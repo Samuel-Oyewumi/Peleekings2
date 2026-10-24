@@ -1,0 +1,216 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper Functions ──────────────────────────────────────────
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && 
+        (getUserData().role == 'admin' || request.auth.token.admin == true);
+    }
+
+    function isTutor() {
+      return isSignedIn() && 
+        (getUserData().role == 'tutor' || getUserData().role == 'instructor');
+    }
+
+    function isCoursePublished(courseId) {
+      return get(/databases/$(database)/documents/courses/$(courseId)).data.status == 'published';
+    }
+
+    // ── 1. Users Collection ───────────────────────────────────────
+    // A user can read and write only their own users/{uid} doc,
+    // EXCEPT the 'role' field — that field must be immutable from the client
+    // (only a Cloud Function/Admin SDK running with admin privileges may set or change it).
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+
+      // Create: user can create their own doc, but cannot set 'role' from client
+      allow create: if isOwner(uid) && !('role' in request.resource.data);
+
+      // Update: user can update their own doc, but cannot modify 'role' field
+      allow update: if isOwner(uid) && 
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']);
+
+      // Deletion denied to clients; admin only
+      allow delete: if isAdmin();
+    }
+
+    // ── 2. Courses Collection & Subcollection Modules ─────────────
+    // Anyone signed in can read courses where status == "published".
+    // Only a user whose own users/{uid}.role == "admin" may create, update, or delete a course or its modules.
+    match /courses/{courseId} {
+      allow read: if isSignedIn() && (resource.data.status == 'published' || isAdmin());
+      allow create, update, delete: if isAdmin();
+
+      match /modules/{moduleId} {
+        allow read: if isSignedIn() && (isCoursePublished(courseId) || isAdmin());
+        allow create, update, delete: if isAdmin();
+      }
+
+      // ── Course Announcements Subcollection ─────────────────────────
+      // Signed-in users can read; tutors and admins can create/update/delete
+      match /announcements/{announcementId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin() || isTutor();
+      }
+
+      // ── Course Comments Subcollection ──────────────────────────────
+      // Signed-in users can read and post their own comments;
+      // owners or admins can delete
+      match /comments/{commentId} {
+        allow read: if isSignedIn();
+        allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+        allow update: if isSignedIn() && resource.data.uid == request.auth.uid;
+        allow delete: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+      }
+      // ── Course Content Subcollections (notes, assignments, tests, announcements) ─
+      // Signed-in enrolled users can read; tutors/admins can create, update, delete
+      match /notes/{noteId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin() || isTutor();
+      }
+      match /assignments/{assignmentId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin() || isTutor();
+      }
+      match /tests/{testId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin() || isTutor();
+      }
+    }
+
+    // ── 3. Enrollments Collection ─────────────────────────────────
+    // Doc ID format: {uid}_{courseId}
+    // A user can create/update an enrollments doc only where the doc's uid field
+    // equals their own request.auth.uid, and can read only their own enrollment docs.
+    match /enrollments/{enrollmentId} {
+      allow create, update: if isSignedIn() && 
+        request.resource.data.uid == request.auth.uid;
+
+      allow read: if isSignedIn() && (resource == null || resource.data.uid == request.auth.uid || isAdmin());
+
+      allow delete: if isAdmin();
+    }
+
+    // ── 3b. Milestones & Celebrations Collection ──────────────────
+    // Visitors and learners can submit celebration milestones;
+    // Admins can read, update, and manage all celebration submissions.
+    match /milestones/{milestoneId} {
+      allow create: if true;
+      allow read: if isSignedIn() && (isAdmin() || resource.data.uid == request.auth.uid);
+      allow update, delete: if isAdmin();
+    }
+
+    // ── 4. Tutor Applications Collection ──────────────────────────
+    // A user can create one with applicantUid == request.auth.uid;
+    // only that applicant or an admin can read it;
+    // only an admin can update its status.
+    match /tutorApplications/{applicationId} {
+      allow create: if isSignedIn() && 
+        request.resource.data.applicantUid == request.auth.uid;
+
+      allow read: if isSignedIn() && 
+        (resource.data.applicantUid == request.auth.uid || isAdmin());
+
+      // Only admin can update status (or any other field)
+      allow update: if isAdmin();
+
+      allow delete: if isAdmin();
+    }
+
+    // ── 5. Test Submissions & Assignment Submissions ──────────────
+    // A user can create their own (uid == request.auth.uid) and read their own;
+    // only an admin or the assigned tutor can update the grade/feedback fields.
+    match /testSubmissions/{submissionId} {
+      allow create: if isSignedIn() && 
+        request.resource.data.uid == request.auth.uid &&
+        !('grade' in request.resource.data) &&
+        !('feedback' in request.resource.data);
+
+      allow read: if isSignedIn() && 
+        (resource.data.uid == request.auth.uid || isAdmin() || isTutor());
+
+      // Only admin or tutor can update grade/feedback fields
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        (isTutor() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['grade', 'feedback', 'status', 'gradedAt', 'gradedBy']))
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    match /assignmentSubmissions/{submissionId} {
+      allow create: if isSignedIn() && 
+        request.resource.data.uid == request.auth.uid &&
+        !('grade' in request.resource.data) &&
+        !('feedback' in request.resource.data);
+
+      allow read: if isSignedIn() && 
+        (resource.data.uid == request.auth.uid || isAdmin() || isTutor());
+
+      // Only admin or tutor can update grade/feedback fields
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        (isTutor() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['grade', 'feedback', 'status', 'gradedAt', 'gradedBy']))
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ── 6. Audit Logs Collection ──────────────────────────────────
+    // Only admins can read audit logs. Writes are performed by Cloud Functions (Admin SDK) or admins.
+    match /auditLogs/{logId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // ── 7. User Notifications Subcollection ───────────────────────
+    // Users can read and update (mark as read) their own notifications.
+    // Admins and tutors can create notifications for any user (e.g., grade alerts).
+    // Cloud Functions (Admin SDK) bypass these rules entirely.
+    match /users/{uid}/notifications/{notifId} {
+      allow read, update: if isOwner(uid);
+      allow create: if isSignedIn(); // tutors/admins notify enrolled students
+      allow delete: if isOwner(uid) || isAdmin();
+    }
+
+    // ── 7b. User Daily Activity Subcollection ─────────────────────
+    // Each user can read and write only their own daily activity records.
+    // Stored at users/{uid}/dailyActivity/{YYYY-MM-DD}
+    match /users/{uid}/dailyActivity/{dayId} {
+      allow read, write: if isOwner(uid);
+      allow read: if isAdmin();
+    }
+
+    // ── 7. Resources Collection & Course Resources ─────────────────
+    // Anyone signed in can read resources. Admins and tutors can create, update, or delete.
+    match /resources/{resourceId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin() || isTutor();
+    }
+
+    match /courses/{courseId}/resources/{resourceId} {
+      allow read: if isSignedIn();
+      allow create, update, delete: if isAdmin() || isTutor();
+    }
+
+    // ── 8. Default Deny ───────────────────────────────────────────
+    // Deny all reads/writes by default for any unspecified path
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

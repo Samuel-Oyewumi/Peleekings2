@@ -1,0 +1,8 @@
+{
+  "name": "Peleekings | E-Learning Platform",
+  "description": "Peleekings – Your gateway to world-class e-learning. Master in-demand skills with expert-led courses.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

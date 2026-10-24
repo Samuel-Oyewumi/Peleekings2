@@ -1,0 +1,64 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ── Helper Functions ──────────────────────────────────────────
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Max file size 10MB (10 * 1024 * 1024 bytes)
+    function isValidFileSize() {
+      return request.resource.size <= 10 * 1024 * 1024;
+    }
+
+    // Images (JPEG, PNG, WebP, etc.) or PDF files only
+    function isImageOrPdf() {
+      return request.resource.contentType.matches('image/.*') ||
+             request.resource.contentType == 'application/pdf';
+    }
+
+    // ── 1. User Portraits: users/{uid}/portrait/{allPaths=**} ────
+    // A user may only upload to their own users/{uid}/portrait path
+    match /users/{uid}/portrait/{allPaths=**} {
+      // Any signed-in user can view user avatars/portraits
+      allow read: if isSignedIn();
+
+      // Only the authenticated owner matching uid may upload, max 10MB, images/PDF only
+      allow write: if isOwner(uid) && isValidFileSize() && isImageOrPdf();
+    }
+
+    // ── 2. Course Submissions: courses/{courseId}/submissions/{uid}/...
+    // A user may only upload to paths matching their own uid
+    match /courses/{courseId}/submissions/{uid}/{allPaths=**} {
+      // The submission owner, or an admin/tutor can read the submission files
+      allow read: if isOwner(uid) || (isSignedIn() && request.auth.token.admin == true);
+
+      // Only the authenticated student matching uid may upload deliverables, max 10MB, images/PDF only
+      allow write: if isOwner(uid) && isValidFileSize() && isImageOrPdf();
+    }
+
+    // ── 3. Platform & Course Resources ────────────────────────────
+    // Signed-in users can read/download resources; authenticated users with valid size can upload
+    match /resources/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && request.resource.size <= 25 * 1024 * 1024;
+    }
+
+    match /courses/{courseId}/resources/{allPaths=**} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && request.resource.size <= 25 * 1024 * 1024;
+    }
+
+    // ── 4. Default Deny ───────────────────────────────────────────
+    // Deny all reads and writes to any other path by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
