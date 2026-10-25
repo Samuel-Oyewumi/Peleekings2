@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { GraduationCap, Briefcase, Target, Sparkles, Search, X } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { getUserActivity } from "../contexts/userActivity";
 import { COURSES_CATALOG } from "../data/courses";
@@ -85,14 +86,14 @@ export default function Home() {
               </button>
             </div>
 
-            {/* Stage 10: Two Large Side-by-Side Role Cards */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 28, maxWidth: 560 }}>
+            {/* Stage 10: Two Role Cards (Responsive stack on mobile) */}
+            <div className="hero-role-cards-grid">
               <Link
                 to="/auth"
                 state={{ tab: "student", mode: "signup" }}
                 style={{
                   background: "#FFFFFF",
-                  border: "2px solid #5624D0",
+                  border: "2px solid #EC586E",
                   borderRadius: "12px",
                   padding: "18px",
                   textDecoration: "none",
@@ -103,15 +104,17 @@ export default function Home() {
                 }}
               >
                 <div>
-                  <div style={{ fontSize: "1.4rem", marginBottom: 8 }}>🎓</div>
-                  <div style={{ fontWeight: 800, fontSize: "1.05rem", color: "#5624D0", marginBottom: 4 }}>
+                  <div style={{ color: "#EC586E", marginBottom: 8 }}>
+                    <GraduationCap size={26} aria-hidden="true" />
+                  </div>
+                  <div style={{ fontWeight: 800, fontSize: "1.05rem", color: "#EC586E", marginBottom: 4 }}>
                     I'm a Student
                   </div>
                   <div style={{ fontSize: "0.825rem", color: "#64748B", lineHeight: 1.4 }}>
                     Browse courses and start learning today.
                   </div>
                 </div>
-                <div style={{ fontSize: "0.825rem", fontWeight: 700, color: "#5624D0", marginTop: 12 }}>
+                <div style={{ fontSize: "0.825rem", fontWeight: 700, color: "#EC586E", marginTop: 12 }}>
                   Start Learning &rarr;
                 </div>
               </Link>
@@ -120,7 +123,7 @@ export default function Home() {
                 to="/teach"
                 style={{
                   background: "#FFFFFF",
-                  border: "2px solid #1C1D1F",
+                  border: "2px solid #3C181A",
                   borderRadius: "12px",
                   padding: "18px",
                   textDecoration: "none",
@@ -131,15 +134,17 @@ export default function Home() {
                 }}
               >
                 <div>
-                  <div style={{ fontSize: "1.4rem", marginBottom: 8 }}>💼</div>
-                  <div style={{ fontWeight: 800, fontSize: "1.05rem", color: "#1C1D1F", marginBottom: 4 }}>
+                  <div style={{ color: "#3C181A", marginBottom: 8 }}>
+                    <Briefcase size={24} aria-hidden="true" />
+                  </div>
+                  <div style={{ fontWeight: 800, fontSize: "1.05rem", color: "#3C181A", marginBottom: 4 }}>
                     I'm a Tutor
                   </div>
                   <div style={{ fontSize: "0.825rem", color: "#64748B", lineHeight: 1.4 }}>
                     Apply to teach your own course.
                   </div>
                 </div>
-                <div style={{ fontSize: "0.825rem", fontWeight: 700, color: "#1C1D1F", marginTop: 12 }}>
+                <div style={{ fontSize: "0.825rem", fontWeight: 700, color: "#3C181A", marginTop: 12 }}>
                   Teach on Peleekings &rarr;
                 </div>
               </Link>
@@ -152,7 +157,7 @@ export default function Home() {
               <div className="mockup-inner-header">
                 <div>
                   <div style={{ fontWeight: 700, fontSize: "1.1rem", color: "var(--text-primary)" }}>
-                    Good morning, {currentUser.displayName?.split(" ")[0] || "Learner"} &#128075;
+                    Good morning, {currentUser.displayName?.split(" ")[0] || "Learner"}
                   </div>
                   <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
                     Ready to continue learning?
@@ -165,7 +170,7 @@ export default function Home() {
                   title="Dismiss preview"
                   aria-label="Dismiss preview"
                 >
-                  &#10005;
+                  <X size={16} aria-hidden="true" />
                 </button>
               </div>
 
@@ -259,7 +264,7 @@ export default function Home() {
           {/* Card 2: Professional Skills */}
           <div className="skill-category-box">
             <div className="skill-box-header">
-              <div className="skill-category-icon" style={{ background: "#EFF6FF", color: "#1D4ED8" }}>
+              <div className="skill-category-icon" style={{ background: "#FFF4F0", color: "#ED7249" }}>
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
@@ -305,7 +310,7 @@ export default function Home() {
 
             {/* Search Input */}
             <div className="search-input-field" style={{ position: "relative" }}>
-              <span>&#128269;</span>
+              <Search size={16} aria-hidden="true" style={{ color: "var(--text-muted)", flexShrink: 0 }} />
               <input
                 id="catalog-search-input"
                 type="text"
@@ -317,6 +322,7 @@ export default function Home() {
                 <button
                   type="button"
                   onClick={() => setSearchQuery("")}
+                  aria-label="Clear search"
                   style={{
                     position: "absolute",
                     right: 12,
@@ -327,11 +333,13 @@ export default function Home() {
                     color: "var(--text-muted)",
                     cursor: "pointer",
                     fontSize: "0.85rem",
-                    padding: 4
+                    padding: 4,
+                    display: "flex",
+                    alignItems: "center",
                   }}
                   title="Clear search"
                 >
-                  ✕
+                  <X size={16} aria-hidden="true" />
                 </button>
               )}
             </div>
@@ -348,6 +356,7 @@ export default function Home() {
                   alt={course.title}
                   loading="lazy"
                   decoding="async"
+                  referrerPolicy="no-referrer"
                   onError={(e) => {
                     e.target.style.display = 'none';
                     e.target.nextSibling.style.display = 'flex';
@@ -410,14 +419,16 @@ export default function Home() {
 
           <div className="landing-about-grid">
             <div className="landing-about-card">
-              <div className="landing-about-card-badge">🎯 Our Mission</div>
+              <div className="landing-about-card-badge" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Target size={18} aria-hidden="true" style={{ color: "var(--primary-learner)" }} /> Our Mission
+              </div>
               <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem", lineHeight: 1.6, marginTop: 8 }}>
                 Equipping Corps Members and young people with practical, monetizable skills that create pathways to financial independence, career growth, and meaningful opportunities.
               </p>
             </div>
 
-            <div className="landing-about-card" style={{ background: "linear-gradient(135deg, rgba(37,99,235,0.05) 0%, rgba(37,99,235,0.12) 100%)", border: "1px solid rgba(37,99,235,0.2)" }}>
-              <div style={{ fontSize: "2.2rem", fontWeight: 900, color: "var(--primary-learner)", lineHeight: 1 }}>20+</div>
+            <div className="landing-about-card" style={{ background: "linear-gradient(135deg, rgba(236,88,110,0.08) 0%, rgba(249,239,167,0.35) 100%)", border: "1px solid rgba(236,88,110,0.25)" }}>
+              <div className="tabular-nums" style={{ fontSize: "2.2rem", fontWeight: 900, color: "var(--primary-learner)", lineHeight: 1 }}>20+</div>
               <div style={{ fontSize: "0.9rem", fontWeight: 700, color: "var(--text-primary)", margin: "4px 0 8px" }}>Corps Members Trained</div>
               <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", lineHeight: 1.5 }}>
                 Successfully trained in digital and professional skills, opening doors to client connections and career advancement.
@@ -425,7 +436,9 @@ export default function Home() {
             </div>
 
             <div className="landing-about-card">
-              <div className="landing-about-card-badge">✨ Core Philosophy</div>
+              <div className="landing-about-card-badge" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Sparkles size={18} aria-hidden="true" style={{ color: "var(--primary-learner)" }} /> Core Philosophy
+              </div>
               <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem", lineHeight: 1.6, fontStyle: "italic", marginTop: 8 }}>
                 "Your growth deserves to be celebrated. Your skills deserve to be valued. Your next season deserves preparation."
               </p>
@@ -441,11 +454,13 @@ export default function Home() {
       </section>
 
       {/* ── Footer ─────────────────────────────────────────────────── */}
-      <footer style={{ background: "#FFFFFF", borderTop: "1px solid var(--border-light)", padding: "32px 40px", marginTop: "auto" }}>
+      <footer className="site-footer">
         <div style={{ maxWidth: 1280, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16 }}>
           <div className="brand-wrapper" style={{ fontSize: "1.1rem" }}>
-            <div className="brand-logo-icon" style={{ width: 26, height: 26, fontSize: "0.85rem" }}>P</div>
-            <span>Peleekings</span>
+            <div className="brand-logo-icon" style={{ width: 28, height: 28, fontSize: "0.85rem" }}>
+              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+            </div>
+            <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
           </div>
           <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
             &copy; {new Date().getFullYear()} Peleekings Inc. Learn &bull; Practice &bull; Prove &bull; Progress
@@ -465,9 +480,10 @@ export default function Home() {
               <button
                 className="btn-ghost"
                 onClick={() => setShowHowItWorksModal(false)}
-                style={{ fontSize: "1.2rem", cursor: "pointer" }}
+                aria-label="Close modal"
+                style={{ fontSize: "1.2rem", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
               >
-                ✕
+                <X size={20} aria-hidden="true" />
               </button>
             </div>
 

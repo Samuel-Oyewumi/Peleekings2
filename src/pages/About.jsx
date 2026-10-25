@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
+import { Award, Gem, Rocket, CheckCircle2, X } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { submitUserMilestone } from "../contexts/userActivity";
 
@@ -44,7 +45,6 @@ export default function About() {
       <section className="about-hero-section">
         <div className="about-hero-inner">
           <div className="about-badge-pill">
-            <span className="badge-dot"></span>
             EMPOWERMENT &amp; CELEBRATION PLATFORM
           </div>
           <h1 className="about-hero-title">
@@ -61,7 +61,7 @@ export default function About() {
         <div className="about-content-grid">
           {/* Mission Card */}
           <div className="about-card about-mission-card">
-            <div className="about-card-icon-wrap" style={{ background: "rgba(59, 130, 246, 0.1)", color: "var(--primary-learner)" }}>
+            <div className="about-card-icon-wrap" style={{ background: "rgba(236, 88, 110, 0.12)", color: "var(--primary-learner)" }}>
               <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
               </svg>
@@ -105,17 +105,23 @@ export default function About() {
 
           <div className="philosophy-pillars-grid">
             <div className="philosophy-pillar-card">
-              <div className="pillar-icon">🎉</div>
+              <div className="pillar-icon" style={{ display: "flex", justifyContent: "center", color: "#EC586E" }}>
+                <Award size={28} aria-hidden="true" />
+              </div>
               <h4>Celebrate Growth</h4>
               <p>Your growth deserves to be celebrated.</p>
             </div>
             <div className="philosophy-pillar-card">
-              <div className="pillar-icon">💎</div>
+              <div className="pillar-icon" style={{ display: "flex", justifyContent: "center", color: "#ED7249" }}>
+                <Gem size={28} aria-hidden="true" />
+              </div>
               <h4>Value Skills</h4>
               <p>Your skills deserve to be valued.</p>
             </div>
             <div className="philosophy-pillar-card">
-              <div className="philosophy-icon">🚀</div>
+              <div className="pillar-icon" style={{ display: "flex", justifyContent: "center", color: "#F9EFA7" }}>
+                <Rocket size={28} aria-hidden="true" />
+              </div>
               <h4>Prepare for Next Season</h4>
               <p>Your next season deserves preparation.</p>
             </div>
@@ -149,7 +155,7 @@ export default function About() {
                   className="btn btn-outline btn-lg"
                   onClick={() => setShowMilestoneModal(true)}
                 >
-                  Celebrate a Milestone with Us 🎉
+                  <Award size={18} aria-hidden="true" /> Celebrate a Milestone with Us
                 </button>
               </div>
             </div>
@@ -164,20 +170,23 @@ export default function About() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
               <div>
                 <span className="pill-badge pill-tech" style={{ marginBottom: 6 }}>CELEBRATE WITH US</span>
-                <h3 style={{ fontSize: "1.45rem", fontWeight: 800 }}>Share Your Milestone 🎉</h3>
+                <h3 style={{ fontSize: "1.45rem", fontWeight: 800 }}>Share Your Milestone</h3>
               </div>
               <button
                 className="btn-ghost"
                 onClick={() => setShowMilestoneModal(false)}
-                style={{ fontSize: "1.2rem", cursor: "pointer", border: "none" }}
+                aria-label="Close milestone modal"
+                style={{ fontSize: "1.2rem", cursor: "pointer", border: "none", display: "flex", alignItems: "center", justifyContent: "center" }}
               >
-                ✕
+                <X size={20} aria-hidden="true" />
               </button>
             </div>
 
             {submitted ? (
               <div style={{ padding: "32px 16px", textAlign: "center" }}>
-                <div style={{ fontSize: "3rem", marginBottom: 12 }}>🎊</div>
+                <div style={{ display: "flex", justifyContent: "center", marginBottom: 12, color: "var(--primary-learner)" }}>
+                  <CheckCircle2 size={44} aria-hidden="true" />
+                </div>
                 <h4 style={{ fontSize: "1.25rem", fontWeight: 800, color: "var(--primary-learner)", marginBottom: 8 }}>
                   Milestone Received!
                 </h4>
@@ -295,11 +304,13 @@ export default function About() {
       )}
 
       {/* ── Footer ─────────────────────────────────────────────────── */}
-      <footer style={{ background: "#FFFFFF", borderTop: "1px solid var(--border-light)", padding: "32px 40px", marginTop: "auto" }}>
+      <footer className="site-footer">
         <div style={{ maxWidth: 1280, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16 }}>
           <div className="brand-wrapper" style={{ fontSize: "1.1rem" }}>
-            <div className="brand-logo-icon" style={{ width: 26, height: 26, fontSize: "0.85rem" }}>P</div>
-            <span>Peleekings</span>
+            <div className="brand-logo-icon" style={{ width: 28, height: 28, fontSize: "0.85rem" }}>
+              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+            </div>
+            <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
           </div>
           <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
             &copy; {new Date().getFullYear()} Peleekings Inc. Learn &bull; Practice &bull; Prove &bull; Progress

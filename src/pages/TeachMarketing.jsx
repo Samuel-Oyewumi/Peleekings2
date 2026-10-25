@@ -1,4 +1,5 @@
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
+import { GraduationCap, Users, BarChart3, Zap } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 
 export default function TeachMarketing() {
@@ -21,7 +22,7 @@ export default function TeachMarketing() {
   return (
     <div className="teach-marketing-page" style={{ minHeight: "90vh", background: "#FFFFFF" }}>
       {/* Hero Section */}
-      <section style={{ padding: "80px 24px 60px", textAlign: "center", maxWidth: 960, margin: "0 auto" }}>
+      <section style={{ padding: "48px 16px 40px", textAlign: "center", maxWidth: 960, margin: "0 auto" }}>
         <div
           style={{
             display: "inline-flex",
@@ -29,8 +30,8 @@ export default function TeachMarketing() {
             gap: 8,
             padding: "6px 16px",
             borderRadius: "99px",
-            background: "#F3F4F6",
-            color: "#1C1D1F",
+            background: "#FDF2F4",
+            color: "#3C181A",
             fontSize: "0.85rem",
             fontWeight: 700,
             marginBottom: 20,
@@ -38,21 +39,22 @@ export default function TeachMarketing() {
             textTransform: "uppercase",
           }}
         >
-          <span>🎓</span> Teach on Peleekings
+          <GraduationCap size={16} aria-hidden="true" /> Teach on Peleekings
         </div>
 
         <h1
           style={{
-            fontSize: "3.2rem",
+            fontSize: "clamp(2rem, 6vw, 3.2rem)",
             fontWeight: 800,
-            color: "#0F172A",
+            color: "#3C181A",
             lineHeight: 1.15,
             letterSpacing: "-0.03em",
             marginBottom: 20,
+            textWrap: "balance",
           }}
         >
           Turn what you know <br />
-          into an <span style={{ color: "#5624D0" }}>accredited course</span>.
+          into an <span style={{ color: "#EC586E" }}>accredited course</span>.
         </h1>
 
         <p
@@ -72,7 +74,7 @@ export default function TeachMarketing() {
             onClick={handleGetStarted}
             className="btn btn-solid-dark btn-lg"
             style={{
-              background: "#1C1D1F",
+              background: "#3C181A",
               color: "#FFFFFF",
               padding: "14px 36px",
               fontSize: "1rem",
@@ -86,12 +88,12 @@ export default function TeachMarketing() {
       </section>
 
       {/* 3 Value Proposition Cards */}
-      <section style={{ padding: "40px 24px 80px", maxWidth: 1140, margin: "0 auto" }}>
+      <section style={{ padding: "40px 20px 80px", maxWidth: 1140, margin: "0 auto" }}>
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
-            gap: 24,
+            gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))",
+            gap: 20,
           }}
         >
           {/* Card 1 */}
@@ -109,18 +111,17 @@ export default function TeachMarketing() {
                 width: 48,
                 height: 48,
                 borderRadius: "10px",
-                background: "#F3EEFC",
-                color: "#5624D0",
-                fontSize: "1.4rem",
+                background: "#FDF2F4",
+                color: "#EC586E",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 marginBottom: 20,
               }}
             >
-              👥
+              <Users size={22} aria-hidden="true" />
             </div>
-            <h3 style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: 10, color: "#0F172A" }}>
+            <h3 style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: 10, color: "#3C181A" }}>
               Reach real learners
             </h3>
             <p style={{ fontSize: "0.95rem", color: "#64748B", lineHeight: 1.6, margin: 0 }}>
@@ -143,18 +144,17 @@ export default function TeachMarketing() {
                 width: 48,
                 height: 48,
                 borderRadius: "10px",
-                background: "#F1F5F9",
-                color: "#1C1D1F",
-                fontSize: "1.4rem",
+                background: "#FFF4F0",
+                color: "#ED7249",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 marginBottom: 20,
               }}
             >
-              📊
+              <BarChart3 size={22} aria-hidden="true" />
             </div>
-            <h3 style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: 10, color: "#0F172A" }}>
+            <h3 style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: 10, color: "#3C181A" }}>
               Your own dashboard
             </h3>
             <p style={{ fontSize: "0.95rem", color: "#64748B", lineHeight: 1.6, margin: 0 }}>
@@ -177,18 +177,17 @@ export default function TeachMarketing() {
                 width: 48,
                 height: 48,
                 borderRadius: "10px",
-                background: "#EAF7EF",
-                color: "#1B7A43",
-                fontSize: "1.4rem",
+                background: "#FEF9C3",
+                color: "#3C181A",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
                 marginBottom: 20,
               }}
             >
-              ⚡
+              <Zap size={22} aria-hidden="true" />
             </div>
-            <h3 style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: 10, color: "#0F172A" }}>
+            <h3 style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: 10, color: "#3C181A" }}>
               Simple to get started
             </h3>
             <p style={{ fontSize: "0.95rem", color: "#64748B", lineHeight: 1.6, margin: 0 }}>
@@ -207,7 +206,7 @@ export default function TeachMarketing() {
           textAlign: "center",
         }}
       >
-        <h2 style={{ fontSize: "2rem", fontWeight: 800, color: "#0F172A", marginBottom: 12 }}>
+        <h2 style={{ fontSize: "clamp(1.5rem, 4.5vw, 2rem)", fontWeight: 800, color: "#3C181A", marginBottom: 12 }}>
           Ready to inspire the next generation?
         </h2>
         <p style={{ fontSize: "1rem", color: "#64748B", maxWidth: 520, margin: "0 auto 28px" }}>
@@ -217,7 +216,7 @@ export default function TeachMarketing() {
           onClick={handleGetStarted}
           className="btn btn-solid-dark btn-lg"
           style={{
-            background: "#1C1D1F",
+            background: "#3C181A",
             color: "#FFFFFF",
             padding: "14px 36px",
             fontSize: "1rem",

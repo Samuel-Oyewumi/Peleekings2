@@ -152,8 +152,10 @@ export default function Auth() {
         {/* Brand Header */}
         <div className="auth-title-block">
           <Link to="/" className="brand-wrapper" style={{ justifyContent: "center", marginBottom: 16 }}>
-            <div className="brand-logo-icon">P</div>
-            <span>Peleekings</span>
+            <div className="brand-logo-icon">
+              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+            </div>
+            <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" />
           </Link>
           <h1 style={{ fontSize: "1.65rem", fontWeight: 800, color: "var(--text-primary)", marginBottom: 6 }}>
             {registeredProfile
@@ -349,7 +351,7 @@ export default function Auth() {
                     Personal Information ({studentType === "non_corper" ? "Non-Corper" : "Corper"})
                   </div>
 
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  <div className="form-grid-2col">
                     <div className="form-field-group">
                       <label className="form-field-label">Surname</label>
                       <input
@@ -439,7 +441,7 @@ export default function Auth() {
                   )}
 
                   {/* Passwords */}
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  <div className="form-grid-2col">
                     <div className="form-field-group">
                       <label className="form-field-label">Password</label>
                       <input
@@ -507,14 +509,14 @@ export default function Auth() {
 
                   {/* Inline Forgot-Password Panel */}
                   {showForgotPw && (
-                    <div style={{ background: "#F0F9FF", border: "1px solid #BAE6FD", borderRadius: 8, padding: "14px 16px", marginTop: 4 }}>
+                    <div style={{ background: "#FDF2F4", border: "1px solid #F9C6CE", borderRadius: 8, padding: "14px 16px", marginTop: 4 }}>
                       {fpStatus === "sent" ? (
-                        <p style={{ fontSize: "0.82rem", color: "#0369A1", fontWeight: 600 }}>
+                        <p style={{ fontSize: "0.82rem", color: "#3C181A", fontWeight: 600 }}>
                           ✓ Reset link sent! Check your inbox for <strong>{fpEmail}</strong>.
                         </p>
                       ) : (
                         <>
-                          <p style={{ fontSize: "0.8rem", color: "#0369A1", marginBottom: 8 }}>
+                          <p style={{ fontSize: "0.8rem", color: "#3C181A", marginBottom: 8 }}>
                             Enter your email to receive a password reset link.
                           </p>
                           <div style={{ display: "flex", gap: 8 }}>

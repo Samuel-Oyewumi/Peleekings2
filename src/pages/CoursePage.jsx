@@ -1518,7 +1518,7 @@ export default function CoursePage() {
     <div className="course-detail-page">
       {/* Toast Notification Banner on Detail View */}
       {toastMessage && (
-        <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#0F172A", color: "#FFFFFF", padding: "12px 20px", borderRadius: "var(--radius-sm)", boxShadow: "var(--shadow-lg)", fontSize: "0.875rem", fontWeight: 600, display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#3C181A", color: "#FFFFFF", padding: "12px 20px", borderRadius: "var(--radius-sm)", boxShadow: "var(--shadow-lg)", fontSize: "0.875rem", fontWeight: 600, display: "flex", alignItems: "center", gap: 10 }}>
           <span>✓</span> {toastMessage}
         </div>
       )}
@@ -1534,7 +1534,7 @@ export default function CoursePage() {
           <span className={`pill-badge ${courseData.badgeClass}`} style={{ marginBottom: 14 }}>
             {courseData.badge}
           </span>
-          <h1 style={{ fontSize: "2.4rem", fontWeight: 800, lineHeight: 1.15, marginBottom: 12 }}>
+          <h1 className="course-detail-title">
             {courseData.title}
           </h1>
           <p style={{ fontSize: "1.05rem", color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 20 }}>
@@ -1601,7 +1601,7 @@ export default function CoursePage() {
               border: (isEnrolled && (enrollment?.experienceType === "online" || selectedExperience === "online"))
                 ? "2px solid var(--primary-learner)"
                 : selectedExperience === "online"
-                ? "2px solid #0F172A"
+                ? "2px solid #3C181A"
                 : "1px solid var(--border-light)",
               cursor: "pointer",
               transition: "transform 0.15s ease, box-shadow 0.15s ease",
@@ -1657,7 +1657,7 @@ export default function CoursePage() {
               border: (isEnrolled && (enrollment?.experienceType === "hands-on" || selectedExperience === "hands-on"))
                 ? "2px solid var(--primary-learner)"
                 : selectedExperience === "hands-on"
-                ? "2px solid #0F172A"
+                ? "2px solid #3C181A"
                 : "1px solid var(--border-light)",
               cursor: "pointer",
               transition: "transform 0.15s ease, box-shadow 0.15s ease",
@@ -1665,7 +1665,7 @@ export default function CoursePage() {
             onClick={() => handleEnroll("hands-on")}
           >
             <div className="experience-card-header">
-              <div className="experience-icon-box" style={{ background: "#F5F3FF", color: "#5624D0" }}>
+              <div className="experience-icon-box" style={{ background: "#FFF4F0", color: "#ED7249" }}>
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                   <circle cx="9" cy="7" r="4"></circle>

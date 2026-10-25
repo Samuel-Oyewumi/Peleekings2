@@ -142,10 +142,10 @@ export default function BecomeInstructor() {
         {/* Navigation tabs between Tutor Dashboard and Application */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 32, flexWrap: "wrap", gap: 16 }}>
           <div>
-            <div className="pill-badge" style={{ background: "#111827", color: "#FFFFFF", marginBottom: 8 }}>
+            <div className="pill-badge" style={{ background: "#3C181A", color: "#FFFFFF", marginBottom: 8 }}>
               TUTOR PORTAL
             </div>
-            <h1 style={{ fontSize: "2rem", fontWeight: 800, color: "#0F172A" }}>
+            <h1 style={{ fontSize: "2rem", fontWeight: 800, color: "#3C181A" }}>
               {activeTab === "dashboard" ? "Welcome back, Tutor 👋" : "Teach on Peleekings"}
             </h1>
             <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem" }}>
@@ -186,7 +186,7 @@ export default function BecomeInstructor() {
                   <div style={{ fontSize: "0.8rem", fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", letterSpacing: "0.05em" }}>
                     {stat.label}
                   </div>
-                  <div style={{ fontSize: "2rem", fontWeight: 900, color: "var(--text-primary)", margin: "8px 0 4px", fontFamily: "Outfit, sans-serif" }}>
+                  <div style={{ fontSize: "2rem", fontWeight: 900, color: "var(--text-primary)", margin: "8px 0 4px", fontFamily: "Montserrat, sans-serif" }}>
                     {stat.val}
                   </div>
                   <div style={{ fontSize: "0.775rem", color: "var(--text-secondary)" }}>
@@ -197,10 +197,10 @@ export default function BecomeInstructor() {
             </div>
 
             {/* Courses Management & Analytics Split */}
-            <div style={{ display: "grid", gridTemplateColumns: "1.2fr 0.8fr", gap: 24, marginBottom: 40 }}>
+            <div className="tutor-courses-split">
               {/* Courses List */}
               <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", padding: 24 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
                   <h2 style={{ fontSize: "1.2rem", fontWeight: 800 }}>Your Courses</h2>
                   <button className="btn btn-solid-dark btn-sm">
                     + Add New Course
@@ -219,6 +219,8 @@ export default function BecomeInstructor() {
                         display: "flex",
                         justifyContent: "space-between",
                         alignItems: "center",
+                        flexWrap: "wrap",
+                        gap: 12,
                         padding: "16px 18px",
                         borderRadius: "var(--radius-sm)",
                         border: "1px solid var(--border-light)",
@@ -275,7 +277,7 @@ export default function BecomeInstructor() {
 
                 {/* Donut progress visual */}
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "20px 0" }}>
-                  <div style={{ width: 130, height: 130, borderRadius: "50%", background: "conic-gradient(#5624D0 0% 78%, #E2E8F0 78% 100%)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <div style={{ width: 130, height: 130, borderRadius: "50%", background: "conic-gradient(#EC586E 0% 78%, #E2E8F0 78% 100%)", display: "flex", alignItems: "center", justifyContent: "center" }}>
                     <div style={{ width: 96, height: 96, borderRadius: "50%", background: "#FFFFFF", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
                       <span style={{ fontSize: "1.4rem", fontWeight: 900, color: "var(--text-primary)" }}>78%</span>
                       <span style={{ fontSize: "0.68rem", color: "var(--text-muted)", textTransform: "uppercase" }}>Completed</span>

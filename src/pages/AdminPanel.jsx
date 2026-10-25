@@ -665,11 +665,11 @@ export default function AdminPanel() {
   });
 
   return (
-    <div style={{ background: "#F8FAFC", minHeight: "calc(100vh - 68px)", padding: "40px 24px" }}>
+    <div className="admin-panel-container">
       <div style={{ maxWidth: 1240, margin: "0 auto" }}>
         {/* Toast Notification */}
         {toastMessage && (
-          <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#0F172A", color: "#FFFFFF", padding: "12px 20px", borderRadius: "var(--radius-sm)", boxShadow: "var(--shadow-lg)", fontSize: "0.875rem", fontWeight: 600, animation: "fadeIn 0.2s ease" }}>
+          <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#3C181A", color: "#FFFFFF", padding: "12px 20px", borderRadius: "var(--radius-sm)", boxShadow: "var(--shadow-lg)", fontSize: "0.875rem", fontWeight: 600, animation: "fadeIn 0.2s ease" }}>
             {toastMessage}
           </div>
         )}
@@ -681,7 +681,7 @@ export default function AdminPanel() {
               <span className="pill-badge pill-tech">ADMIN CONSOLE</span>
               <span className="pill-badge pill-success">ROLE: ADMINISTRATOR</span>
             </div>
-            <h1 style={{ fontSize: "2.1rem", fontWeight: 800, color: "#0F172A" }}>
+            <h1 style={{ fontSize: "2.1rem", fontWeight: 800, color: "#3C181A" }}>
               Peleekings Admin Dashboard
             </h1>
             <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem" }}>
@@ -717,7 +717,7 @@ export default function AdminPanel() {
                   {m.change}
                 </span>
               </div>
-              <div style={{ fontSize: "2.1rem", fontWeight: 900, color: "var(--text-primary)", margin: "10px 0 2px", fontFamily: "Outfit, sans-serif" }}>
+              <div style={{ fontSize: "2.1rem", fontWeight: 900, color: "var(--text-primary)", margin: "10px 0 2px", fontFamily: "Montserrat, sans-serif" }}>
                 {m.value}
               </div>
               <div style={{ fontSize: "0.775rem", color: "var(--text-muted)" }}>
@@ -797,7 +797,7 @@ export default function AdminPanel() {
                       <tr key={app.id}>
                         <td>
                           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                            <div className="user-avatar-circle" style={{ width: 34, height: 34, fontSize: "0.8rem", background: "#1C1D1F" }}>
+                            <div className="user-avatar-circle" style={{ width: 34, height: 34, fontSize: "0.8rem", background: "#3C181A" }}>
                               {(app.fullName || "A").split(" ").map(n => n[0]).join("").slice(0, 2)}
                             </div>
                             <div>
@@ -869,7 +869,7 @@ export default function AdminPanel() {
               </div>
               <div className="stat-metric-card">
                 <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>Audit Events</div>
-                <div style={{ fontSize: "2rem", fontWeight: 900, color: "#0F172A", margin: "8px 0" }}>{auditLogs.length}</div>
+                <div style={{ fontSize: "2rem", fontWeight: 900, color: "#3C181A", margin: "8px 0" }}>{auditLogs.length}</div>
                 <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Recorded by Cloud Functions &amp; Admin SDK</div>
               </div>
             </div>

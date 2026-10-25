@@ -1,5 +1,20 @@
 import { useState, useEffect } from "react";
 import { Link, useNavigate, useLocation } from "react-router-dom";
+import {
+  LayoutDashboard,
+  BookOpen,
+  Compass,
+  ClipboardList,
+  Clock,
+  FileText,
+  Megaphone,
+  Award,
+  User,
+  Briefcase,
+  LogOut,
+  Menu,
+  X,
+} from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { getUserActivity, submitAssignment, getUserEnrollments, enrollInCourse, getWeeklyActivityData, incrementDailyActivity } from "../contexts/userActivity";
 import { COURSES_CATALOG } from "../data/courses";
@@ -290,7 +305,7 @@ export default function Dashboard() {
           top: 80,
           right: 24,
           zIndex: 1000,
-          background: "#0F172A",
+          background: "#3C181A",
           color: "#FFFFFF",
           padding: "12px 18px",
           borderRadius: "var(--radius-sm)",
@@ -336,8 +351,10 @@ export default function Dashboard() {
         {/* Mobile-only close header */}
         <div className="sidebar-mobile-header">
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div className="brand-logo-icon" style={{ width: 28, height: 28, fontSize: "0.9rem" }}>P</div>
-            <span style={{ fontWeight: 800, fontSize: "1rem" }}>Peleekings</span>
+            <div className="brand-logo-icon" style={{ width: 28, height: 28, fontSize: "0.9rem" }}>
+              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+            </div>
+            <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
           </div>
           <button
             type="button"
@@ -345,7 +362,7 @@ export default function Dashboard() {
             onClick={() => setShowMobileSidebar(false)}
             aria-label="Close navigation"
           >
-            ✕
+            <X size={18} aria-hidden="true" />
           </button>
         </div>
 
@@ -378,15 +395,15 @@ export default function Dashboard() {
         {/* Navigation Menu */}
         <nav className="portal-nav-menu">
           {[
-            { id: "dashboard", label: "Dashboard", icon: "📊" },
-            { id: "my-courses", label: "My Courses", icon: "📚" },
-            { id: "browse-courses", label: "Browse Courses", icon: "🔍" },
-            { id: "assignments", label: "Assignments", icon: "📝" },
-            { id: "tests", label: "Tests", icon: "⏱" },
-            { id: "notes", label: "Notes", icon: "📄" },
-            { id: "announcements", label: "Announcements", icon: "📢" },
-            { id: "certificates", label: "Certificates", icon: "🎓" },
-            { id: "profile", label: "Profile", icon: "👤" },
+            { id: "dashboard", label: "Dashboard", Icon: LayoutDashboard },
+            { id: "my-courses", label: "My Courses", Icon: BookOpen },
+            { id: "browse-courses", label: "Browse Courses", Icon: Compass },
+            { id: "assignments", label: "Assignments", Icon: ClipboardList },
+            { id: "tests", label: "Tests", Icon: Clock },
+            { id: "notes", label: "Notes", Icon: FileText },
+            { id: "announcements", label: "Announcements", Icon: Megaphone },
+            { id: "certificates", label: "Certificates", Icon: Award },
+            { id: "profile", label: "Profile", Icon: User },
           ].map(item => (
             <button
               key={item.id}
@@ -397,7 +414,7 @@ export default function Dashboard() {
                 else setActiveNav(item.id);
               }}
             >
-              <span>{item.icon}</span>
+              <item.Icon size={18} aria-hidden="true" />
               {item.label}
             </button>
           ))}
@@ -410,14 +427,14 @@ export default function Dashboard() {
             className="portal-nav-link"
             style={{ fontSize: "0.85rem", color: "var(--primary-learner)", marginBottom: 4 }}
           >
-            <span>💼</span> Teaching Portal
+            <Briefcase size={18} aria-hidden="true" /> Teaching Portal
           </Link>
           <button
             onClick={handleLogout}
             className="portal-nav-link"
             style={{ color: "#DC2626", width: "100%" }}
           >
-            <span>⎋</span> Log out
+            <LogOut size={18} aria-hidden="true" /> Log out
           </button>
         </div>
       </aside>
@@ -434,11 +451,11 @@ export default function Dashboard() {
                 onClick={() => setShowMobileSidebar(prev => !prev)}
                 aria-label="Open menu"
               >
-                ☰
+                <Menu size={18} aria-hidden="true" />
               </button>
               <div>
                 <h1 style={{ fontSize: "1.9rem", fontWeight: 800, marginBottom: 2 }}>
-                  Good morning, {firstName} &#128075;
+                  Good morning, {firstName}
                 </h1>
                 <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem", margin: 0 }}>
                   Ready to continue learning today?
@@ -451,13 +468,38 @@ export default function Dashboard() {
           </div>
         </div>
 
+        {/* ── Mobile Quick Navigation Tabs (Thumb Zone Ergonomics) ── */}
+        <div className="dashboard-mobile-quick-nav">
+          {[
+            { id: "dashboard", label: "Overview", Icon: LayoutDashboard },
+            { id: "my-courses", label: "My Courses", Icon: BookOpen },
+            { id: "browse-courses", label: "Browse", Icon: Compass },
+            { id: "assignments", label: "Assignments", Icon: ClipboardList },
+            { id: "tests", label: "Tests", Icon: Clock },
+            { id: "notes", label: "Notes", Icon: FileText },
+            { id: "announcements", label: "Updates", Icon: Megaphone },
+            { id: "certificates", label: "Certificates", Icon: Award },
+            { id: "profile", label: "Profile", Icon: User },
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={`dashboard-mobile-quick-pill ${activeNav === tab.id ? "active" : ""}`}
+              onClick={() => setActiveNav(tab.id)}
+            >
+              <tab.Icon size={15} aria-hidden="true" />
+              <span>{tab.label}</span>
+            </button>
+          ))}
+        </div>
+
 
         {/* Stage 6: Dismissible Tutor Apply Banner */}
         {showTutorBanner && (
           <div
             style={{
-              background: "#F3EEFC",
-              border: "1px solid #D8C7F8",
+              background: "#FDF2F4",
+              border: "1px solid #F9C6CE",
               borderRadius: "10px",
               padding: "14px 20px",
               marginBottom: 20,
@@ -467,9 +509,9 @@ export default function Dashboard() {
               gap: 16,
             }}
           >
-            <div style={{ fontSize: "0.9rem", color: "#5624D0" }}>
+            <div style={{ fontSize: "0.9rem", color: "#3C181A" }}>
               <strong>Want to teach on Peleekings?</strong> Share your expertise with hundreds of students.{" "}
-              <Link to="/teach" style={{ color: "#5624D0", fontWeight: 700, textDecoration: "underline" }}>
+              <Link to="/teach" style={{ color: "#EC586E", fontWeight: 700, textDecoration: "underline" }}>
                 Apply here &rarr;
               </Link>
             </div>
@@ -478,7 +520,7 @@ export default function Dashboard() {
               style={{
                 background: "none",
                 border: "none",
-                color: "#5624D0",
+                color: "#EC586E",
                 cursor: "pointer",
                 fontSize: "1.1rem",
                 lineHeight: 1,
@@ -495,42 +537,32 @@ export default function Dashboard() {
         {activeNav === "dashboard" && (
           <>
             {/* ── DARK HERO: Continue where you left off ── */}
-            <div style={{
-              background: "linear-gradient(135deg, #0F172A 60%, #1a2744 100%)",
-              borderRadius: "var(--radius-md)",
-              padding: "32px 28px",
-              marginBottom: 24,
-              display: "grid",
-              gridTemplateColumns: enrolledCourses.length > 0 ? "1fr auto" : "1fr",
-              gap: 24,
-              alignItems: "stretch",
-              minHeight: 200,
-            }}>
+            <div className="dashboard-continue-hero">
               {/* Left: Course info */}
               <div style={{ display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
                 <div>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
-                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#22C55E", display: "inline-block" }} />
-                    <span style={{ fontSize: "0.72rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#22C55E" }}>
+                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#F9EFA7", display: "inline-block" }} />
+                    <span style={{ fontSize: "0.72rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#F9EFA7" }}>
                       {enrolledCourses.length > 0 ? "Continue where you left off" : "Ready to start?"}
                     </span>
                   </div>
-                  <h2 style={{ fontSize: "2rem", fontWeight: 800, color: "#FFFFFF", marginBottom: 6, lineHeight: 1.15 }}>
+                  <h2 style={{ fontSize: "clamp(1.4rem, 4.5vw, 2rem)", fontWeight: 800, color: "#FFFFFF", marginBottom: 6, lineHeight: 1.15 }}>
                     {enrolledCourses.length > 0 ? enrolledCourses[0].title : "Explore Courses"}
                   </h2>
-                  <p style={{ fontSize: "0.9rem", color: "#94A3B8", marginBottom: 20 }}>
+                  <p style={{ fontSize: "0.9rem", color: "#E2E8F0", marginBottom: 20 }}>
                     {enrolledCourses.length > 0 ? enrolledCourses[0].currentModule : "Enroll in a course to begin your learning journey."}
                   </p>
                 </div>
 
                 {enrolledCourses.length > 0 && (
                   <div>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.8rem", color: "#94A3B8", marginBottom: 6 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.8rem", color: "#E2E8F0", marginBottom: 6 }}>
                       <span>Course progress</span>
-                      <span style={{ color: "#22C55E", fontWeight: 700 }}>{enrolledCourses[0].progress}%</span>
+                      <span style={{ color: "#F9EFA7", fontWeight: 700 }}>{enrolledCourses[0].progress}%</span>
                     </div>
-                    <div style={{ width: "100%", height: 6, background: "rgba(255,255,255,0.12)", borderRadius: 99, overflow: "hidden", marginBottom: 20 }}>
-                      <div style={{ width: `${enrolledCourses[0].progress}%`, height: "100%", background: "#22C55E", borderRadius: 99, transition: "width 0.6s ease" }} />
+                    <div style={{ width: "100%", height: 6, background: "rgba(255,255,255,0.16)", borderRadius: 99, overflow: "hidden", marginBottom: 20 }}>
+                      <div style={{ width: `${enrolledCourses[0].progress}%`, height: "100%", background: "#EC586E", borderRadius: 99, transition: "width 0.6s ease" }} />
                     </div>
                   </div>
                 )}
@@ -539,7 +571,7 @@ export default function Dashboard() {
                   className="btn btn-sm"
                   style={{
                     alignSelf: "flex-start",
-                    background: "#22C55E",
+                    background: "#EC586E",
                     color: "#FFFFFF",
                     border: "none",
                     borderRadius: 8,
@@ -562,24 +594,14 @@ export default function Dashboard() {
 
               {/* Right: Next upcoming deadline panel */}
               {enrolledCourses.length > 0 && (
-                <div style={{
-                  background: "rgba(255,255,255,0.06)",
-                  border: "1px solid rgba(255,255,255,0.1)",
-                  borderRadius: 12,
-                  padding: "20px 22px",
-                  minWidth: 220,
-                  maxWidth: 270,
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 8,
-                }}>
+                <div className="dashboard-upcoming-deadline">
                   <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                    <span style={{ fontSize: "0.7rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#22C55E" }}>📋 Upcoming deadline</span>
+                    <span style={{ fontSize: "0.7rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#F9EFA7" }}>📋 Upcoming deadline</span>
                   </div>
                   <div style={{ fontWeight: 800, fontSize: "1.05rem", color: "#FFFFFF", lineHeight: 1.3 }}>
                     Assignment Due
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.8rem", color: "#94A3B8" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.8rem", color: "#E2E8F0" }}>
                     <span>⏰</span>
                     <span>Fri, Oct 24 • 6:00 PM</span>
                   </div>
@@ -685,12 +707,12 @@ export default function Dashboard() {
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 {[
-                  { icon: "🎬", label: "My Courses", sub: "Resume your learning", color: "#FEE2E2", nav: "my-courses" },
-                  { icon: "📝", label: "Assignments", sub: "View pending submissions", color: "#FEF3C7", nav: "assignments" },
-                  { icon: "📄", label: "Notes & Resources", sub: "Course materials and tools", color: "#EEF2FF", nav: "notes" },
-                  { icon: "⏱", label: "Tests", sub: "Check scheduled tests", color: "#F0FDF4", nav: "tests" },
-                  { icon: "📢", label: "Announcements", sub: "Latest from instructors", color: "#FFF7ED", nav: "announcements" },
-                  { icon: "🎓", label: "Certificates", sub: "View your achievements", color: "#F5F3FF", nav: "certificates" },
+                  { icon: "🎬", label: "My Courses", sub: "Resume your learning", color: "#FDF2F4", nav: "my-courses" },
+                  { icon: "📝", label: "Assignments", sub: "View pending submissions", color: "#FEF9C3", nav: "assignments" },
+                  { icon: "📄", label: "Notes & Resources", sub: "Course materials and tools", color: "#FFF4F0", nav: "notes" },
+                  { icon: "⏱", label: "Tests", sub: "Check scheduled tests", color: "#EAF7EF", nav: "tests" },
+                  { icon: "📢", label: "Announcements", sub: "Latest from instructors", color: "#FFF4F0", nav: "announcements" },
+                  { icon: "🎓", label: "Certificates", sub: "View your achievements", color: "#FDF2F4", nav: "certificates" },
                 ].map(item => (
                   <button
                     key={item.nav}
@@ -1020,7 +1042,7 @@ export default function Dashboard() {
           <div className="dashboard-tab-panel">
             <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Certificates of Completion</h2>
             <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Official verified Peleekings credentials with your Registration Code.</p>
-            <div style={{ padding: 28, border: "2px solid var(--primary-learner-border)", background: "linear-gradient(135deg, #FAF5FF, #EFF6FF)", borderRadius: "var(--radius-md)" }}>
+            <div style={{ padding: 28, border: "2px solid var(--primary-learner-border)", background: "linear-gradient(135deg, #FDF2F4, #FEFCE8)", borderRadius: "var(--radius-md)" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
                 <div>
                   <span className="pill-badge pill-success" style={{ marginBottom: 8 }}>VERIFIED CREDENTIAL</span>
@@ -1029,8 +1051,8 @@ export default function Dashboard() {
                     Recipient: <strong>{userName}</strong> &bull; Registration ID: <strong>{regCode}</strong>
                   </div>
                 </div>
-                <div style={{ width: 48, height: 48, borderRadius: "50%", background: "#0F172A", color: "#FFFFFF", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900 }}>
-                  P
+                <div className="brand-logo-icon" style={{ width: 48, height: 48, borderRadius: "50%" }}>
+                  <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="Peleekings" className="brand-submark-img" />
                 </div>
               </div>
               <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: 20 }}>
@@ -1279,63 +1301,6 @@ export default function Dashboard() {
           </div>
         )}
       </main>
-
-      {/* ── Fixed Bottom Nav Bar (mobile) ── */}
-      <nav style={{
-        position: "fixed",
-        bottom: 0,
-        left: 0,
-        right: 0,
-        height: 64,
-        background: "#FFFFFF",
-        borderTop: "1px solid var(--border-light)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-around",
-        zIndex: 300,
-        paddingBottom: "env(safe-area-inset-bottom, 0px)",
-      }}>
-        {[
-          { id: "dashboard", label: "Dashboard", icon: (
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
-          )},
-          { id: "my-courses", label: "Courses", icon: (
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-          )},
-          { id: "assignments", label: "Assignments", icon: (
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-          )},
-          { id: "profile", label: "Settings", icon: (
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 1 0-16 0"/></svg>
-          )},
-        ].map(item => {
-          const isActive = activeNav === item.id;
-          return (
-            <button
-              key={item.id}
-              onClick={() => setActiveNav(item.id)}
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                gap: 3,
-                background: "none",
-                border: "none",
-                cursor: "pointer",
-                padding: "6px 12px",
-                color: isActive ? "var(--primary-learner)" : "#94A3B8",
-                fontWeight: isActive ? 700 : 500,
-                fontSize: "0.68rem",
-                transition: "color 0.15s ease",
-                minWidth: 52,
-              }}
-            >
-              {item.icon}
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
-      </nav>
     </div>
   );
 }

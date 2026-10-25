@@ -1,5 +1,22 @@
 import { useState, useEffect, useRef } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import {
+  Home as HomeIcon,
+  BookOpen,
+  LayoutDashboard,
+  LogIn,
+  FolderOpen,
+  User,
+  Menu,
+  Search,
+  Compass,
+  Info,
+  Briefcase,
+  ShieldCheck,
+  Bell,
+  LogOut,
+  X,
+} from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { COURSES_CATALOG } from "../data/courses";
 import { getResources, uploadResource, DEFAULT_RESOURCES } from "../contexts/resourcesService";
@@ -243,11 +260,14 @@ export default function Navbar() {
   const isActive = (path) => location.pathname === path;
 
   return (
+    <>
     <header className="site-navbar" ref={navRef}>
       {/* Brand Logo */}
       <Link to="/" className="brand-wrapper" id="nav-brand">
-        <div className="brand-logo-icon">P</div>
-        <span>Peleekings</span>
+        <div className="brand-logo-icon">
+          <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+        </div>
+        <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" />
       </Link>
 
 
@@ -297,8 +317,8 @@ export default function Navbar() {
                   style={{
                     position: "absolute",
                     top: "calc(100% + 12px)",
-                    right: -40,
-                    width: 320,
+                    right: 0,
+                    width: "min(330px, calc(100vw - 32px))",
                     background: "#FFFFFF",
                     border: "1px solid var(--border-light)",
                     borderRadius: "var(--radius-md)",
@@ -419,7 +439,7 @@ export default function Navbar() {
                       fontWeight: 600,
                     }}
                   >
-                    <span>⎋</span> Log Out
+                    <LogOut size={16} aria-hidden="true" /> Log Out
                   </button>
                 </div>
               )}
@@ -436,48 +456,128 @@ export default function Navbar() {
           </div>
         )}
 
-        {/* ── Mobile Hamburger Menu Toggle Button (Only shown when visitor is NOT logged in) ── */}
-        {!showAuthUser && (
-          <button
-            className="mobile-hamburger-btn"
-            onClick={() => setShowMobileMenu(prev => !prev)}
-            aria-label="Toggle navigation menu"
-          >
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-              {showMobileMenu ? (
-                <>
-                  <line x1="18" y1="6" x2="6" y2="18"></line>
-                  <line x1="6" y1="6" x2="18" y2="18"></line>
-                </>
-              ) : (
-                <>
-                  <line x1="3" y1="12" x2="21" y2="12"></line>
-                  <line x1="3" y1="6" x2="21" y2="6"></line>
-                  <line x1="3" y1="18" x2="21" y2="18"></line>
-                </>
-              )}
-            </svg>
-          </button>
-        )}
+        {/* ── Mobile Hamburger Menu Toggle Button (Available for all on mobile) ── */}
+        <button
+          className="mobile-hamburger-btn"
+          onClick={() => setShowMobileMenu(prev => !prev)}
+          aria-label="Toggle navigation menu"
+        >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            {showMobileMenu ? (
+              <>
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+              </>
+            ) : (
+              <>
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+              </>
+            )}
+          </svg>
+        </button>
       </div>
 
       {/* ── Mobile Drawer ───────────────────────────────────────────── */}
       {showMobileMenu && (
         <div className="mobile-nav-drawer">
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {/* User Profile Banner if Logged In */}
+            {showAuthUser && (
+              <div style={{ padding: "12px 14px", background: "#F8FAFC", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)", display: "flex", alignItems: "center", gap: 12 }}>
+                <div className="user-avatar-circle" style={{ width: 38, height: 38, fontSize: "0.85rem" }}>
+                  {currentUser?.photoURL ? (
+                    <img src={currentUser.photoURL} alt="Avatar" style={{ width: "100%", height: "100%", borderRadius: "50%", objectFit: "cover" }} />
+                  ) : initials}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 800, fontSize: "0.925rem", color: "var(--text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {currentUser?.displayName || userProfile?.fullName || "Learner"}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
+                    <span className={`pill-badge ${userProfile?.role === "admin" ? "pill-solid-dark" : userProfile?.role === "tutor" || userProfile?.role === "instructor" ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.65rem", padding: "1px 6px" }}>
+                      {userProfile?.role === "admin" ? "Admin" : userProfile?.role === "tutor" || userProfile?.role === "instructor" ? "Tutor" : "Student"}
+                    </span>
+                    {userProfile?.regNumber && (
+                      <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 600 }}>
+                        {userProfile.regNumber}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Search Trigger for Mobile */}
             <button
               className="mobile-nav-link"
-              style={{ textAlign: "left", background: "none", border: "none", display: "flex", alignItems: "center", gap: 10, color: "var(--primary-learner)", fontWeight: 600 }}
+              style={{ textAlign: "left", background: "#F1F5F9", borderRadius: "var(--radius-sm)", padding: "10px 14px", border: "none", display: "flex", alignItems: "center", gap: 10, color: "var(--primary-learner)", fontWeight: 600 }}
               onClick={() => {
                 setShowMobileMenu(false);
                 setShowSearchModal(true);
               }}
             >
-              <span>🔍</span> Search Courses
+              <Search size={18} aria-hidden="true" /> Search courses, skills, tools...
             </button>
 
-            {!isDashboard && (
+            {/* Navigation Destinations */}
+            {showAuthUser ? (
+              <>
+                <Link
+                  to="/dashboard"
+                  className={`mobile-nav-link ${isActive("/dashboard") ? "active" : ""}`}
+                  style={{ display: "flex", alignItems: "center", gap: 10 }}
+                  onClick={() => setShowMobileMenu(false)}
+                >
+                  <LayoutDashboard size={18} aria-hidden="true" /> Learner Dashboard
+                </Link>
+                <Link
+                  to="/"
+                  className={`mobile-nav-link ${isActive("/") ? "active" : ""}`}
+                  style={{ display: "flex", alignItems: "center", gap: 10 }}
+                  onClick={() => setShowMobileMenu(false)}
+                >
+                  <Compass size={18} aria-hidden="true" /> Course Catalog
+                </Link>
+                <button
+                  className="mobile-nav-link"
+                  style={{ textAlign: "left", background: "none", border: "none", display: "flex", alignItems: "center", gap: 10 }}
+                  onClick={() => {
+                    setShowMobileMenu(false);
+                    setShowResourcesModal(true);
+                  }}
+                >
+                  <FolderOpen size={18} aria-hidden="true" /> Platform Resources
+                </button>
+                <Link
+                  to="/about"
+                  className={`mobile-nav-link ${isActive("/about") ? "active" : ""}`}
+                  style={{ display: "flex", alignItems: "center", gap: 10 }}
+                  onClick={() => setShowMobileMenu(false)}
+                >
+                  <Info size={18} aria-hidden="true" /> About Us
+                </Link>
+                <Link
+                  to="/become-instructor"
+                  className={`mobile-nav-link ${isActive("/become-instructor") || isActive("/teach-portal") ? "active" : ""}`}
+                  style={{ display: "flex", alignItems: "center", gap: 10 }}
+                  onClick={() => setShowMobileMenu(false)}
+                >
+                  <Briefcase size={18} aria-hidden="true" /> Teaching Portal
+                </Link>
+                {userProfile?.role === "admin" && (
+                  <Link
+                    to="/admin"
+                    className={`mobile-nav-link ${isActive("/admin") ? "active" : ""}`}
+                    style={{ display: "flex", alignItems: "center", gap: 10 }}
+                    onClick={() => setShowMobileMenu(false)}
+                  >
+                    <ShieldCheck size={18} aria-hidden="true" /> Admin Console
+                  </Link>
+                )}
+              </>
+            ) : (
               <>
                 <Link
                   to="/"
@@ -528,30 +628,31 @@ export default function Navbar() {
                 >
                   About
                 </Link>
+                <Link
+                  to="/teach"
+                  className={`mobile-nav-link ${isActive("/teach") ? "active" : ""}`}
+                  onClick={() => setShowMobileMenu(false)}
+                >
+                  Teach on Peleekings
+                </Link>
               </>
             )}
 
-            <div style={{ borderTop: "1px solid var(--border-light)", paddingTop: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ borderTop: "1px solid var(--border-light)", paddingTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
               {showAuthUser ? (
-                <>
-                  {userProfile?.role === "admin" && (
-                    <Link to="/admin" className="btn btn-solid-dark" onClick={() => setShowMobileMenu(false)}>
-                      Admin Dashboard
-                    </Link>
-                  )}
-                  <Link to="/become-instructor" className="btn btn-outline" onClick={() => setShowMobileMenu(false)}>
-                    Teaching Portal
-                  </Link>
-                  <button onClick={handleLogout} className="btn btn-outline" style={{ color: "#DC2626" }}>
-                    Log Out
-                  </button>
-                </>
+                <button
+                  onClick={handleLogout}
+                  className="btn btn-outline"
+                  style={{ color: "#DC2626", borderColor: "#FCA5A5", fontWeight: 700, width: "100%", justifyContent: "center" }}
+                >
+                  <LogOut size={16} aria-hidden="true" /> Log Out
+                </button>
               ) : (
                 <>
-                  <Link to="/auth" state={{ mode: "login" }} className="btn btn-outline" onClick={() => setShowMobileMenu(false)}>
+                  <Link to="/auth" state={{ mode: "login" }} className="btn btn-outline" onClick={() => setShowMobileMenu(false)} style={{ width: "100%", justifyContent: "center" }}>
                     Sign In
                   </Link>
-                  <Link to="/auth" state={{ mode: "signup" }} className="btn btn-solid-dark" onClick={() => setShowMobileMenu(false)}>
+                  <Link to="/auth" state={{ mode: "signup" }} className="btn btn-solid-dark" onClick={() => setShowMobileMenu(false)} style={{ width: "100%", justifyContent: "center" }}>
                     Get Started Free &rarr;
                   </Link>
                 </>
@@ -573,9 +674,10 @@ export default function Navbar() {
               <button
                 className="btn-ghost"
                 onClick={() => setShowResourcesModal(false)}
-                style={{ fontSize: "1.2rem", cursor: "pointer", border: "none" }}
+                aria-label="Close resources modal"
+                style={{ fontSize: "1.2rem", cursor: "pointer", border: "none", display: "flex", alignItems: "center", justifyContent: "center" }}
               >
-                ✕
+                <X size={20} aria-hidden="true" />
               </button>
             </div>
 
@@ -645,7 +747,7 @@ export default function Navbar() {
                         />
                       </div>
 
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      <div className="form-grid-2col" style={{ gap: 10 }}>
                         <div>
                           <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-muted)", display: "block", marginBottom: 4 }}>
                             CATEGORY
@@ -707,20 +809,12 @@ export default function Navbar() {
               {platformResources.map((res) => (
                 <div
                   key={res.id}
-                  style={{
-                    padding: "14px 18px",
-                    border: "1px solid var(--border-light)",
-                    borderRadius: "var(--radius-sm)",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    background: "#FFFFFF",
-                  }}
+                  className="resource-item-card"
                 >
-                  <div style={{ maxWidth: "72%" }}>
+                  <div className="resource-item-info">
                     <div style={{ fontWeight: 700, fontSize: "0.925rem", color: "var(--text-primary)" }}>{res.title}</div>
                     <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 2 }}>{res.desc}</div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
                       <span className="pill-badge pill-success">{res.type}</span>
                       {res.fileSize && (
                         <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>{res.fileSize}</span>
@@ -760,8 +854,8 @@ export default function Navbar() {
           <div className="modal-dialog-box" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <div style={{ width: 40, height: 40, borderRadius: "50%", background: "var(--primary-learner-light)", color: "var(--primary-learner)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.2rem", flexShrink: 0 }}>
-                  🔔
+                <div style={{ width: 40, height: 40, borderRadius: "50%", background: "var(--primary-learner-light)", color: "var(--primary-learner)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <Bell size={20} aria-hidden="true" />
                 </div>
                 <div>
                   <h3 style={{ fontSize: "1.25rem", fontWeight: 800, color: "var(--text-primary)" }}>{selectedNotification.title}</h3>
@@ -771,9 +865,10 @@ export default function Navbar() {
               <button
                 className="btn-ghost"
                 onClick={() => setSelectedNotification(null)}
-                style={{ fontSize: "1.2rem", cursor: "pointer", border: "none" }}
+                aria-label="Close notification modal"
+                style={{ fontSize: "1.2rem", cursor: "pointer", border: "none", display: "flex", alignItems: "center", justifyContent: "center" }}
               >
-                ✕
+                <X size={20} aria-hidden="true" />
               </button>
             </div>
 
@@ -910,7 +1005,9 @@ export default function Navbar() {
                 ))
               ) : (
                 <div style={{ padding: "36px 16px", textAlign: "center", color: "var(--text-muted)" }}>
-                  <div style={{ fontSize: "2rem", marginBottom: 8 }}>🔍</div>
+                  <div style={{ display: "flex", justifyContent: "center", marginBottom: 8, color: "var(--text-light)" }}>
+                    <Search size={32} aria-hidden="true" />
+                  </div>
                   <div style={{ fontWeight: 600, fontSize: "1rem", color: "var(--text-primary)", marginBottom: 4 }}>
                     No courses found
                   </div>
@@ -935,5 +1032,73 @@ export default function Navbar() {
         </div>
       )}
     </header>
+
+    {/* ── Ergonomic Mobile Bottom Tab Bar (Pattern 1 Mobile Navigation Anchor) ── */}
+    <nav className="mobile-bottom-tab-bar" aria-label="Mobile Navigation">
+      <div className="mobile-bottom-tab-bar-inner">
+        <Link
+          to="/"
+          className={`mobile-tab-btn ${location.pathname === "/" && !showMobileMenu ? "active" : ""}`}
+          aria-label="Home"
+        >
+          <span className="tab-icon"><HomeIcon size={20} aria-hidden="true" /></span>
+          <span>Home</span>
+        </Link>
+
+        <Link
+          to={showAuthUser ? "/dashboard" : "/"}
+          onClick={(e) => {
+            if (location.pathname === "/") {
+              e.preventDefault();
+              setShowMobileMenu(false);
+              document.getElementById("courses-catalog-section")?.scrollIntoView({ behavior: "smooth" });
+            }
+          }}
+          className={`mobile-tab-btn ${location.pathname.startsWith("/course/") ? "active" : ""}`}
+          aria-label="Courses"
+        >
+          <span className="tab-icon"><BookOpen size={20} aria-hidden="true" /></span>
+          <span>Courses</span>
+        </Link>
+
+        <Link
+          to={showAuthUser ? "/dashboard" : "/auth"}
+          state={showAuthUser ? undefined : { mode: "login" }}
+          className={`mobile-tab-btn ${location.pathname === "/dashboard" ? "active" : ""}`}
+          aria-label={showAuthUser ? "Dashboard" : "Sign In"}
+        >
+          <span className="tab-icon">
+            {showAuthUser ? <LayoutDashboard size={20} aria-hidden="true" /> : <LogIn size={20} aria-hidden="true" />}
+          </span>
+          <span>{showAuthUser ? "Dashboard" : "Sign In"}</span>
+        </Link>
+
+        <button
+          type="button"
+          className="mobile-tab-btn"
+          onClick={() => {
+            setShowMobileMenu(false);
+            setShowResourcesModal(true);
+          }}
+          aria-label="Resources"
+        >
+          <span className="tab-icon"><FolderOpen size={20} aria-hidden="true" /></span>
+          <span>Resources</span>
+        </button>
+
+        <button
+          type="button"
+          className={`mobile-tab-btn ${showMobileMenu ? "active" : ""}`}
+          onClick={() => setShowMobileMenu(prev => !prev)}
+          aria-label={showAuthUser ? "Profile" : "Menu"}
+        >
+          <span className="tab-icon">
+            {showAuthUser ? <User size={20} aria-hidden="true" /> : <Menu size={20} aria-hidden="true" />}
+          </span>
+          <span>{showAuthUser ? "Profile" : "Menu"}</span>
+        </button>
+      </div>
+    </nav>
+    </>
   );
 }

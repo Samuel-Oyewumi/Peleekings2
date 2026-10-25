@@ -640,7 +640,7 @@ export default function TeachingPortal() {
     return (
       <div className="teaching-portal-container" style={{ minHeight: "85vh", background: "var(--bg-main)", padding: "40px 20px" }}>
         {toastMessage && (
-          <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#1C1D1F", color: "#FFFFFF", padding: "12px 20px", borderRadius: "8px", fontWeight: 600 }}>
+          <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#3C181A", color: "#FFFFFF", padding: "12px 20px", borderRadius: "8px", fontWeight: 600 }}>
             ✓ {toastMessage}
           </div>
         )}
@@ -828,7 +828,7 @@ export default function TeachingPortal() {
     <div className="teaching-portal-layout" style={{ minHeight: "100vh", background: "var(--bg-main)", display: "flex", flexDirection: "column" }}>
       {/* Toast Notification */}
       {toastMessage && (
-        <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#1C1D1F", color: "#FFFFFF", padding: "12px 20px", borderRadius: "8px", fontWeight: 600 }}>
+        <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#3C181A", color: "#FFFFFF", padding: "12px 20px", borderRadius: "8px", fontWeight: 600 }}>
           ✓ {toastMessage}
         </div>
       )}
@@ -836,7 +836,7 @@ export default function TeachingPortal() {
       {/* Stage 7: Distinct Teaching Portal Header */}
       <header
         style={{
-          background: "#1C1D1F",
+          background: "#3C181A",
           color: "#FFFFFF",
           padding: "16px 32px",
           display: "flex",
@@ -847,12 +847,11 @@ export default function TeachingPortal() {
       >
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <Link to="/" style={{ display: "flex", alignItems: "center", gap: 10, textDecoration: "none", color: "#FFFFFF" }}>
-            <div style={{ width: 34, height: 34, borderRadius: 8, background: "var(--primary-learner)", color: "#FFFFFF", fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center" }}>
-              P
+            <div className="brand-logo-icon" style={{ width: 34, height: 34, borderRadius: 8 }}>
+              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
             </div>
-            <span style={{ fontWeight: 800, fontSize: "1.15rem", letterSpacing: "-0.02em" }}>
-              Peleekings <span style={{ color: "#94A3B8", fontWeight: 500, fontSize: "0.9rem" }}>Teaching</span>
-            </span>
+            <img src="/assets/aistudio/20260925_194648_c89756b4.png" alt="Peleekings" className="brand-wordmark-img" style={{ height: 22 }} />
+            <span style={{ color: "#F9EFA7", fontWeight: 600, fontSize: "0.9rem" }}>Teaching</span>
           </Link>
           <span style={{ fontSize: "0.75rem", background: "rgba(255,255,255,0.15)", padding: "2px 8px", borderRadius: 4, textTransform: "uppercase", letterSpacing: "0.05em" }}>
             Instructor Portal
@@ -882,9 +881,9 @@ export default function TeachingPortal() {
         </div>
       </header>
 
-      {/* Navigation Sub-header */}
-      <div style={{ background: "#FFFFFF", borderBottom: "1px solid var(--border-light)", padding: "0 32px" }}>
-        <div style={{ display: "flex", gap: 24 }}>
+      {/* Navigation Sub-header (Touch-scrollable on mobile) */}
+      <div className="portal-subnav-bar">
+        <div style={{ display: "flex", gap: 24, minWidth: "max-content" }}>
           {[
             { id: "courses", label: "My Courses & Modules" },
             { id: "submissions", label: `Student Submissions (${submissions.length})` },
@@ -903,6 +902,7 @@ export default function TeachingPortal() {
                 color: activeTab === tab.id ? "var(--text-primary)" : "var(--text-muted)",
                 borderBottom: `2px solid ${activeTab === tab.id ? "var(--primary-learner)" : "transparent"}`,
                 cursor: "pointer",
+                whiteSpace: "nowrap",
               }}
             >
               {tab.label}
@@ -912,7 +912,7 @@ export default function TeachingPortal() {
       </div>
 
       {/* Main Content Area */}
-      <main style={{ flex: 1, padding: "32px", maxWidth: 1200, margin: "0 auto", width: "100%" }}>
+      <main className="portal-main-container">
         {/* ── TAB: COURSES & MODULES ─────────────────────────────────── */}
         {activeTab === "courses" && (
           <div>
@@ -1061,7 +1061,7 @@ export default function TeachingPortal() {
                         onClick={() => setAddContentType(t)}
                         style={{
                           flex: 1, padding: "8px 6px", border: "none", borderRadius: 6, cursor: "pointer", fontSize: "0.8rem", fontWeight: 700,
-                          background: addContentType === t ? "#1C1D1F" : "transparent",
+                          background: addContentType === t ? "#3C181A" : "transparent",
                           color: addContentType === t ? "#FFFFFF" : "var(--text-muted)",
                           textTransform: "capitalize",
                         }}
