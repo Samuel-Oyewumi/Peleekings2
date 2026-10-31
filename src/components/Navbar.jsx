@@ -270,23 +270,88 @@ export default function Navbar() {
         <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" />
       </Link>
 
-
+      {/* Desktop Navigation Links */}
+      <nav className="nav-links-menu" aria-label="Main Navigation">
+        {isLanding && !showAuthUser ? (
+          <>
+            <Link
+              to="/"
+              className={`nav-item-link ${isActive("/") && activeSection === "courses" ? "active" : ""}`}
+              onClick={() => {
+                setActiveSection("courses");
+                document.getElementById("courses-catalog-section")?.scrollIntoView({ behavior: "smooth" });
+              }}
+            >
+              Courses
+            </Link>
+            <Link
+              to="/"
+              className={`nav-item-link ${isActive("/") && activeSection === "learning-paths" ? "active" : ""}`}
+              onClick={(e) => {
+                e.preventDefault();
+                setActiveSection("learning-paths");
+                document.getElementById("learning-paths-section")?.scrollIntoView({ behavior: "smooth" });
+              }}
+            >
+              Learning Paths
+            </Link>
+            <button
+              type="button"
+              className="nav-item-link"
+              style={{ background: "none", border: "none", cursor: "pointer" }}
+              onClick={() => setShowResourcesModal(true)}
+            >
+              Resources
+            </button>
+            <Link to="/about" className={`nav-item-link ${isActive("/about") ? "active" : ""}`}>
+              About
+            </Link>
+            <Link to="/teach" className={`nav-item-link ${isActive("/teach") ? "active" : ""}`}>
+              Teach on Peleekings
+            </Link>
+          </>
+        ) : (
+          <>
+            <Link to="/dashboard" className={`nav-item-link ${isDashboard ? "active" : ""}`}>
+              Dashboard
+            </Link>
+            <Link to="/" className={`nav-item-link ${isActive("/") ? "active" : ""}`}>
+              Catalog
+            </Link>
+            <button
+              type="button"
+              className="nav-item-link"
+              style={{ background: "none", border: "none", cursor: "pointer" }}
+              onClick={() => setShowResourcesModal(true)}
+            >
+              Resources
+            </button>
+            <Link to="/about" className={`nav-item-link ${isActive("/about") ? "active" : ""}`}>
+              About
+            </Link>
+            <Link
+              to={showAuthUser ? "/teach-portal" : "/teach"}
+              className={`nav-item-link ${isActive("/teach-portal") || isActive("/teach") ? "active" : ""}`}
+            >
+              {showAuthUser ? "Teaching Portal" : "Teach"}
+            </Link>
+          </>
+        )}
+      </nav>
 
       {/* Right Actions */}
       <div className="nav-actions-group">
         {/* Active Search Button Trigger */}
         <button
-          className="btn-ghost"
-          style={{ width: 38, height: 38, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+          type="button"
+          className="btn-ghost nav-search-trigger"
+          style={{ width: 38, height: 38, padding: 0, flexShrink: 0, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
           onClick={() => setShowSearchModal(true)}
           title="Search courses (Ctrl+K)"
           aria-label="Search courses"
           id="nav-search-btn"
         >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="11" cy="11" r="8"></circle>
-            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-          </svg>
+          <Search size={18} strokeWidth={2.2} aria-hidden="true" />
         </button>
 
         {showAuthUser ? (
@@ -410,8 +475,8 @@ export default function Navbar() {
                       {currentUser?.email || ""}
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
-                      <span className={`pill-badge ${userProfile?.role === "admin" ? "pill-solid-dark" : userProfile?.role === "tutor" || userProfile?.role === "instructor" ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
-                        {userProfile?.role === "admin" ? "Admin" : userProfile?.role === "tutor" || userProfile?.role === "instructor" ? "Tutor" : "Student"}
+                      <span className={`pill-badge ${userProfile?.role === "admin" ? "pill-solid-dark" : userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.submittedRole === "tutor" ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
+                        {userProfile?.role === "admin" ? "Admin" : userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.submittedRole === "tutor" ? "Tutor" : "Student"}
                       </span>
                       {userProfile?.regNumber && (
                         <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontWeight: 600 }}>
@@ -419,6 +484,33 @@ export default function Navbar() {
                         </span>
                       )}
                     </div>
+                  </div>
+
+                  {/* Quick Portal Links */}
+                  <div style={{ padding: "6px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+                    <Link
+                      to="/dashboard"
+                      onClick={() => setShowMenu(false)}
+                      style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", fontSize: "0.85rem", color: "var(--text-primary)", textDecoration: "none", fontWeight: 600 }}
+                    >
+                      <LayoutDashboard size={15} aria-hidden="true" /> Learner Dashboard
+                    </Link>
+                    <Link
+                      to="/teach-portal"
+                      onClick={() => setShowMenu(false)}
+                      style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", fontSize: "0.85rem", color: "var(--text-primary)", textDecoration: "none", fontWeight: 600 }}
+                    >
+                      <Briefcase size={15} aria-hidden="true" /> Teaching Portal
+                    </Link>
+                    {userProfile?.role === "admin" && (
+                      <Link
+                        to="/admin"
+                        onClick={() => setShowMenu(false)}
+                        style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", fontSize: "0.85rem", color: "var(--text-primary)", textDecoration: "none", fontWeight: 600 }}
+                      >
+                        <ShieldCheck size={15} aria-hidden="true" /> Admin Console
+                      </Link>
+                    )}
                   </div>
 
                   {/* Log Out */}
@@ -446,11 +538,11 @@ export default function Navbar() {
             </div>
           </div>
         ) : (
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <Link to="/auth" state={{ mode: "login" }} className="btn btn-ghost" id="nav-login-btn">
+          <div className="nav-guest-auth-btns" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <Link to="/auth" state={{ mode: "login" }} className="btn btn-ghost nav-login-link" id="nav-login-btn">
               Log in
             </Link>
-            <Link to="/auth" state={{ mode: "signup" }} className="btn btn-solid-dark" id="nav-get-started-btn">
+            <Link to="/auth" state={{ mode: "signup" }} className="btn btn-solid-dark nav-signup-link" id="nav-get-started-btn">
               Get Started
             </Link>
           </div>
@@ -496,8 +588,8 @@ export default function Navbar() {
                     {currentUser?.displayName || userProfile?.fullName || "Learner"}
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
-                    <span className={`pill-badge ${userProfile?.role === "admin" ? "pill-solid-dark" : userProfile?.role === "tutor" || userProfile?.role === "instructor" ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.65rem", padding: "1px 6px" }}>
-                      {userProfile?.role === "admin" ? "Admin" : userProfile?.role === "tutor" || userProfile?.role === "instructor" ? "Tutor" : "Student"}
+                    <span className={`pill-badge ${userProfile?.role === "admin" ? "pill-solid-dark" : userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.submittedRole === "tutor" ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.65rem", padding: "1px 6px" }}>
+                      {userProfile?.role === "admin" ? "Admin" : userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.submittedRole === "tutor" ? "Tutor" : "Student"}
                     </span>
                     {userProfile?.regNumber && (
                       <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 600 }}>
@@ -559,8 +651,8 @@ export default function Navbar() {
                   <Info size={18} aria-hidden="true" /> About Us
                 </Link>
                 <Link
-                  to="/become-instructor"
-                  className={`mobile-nav-link ${isActive("/become-instructor") || isActive("/teach-portal") ? "active" : ""}`}
+                  to="/teach-portal"
+                  className={`mobile-nav-link ${isActive("/teach-portal") || isActive("/become-instructor") ? "active" : ""}`}
                   style={{ display: "flex", alignItems: "center", gap: 10 }}
                   onClick={() => setShowMobileMenu(false)}
                 >

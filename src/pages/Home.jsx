@@ -1,13 +1,18 @@
 import { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { GraduationCap, Briefcase, Target, Sparkles, Search, X } from "lucide-react";
+import { GraduationCap, Briefcase, Target, Sparkles, Search, X, Award, ArrowRight } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { getUserActivity } from "../contexts/userActivity";
 import { COURSES_CATALOG } from "../data/courses";
 export { COURSES_CATALOG };
 
+// Swap in a local image by placing your file at public/assets/hero-photo.jpg
+// and changing HERO_PHOTO below to "/assets/hero-photo.jpg".
+const HERO_PHOTO =
+  "https://images.unsplash.com/photo-1522202176988-66273c2fd55f?w=1200&auto=format&fit=crop&q=80";
+
 export default function Home() {
-  const { currentUser } = useAuth();
+  const { currentUser, userProfile } = useAuth();
   const navigate = useNavigate();
   const [activeFilter, setActiveFilter] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
@@ -15,12 +20,19 @@ export default function Home() {
   const [showHowItWorksModal, setShowHowItWorksModal] = useState(false);
   const [userActivity, setUserActivity] = useState(() => getUserActivity(currentUser?.uid));
 
-  // Redirect authenticated users away from the landing page
+  // Redirect authenticated users to their role portal
   useEffect(() => {
     if (currentUser) {
-      navigate("/dashboard", { replace: true });
+      const effectiveRole = userProfile?.role || userProfile?.submittedRole;
+      if (effectiveRole === "admin") {
+        navigate("/admin", { replace: true });
+      } else if (effectiveRole === "tutor" || effectiveRole === "instructor") {
+        navigate("/teach-portal", { replace: true });
+      } else {
+        navigate("/dashboard", { replace: true });
+      }
     }
-  }, [currentUser, navigate]);
+  }, [currentUser, userProfile?.role, userProfile?.submittedRole, navigate]);
 
   useEffect(() => {
     setUserActivity(getUserActivity(currentUser?.uid));
@@ -44,6 +56,8 @@ export default function Home() {
     image: "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=500&auto=format&fit=crop&q=80"
   };
 
+  const courseCount = (category) => COURSES_CATALOG.filter(c => c.category === category).length;
+
   const filteredCourses = COURSES_CATALOG.filter(course => {
     const matchesFilter = activeFilter === "All" || course.category === activeFilter;
     const matchesSearch =
@@ -57,18 +71,27 @@ export default function Home() {
     <div className="app-container">
       {/* ── Hero Section (Screen 1) ─────────────────────────────────── */}
       <section className="landing-hero">
+        <div className="hero-coral-glow" aria-hidden="true" />
         <div className={`hero-content-grid ${!currentUser ? "hero-grid-visitor" : ""}`}>
           {/* Left Hero Column */}
-          <div>
+          <div className="hero-copy-col">
+            <div className="hero-kicker-pill">
+              <span className="hero-kicker-dot" aria-hidden="true" />
+              <span>Online classes &middot; Hands-on training</span>
+            </div>
+
             <h1 className="hero-headline">
-              Learn practical skills.<br />Build your future.
+              Learn practical skills.
+              <span className="hero-headline-accent">Build your future.</span>
             </h1>
+
             <p className="hero-subtext">
               Professional courses designed to help you develop relevant, practical skills through online learning and hands-on training.
             </p>
+
             <div className="hero-cta-row">
               <button
-                className="btn btn-solid-dark btn-lg"
+                className="btn btn-solid-dark btn-lg hero-btn-primary"
                 id="hero-explore-btn"
                 onClick={() => {
                   const catalog = document.getElementById("courses-catalog-section");
@@ -78,7 +101,7 @@ export default function Home() {
                 Explore Courses &rarr;
               </button>
               <button
-                className="btn btn-outline btn-lg"
+                className="btn btn-outline btn-lg hero-btn-secondary"
                 id="hero-how-it-works-btn"
                 onClick={() => setShowHowItWorksModal(true)}
               >
@@ -91,63 +114,73 @@ export default function Home() {
               <Link
                 to="/auth"
                 state={{ tab: "student", mode: "signup" }}
-                style={{
-                  background: "#FFFFFF",
-                  border: "2px solid #EC586E",
-                  borderRadius: "12px",
-                  padding: "18px",
-                  textDecoration: "none",
-                  display: "flex",
-                  flexDirection: "column",
-                  justifyContent: "space-between",
-                  transition: "transform 0.2s ease, box-shadow 0.2s ease",
-                }}
+                className="role-card hero-role-card hero-role-card-student"
               >
-                <div>
-                  <div style={{ color: "#EC586E", marginBottom: 8 }}>
-                    <GraduationCap size={26} aria-hidden="true" />
-                  </div>
-                  <div style={{ fontWeight: 800, fontSize: "1.05rem", color: "#EC586E", marginBottom: 4 }}>
-                    I'm a Student
-                  </div>
-                  <div style={{ fontSize: "0.825rem", color: "#64748B", lineHeight: 1.4 }}>
-                    Browse courses and start learning today.
-                  </div>
+                <div className="hero-role-icon hero-role-icon-student">
+                  <GraduationCap size={22} aria-hidden="true" />
                 </div>
-                <div style={{ fontSize: "0.825rem", fontWeight: 700, color: "#EC586E", marginTop: 12 }}>
+                <div className="hero-role-title hero-role-title-student">
+                  I'm a Student
+                </div>
+                <div className="hero-role-desc">
+                  Browse courses and start learning today.
+                </div>
+                <div className="hero-role-cta hero-role-cta-student">
                   Start Learning &rarr;
                 </div>
               </Link>
 
               <Link
                 to="/teach"
-                style={{
-                  background: "#FFFFFF",
-                  border: "2px solid #3C181A",
-                  borderRadius: "12px",
-                  padding: "18px",
-                  textDecoration: "none",
-                  display: "flex",
-                  flexDirection: "column",
-                  justifyContent: "space-between",
-                  transition: "transform 0.2s ease, box-shadow 0.2s ease",
-                }}
+                className="role-card hero-role-card hero-role-card-tutor"
               >
-                <div>
-                  <div style={{ color: "#3C181A", marginBottom: 8 }}>
-                    <Briefcase size={24} aria-hidden="true" />
-                  </div>
-                  <div style={{ fontWeight: 800, fontSize: "1.05rem", color: "#3C181A", marginBottom: 4 }}>
-                    I'm a Tutor
-                  </div>
-                  <div style={{ fontSize: "0.825rem", color: "#64748B", lineHeight: 1.4 }}>
-                    Apply to teach your own course.
-                  </div>
+                <div className="hero-role-icon hero-role-icon-tutor">
+                  <Briefcase size={20} aria-hidden="true" />
                 </div>
-                <div style={{ fontSize: "0.825rem", fontWeight: 700, color: "#3C181A", marginTop: 12 }}>
+                <div className="hero-role-title hero-role-title-tutor">
+                  I'm a Tutor
+                </div>
+                <div className="hero-role-desc">
+                  Apply to teach your own course.
+                </div>
+                <div className="hero-role-cta hero-role-cta-tutor">
                   Teach on Peleekings &rarr;
                 </div>
               </Link>
+            </div>
+          </div>
+
+          {/* Right Hero Column: Learner Photo Frame */}
+          <div className="hero-photo-col">
+            <div className="hero-photo-stage">
+              <div className="hero-photo-outline" aria-hidden="true" />
+              <div className="hero-photo-frame">
+                <div className="hero-photo-fallback" aria-hidden="true">
+                  <img
+                    src="/assets/aistudio/20260925_194828_31921ef2.png"
+                    alt=""
+                    className="hero-photo-fallback-logo"
+                  />
+                </div>
+                <img
+                  src={HERO_PHOTO}
+                  alt="Students learning practical skills on laptops"
+                  className="hero-photo-img"
+                  onError={(e) => {
+                    e.currentTarget.style.display = "none";
+                  }}
+                />
+              </div>
+
+              <div className="hero-floating-badge">
+                <div className="hero-floating-badge-icon" aria-hidden="true">
+                  <Award size={22} />
+                </div>
+                <div className="hero-floating-badge-text">
+                  <div className="hero-floating-badge-title">Earn certificates</div>
+                  <div className="hero-floating-badge-sub">Show what you've learned</div>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -246,7 +279,7 @@ export default function Home() {
               </div>
               <div>
                 <div style={{ fontWeight: 700, fontSize: "1.1rem" }}>Tech &amp; Digital Skills</div>
-                <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>8 courses available</div>
+                <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>{courseCount("Tech & Digital Skills")} courses available</div>
               </div>
             </div>
             <div className="skill-tags-list">
@@ -259,6 +292,16 @@ export default function Home() {
               <div className="skill-tag-item">Videography &amp; Video Editing</div>
               <div className="skill-tag-item">Livestreaming</div>
             </div>
+            <button
+              type="button"
+              className="skill-box-cta"
+              onClick={() => {
+                setActiveFilter("Tech & Digital Skills");
+                document.getElementById("courses-catalog-section")?.scrollIntoView({ behavior: "smooth" });
+              }}
+            >
+              Browse Tech &amp; Digital courses <ArrowRight size={16} aria-hidden="true" />
+            </button>
           </div>
 
           {/* Card 2: Professional Skills */}
@@ -271,13 +314,23 @@ export default function Home() {
               </div>
               <div>
                 <div style={{ fontWeight: 700, fontSize: "1.1rem" }}>Professional Skills</div>
-                <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>2 courses available</div>
+                <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>{courseCount("Professional Skills")} courses available</div>
               </div>
             </div>
             <div className="skill-tags-list">
               <div className="skill-tag-item">Broadcasting &amp; Media</div>
               <div className="skill-tag-item">Project Management &amp; Agile</div>
             </div>
+            <button
+              type="button"
+              className="skill-box-cta"
+              onClick={() => {
+                setActiveFilter("Professional Skills");
+                document.getElementById("courses-catalog-section")?.scrollIntoView({ behavior: "smooth" });
+              }}
+            >
+              Browse Professional courses <ArrowRight size={16} aria-hidden="true" />
+            </button>
           </div>
         </div>
       </section>
@@ -310,7 +363,12 @@ export default function Home() {
 
             {/* Search Input */}
             <div className="search-input-field" style={{ position: "relative" }}>
-              <Search size={16} aria-hidden="true" style={{ color: "var(--text-muted)", flexShrink: 0 }} />
+              <Search
+                size={16}
+                aria-hidden="true"
+                className="search-input-icon"
+                style={{ color: "var(--text-muted)", flexShrink: 0 }}
+              />
               <input
                 id="catalog-search-input"
                 type="text"

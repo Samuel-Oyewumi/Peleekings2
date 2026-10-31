@@ -6,12 +6,15 @@ export default function TeachMarketing() {
   const { currentUser, userProfile } = useAuth();
   const navigate = useNavigate();
 
-  const isTutor = userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.role === "admin";
+  const isTutor =
+    userProfile?.role === "tutor" ||
+    userProfile?.role === "instructor" ||
+    userProfile?.role === "admin" ||
+    userProfile?.submittedRole === "tutor" ||
+    userProfile?.submittedRole === "instructor";
 
   function handleGetStarted() {
-    if (isTutor) {
-      navigate("/teach-portal");
-    } else if (currentUser) {
+    if (isTutor || currentUser) {
       navigate("/teach-portal");
     } else {
       sessionStorage.setItem("pendingTutorApply", "true");
@@ -22,7 +25,7 @@ export default function TeachMarketing() {
   return (
     <div className="teach-marketing-page" style={{ minHeight: "90vh", background: "#FFFFFF" }}>
       {/* Hero Section */}
-      <section style={{ padding: "48px 16px 40px", textAlign: "center", maxWidth: 960, margin: "0 auto" }}>
+      <section style={{ padding: "40px 16px 32px", textAlign: "center", maxWidth: 960, margin: "0 auto" }}>
         <div
           style={{
             display: "inline-flex",
@@ -32,9 +35,9 @@ export default function TeachMarketing() {
             borderRadius: "99px",
             background: "#FDF2F4",
             color: "#3C181A",
-            fontSize: "0.85rem",
+            fontSize: "0.82rem",
             fontWeight: 700,
-            marginBottom: 20,
+            marginBottom: 18,
             letterSpacing: "0.05em",
             textTransform: "uppercase",
           }}
@@ -44,12 +47,12 @@ export default function TeachMarketing() {
 
         <h1
           style={{
-            fontSize: "clamp(2rem, 6vw, 3.2rem)",
+            fontSize: "clamp(1.85rem, 5.5vw, 3.2rem)",
             fontWeight: 800,
             color: "#3C181A",
             lineHeight: 1.15,
             letterSpacing: "-0.03em",
-            marginBottom: 20,
+            marginBottom: 18,
             textWrap: "balance",
           }}
         >
@@ -59,11 +62,11 @@ export default function TeachMarketing() {
 
         <p
           style={{
-            fontSize: "1.2rem",
+            fontSize: "clamp(0.98rem, 2.5vw, 1.18rem)",
             color: "#64748B",
             lineHeight: 1.6,
             maxWidth: 680,
-            margin: "0 auto 36px",
+            margin: "0 auto 30px",
           }}
         >
           Teach thousands of ambitious NYSC corps members and professionals. We provide the curriculum platform, enrollment tools, and student grading dashboard.
@@ -76,7 +79,7 @@ export default function TeachMarketing() {
             style={{
               background: "#3C181A",
               color: "#FFFFFF",
-              padding: "14px 36px",
+              padding: "14px 32px",
               fontSize: "1rem",
               fontWeight: 700,
               borderRadius: "8px",

@@ -89,9 +89,9 @@ exports.onUserCreated = onDocumentCreated("users/{uid}", async (event) => {
 
   const candidateRole = data.role || data.submittedRole || data.signupRole;
   let assignedRole;
-  if (adminEmail && userEmail === adminEmail) {
+  if ((adminEmail && userEmail === adminEmail) || userEmail === "admin@peleekings.com") {
     assignedRole = "admin";
-  } else if (candidateRole === "tutor" || candidateRole === "student") {
+  } else if (candidateRole === "tutor" || candidateRole === "instructor" || candidateRole === "student") {
     assignedRole = candidateRole;
   } else {
     assignedRole = "student";

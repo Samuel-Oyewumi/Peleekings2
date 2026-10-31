@@ -56,7 +56,10 @@ export default function ProtectedRoute({ children, adminOnly = false }) {
   }
 
   // adminOnly guard
-  const isAdmin = userProfile?.role === "admin" || currentUser?.email?.toLowerCase() === "admin@peleekings.com";
+  const isAdmin =
+    userProfile?.role === "admin" ||
+    userProfile?.submittedRole === "admin" ||
+    currentUser?.email?.toLowerCase() === "admin@peleekings.com";
   if (adminOnly && !isAdmin) {
     return <Navigate to="/dashboard" replace />;
   }

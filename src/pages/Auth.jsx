@@ -1,16 +1,17 @@
 import { useState } from "react";
 import { useNavigate, useLocation, Link } from "react-router-dom";
+import { User, GraduationCap } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 
 export default function Auth() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { login, signup, resetPassword } = useAuth();
+  const { login, signup, logout, resetPassword } = useAuth();
 
   // Mode: "signup" or "login"
   const initialMode = location.state?.mode || "signup";
   const [authMode, setAuthMode] = useState(initialMode);
-  const [roleTab, setRoleTab] = useState(location.state?.tab || "student"); // "student" or "tutor"
+  const [roleTab, setRoleTab] = useState(location.state?.tab || "student"); // "student" | "tutor" | "admin"
 
   // Registration type: "corper" vs "non_corper"
   const [studentType, setStudentType] = useState("non_corper");
@@ -62,7 +63,7 @@ export default function Auth() {
         if (!formData.email.trim()) {
           throw new Error("Please enter a valid email address.");
         }
-        if (studentType === "corper" && !formData.nyscStateCode.trim()) {
+        if (roleTab === "student" && studentType === "corper" && !formData.nyscStateCode.trim()) {
           throw new Error("Please enter your NYSC State Code.");
         }
         if (!formData.password || formData.password.length < 6) {
@@ -75,14 +76,15 @@ export default function Auth() {
         const cleanEmail = formData.email.trim().toLowerCase();
         const isAdmin = cleanEmail === "admin@peleekings.com";
         const fullName = `${formData.surname.trim()} ${formData.firstName.trim()}`;
+        const effectiveStudentType = roleTab === "tutor" ? "non_corper" : studentType;
         const customProfile = {
           fullName,
           surname: formData.surname.trim(),
           firstName: formData.firstName.trim(),
           otherName: formData.otherName.trim() || null,
           phoneNumber: formData.phoneNumber.trim() || "",
-          studentType,
-          nyscStateCode: studentType === "corper" ? formData.nyscStateCode.trim() : null,
+          studentType: effectiveStudentType,
+          nyscStateCode: effectiveStudentType === "corper" ? formData.nyscStateCode.trim() : null,
           submittedRole: isAdmin ? "admin" : (roleTab === "tutor" ? "tutor" : "student"),
         };
 
@@ -103,15 +105,35 @@ export default function Auth() {
         if (!cleanEmail) throw new Error("Please enter your email address.");
         if (!formData.password) throw new Error("Please enter your password.");
 
-        const authRes = await login(cleanEmail, formData.password);
+        const authRes = await login(cleanEmail, formData.password, roleTab);
         const role = authRes.role;
         const profile = authRes.profile;
+        const isUserAdmin =
+          roleTab === "admin" ||
+          role === "admin" ||
+          cleanEmail === "admin@peleekings.com" ||
+          profile?.role === "admin" ||
+          profile?.submittedRole === "admin";
+        const isUserTutor =
+          roleTab === "tutor" ||
+          role === "tutor" ||
+          role === "instructor" ||
+          profile?.role === "tutor" ||
+          profile?.role === "instructor" ||
+          profile?.submittedRole === "tutor";
+
+        // Validate Admin tab access: prevent non-admin accounts from logging in through Admin tab
+        if (roleTab === "admin" && !isUserAdmin) {
+          await logout();
+          throw new Error("Access denied: This account does not have Administrator privileges. Please use the Student or Tutor tab.");
+        }
+
         setLoading(false);
 
-        // Auto-detect admin: If email is admin@peleekings.com or role is admin, take directly to /admin
-        if (role === "admin" || cleanEmail === "admin@peleekings.com" || profile?.role === "admin") {
+        // Route based on verified role or selected tab
+        if (isUserAdmin) {
           navigate("/admin", { state: { welcomeToast: "Welcome Admin! Signed in successfully." } });
-        } else if (role === "tutor" || role === "instructor" || roleTab === "tutor") {
+        } else if (isUserTutor || roleTab === "tutor") {
           navigate("/teach-portal", { state: { welcomeToast: `Welcome back, ${profile?.fullName || "Instructor"}!` } });
         } else {
           navigate("/dashboard", {
@@ -122,7 +144,6 @@ export default function Auth() {
         }
       }
     } catch (err) {
-      console.error(err);
       setError(err.message || "Authentication error. Please check your credentials.");
       setLoading(false);
     }
@@ -131,7 +152,7 @@ export default function Auth() {
   function handleContinueFromConfirmation() {
     if (formData.email.trim().toLowerCase() === "admin@peleekings.com" || registeredProfile?.role === "admin") {
       navigate("/admin", { state: { welcomeToast: "Welcome Admin! Signed in successfully." } });
-    } else if (roleTab === "tutor") {
+    } else if (roleTab === "tutor" || registeredProfile?.role === "tutor" || registeredProfile?.submittedRole === "tutor") {
       navigate("/teach-portal", {
         state: { welcomeToast: `Welcome ${registeredProfile?.fullName || ""}! You can now access your teaching portal.` },
       });
@@ -242,6 +263,7 @@ export default function Auth() {
                 className={`auth-nav-tab-btn ${authMode === "signup" ? "active" : ""}`}
                 onClick={() => {
                   setAuthMode("signup");
+                  if (roleTab === "admin") setRoleTab("student");
                   setError("");
                 }}
               >
@@ -249,22 +271,76 @@ export default function Auth() {
               </button>
             </div>
 
-            {/* Student vs Tutor Tabs for Login */}
-            {authMode === "login" && (
-              <div
+            {/* Role Selector Tabs: Student / Tutor / Admin (Login) or Student / Tutor (Sign Up) */}
+            <div
+              className="auth-role-tabs"
+              style={{
+                display: "grid",
+                gridTemplateColumns: authMode === "login" ? "1fr 1fr 1fr" : "1fr 1fr",
+                gap: 6,
+                marginBottom: 14,
+                padding: 4,
+                background: "var(--bg-subtle)",
+                borderRadius: "8px",
+              }}
+            >
+              <button
+                type="button"
+                className={`auth-role-tab-btn ${roleTab === "student" ? "selected" : ""}`}
+                onClick={() => {
+                  setRoleTab("student");
+                  setError("");
+                }}
                 style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr 1fr",
-                  gap: 6,
-                  marginBottom: 14,
-                  padding: 4,
-                  background: "var(--bg-subtle)",
-                  borderRadius: "8px",
+                  padding: "8px 8px",
+                  borderRadius: "6px",
+                  fontSize: "0.85rem",
+                  fontWeight: 600,
+                  border: "none",
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                  background: roleTab === "student" ? "#D13F57" : "transparent",
+                  color: roleTab === "student" ? "#FFFFFF" : "var(--text-muted)",
+                  transition: "all 0.15s ease",
                 }}
               >
+                Student
+              </button>
+              <button
+                type="button"
+                className={`auth-role-tab-btn ${roleTab === "tutor" ? "selected" : ""}`}
+                onClick={() => {
+                  setRoleTab("tutor");
+                  setError("");
+                }}
+                style={{
+                  padding: "8px 8px",
+                  borderRadius: "6px",
+                  fontSize: "0.85rem",
+                  fontWeight: 600,
+                  border: "none",
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                  background:
+                    roleTab === "tutor"
+                      ? authMode === "signup"
+                        ? "#D13F57"
+                        : "var(--tutor-accent)"
+                      : "transparent",
+                  color: roleTab === "tutor" ? "#FFFFFF" : "var(--text-muted)",
+                  transition: "all 0.15s ease",
+                }}
+              >
+                Tutor
+              </button>
+              {authMode === "login" && (
                 <button
                   type="button"
-                  onClick={() => setRoleTab("student")}
+                  className={`auth-role-tab-btn ${roleTab === "admin" ? "selected" : ""}`}
+                  onClick={() => {
+                    setRoleTab("admin");
+                    setError("");
+                  }}
                   style={{
                     padding: "8px 8px",
                     borderRadius: "6px",
@@ -272,32 +348,16 @@ export default function Auth() {
                     fontWeight: 600,
                     border: "none",
                     cursor: "pointer",
-                    background: roleTab === "student" ? "var(--primary-learner)" : "transparent",
-                    color: roleTab === "student" ? "#FFFFFF" : "var(--text-muted)",
+                    whiteSpace: "nowrap",
+                    background: roleTab === "admin" ? "#0F172A" : "transparent",
+                    color: roleTab === "admin" ? "#FFFFFF" : "var(--text-muted)",
                     transition: "all 0.15s ease",
                   }}
                 >
-                  Student
+                  Admin
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setRoleTab("tutor")}
-                  style={{
-                    padding: "8px 8px",
-                    borderRadius: "6px",
-                    fontSize: "0.85rem",
-                    fontWeight: 600,
-                    border: "none",
-                    cursor: "pointer",
-                    background: roleTab === "tutor" ? "var(--tutor-accent)" : "transparent",
-                    color: roleTab === "tutor" ? "#FFFFFF" : "var(--text-muted)",
-                    transition: "all 0.15s ease",
-                  }}
-                >
-                  Tutor
-                </button>
-              </div>
-            )}
+              )}
+            </div>
 
             {error && (
               <div
@@ -317,38 +377,33 @@ export default function Auth() {
             <form onSubmit={handleSubmit}>
               {authMode === "signup" && (
                 <>
-                  {/* Corper vs Non-Corper Selection Buttons */}
-                  <div className="corper-selector-group">
-                    <button
-                      type="button"
-                      className={`corper-select-btn ${studentType === "non_corper" ? "selected" : ""}`}
-                      onClick={() => handleTypeSelect("non_corper")}
-                    >
-                      <span>👤</span>
-                      Non-Corper
-                    </button>
-                    <button
-                      type="button"
-                      className={`corper-select-btn ${studentType === "corper" ? "selected" : ""}`}
-                      onClick={() => handleTypeSelect("corper")}
-                    >
-                      <span>🎓</span>
-                      Corper
-                    </button>
-                  </div>
+                  {/* Corper vs Non-Corper Selection Buttons (Learner mode only) */}
+                  {roleTab === "student" && (
+                    <div className="corper-selector-group">
+                      <button
+                        type="button"
+                        className={`corper-select-btn ${studentType === "non_corper" ? "selected" : ""}`}
+                        onClick={() => handleTypeSelect("non_corper")}
+                      >
+                        <User size={18} aria-hidden="true" />
+                        <span className="corper-select-label">Non-Corper</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={`corper-select-btn ${studentType === "corper" ? "selected" : ""}`}
+                        onClick={() => handleTypeSelect("corper")}
+                      >
+                        <GraduationCap size={18} aria-hidden="true" />
+                        <span className="corper-select-label">Corper</span>
+                      </button>
+                    </div>
+                  )}
 
                   {/* Personal Information Group */}
-                  <div
-                    style={{
-                      fontSize: "0.8rem",
-                      fontWeight: 700,
-                      color: "var(--text-muted)",
-                      textTransform: "uppercase",
-                      letterSpacing: "0.05em",
-                      marginBottom: 12,
-                    }}
-                  >
-                    Personal Information ({studentType === "non_corper" ? "Non-Corper" : "Corper"})
+                  <div className="auth-section-label">
+                    {roleTab === "tutor"
+                      ? "Instructor Profile Information"
+                      : "Personal Information"}
                   </div>
 
                   <div className="form-grid-2col">
@@ -410,8 +465,8 @@ export default function Auth() {
                     />
                   </div>
 
-                  {/* NYSC Information (Only visible if Corper) */}
-                  {studentType === "corper" && (
+                  {/* NYSC Information (Only visible if Student + Corper) */}
+                  {roleTab === "student" && studentType === "corper" && (
                     <div>
                       <div
                         style={{
@@ -478,7 +533,7 @@ export default function Auth() {
                       type="email"
                       name="email"
                       required
-                      placeholder="name@example.com"
+                      placeholder={roleTab === "admin" ? "admin@peleekings.com" : "name@example.com"}
                       className="form-field-input"
                       value={formData.email}
                       onChange={handleChange}
@@ -563,14 +618,19 @@ export default function Auth() {
                 style={{
                   width: "100%",
                   marginTop: 8,
-                  background: roleTab === "tutor" && authMode === "login" ? "var(--tutor-accent)" : "var(--primary-learner)",
+                  background:
+                    roleTab === "admin" && authMode === "login"
+                      ? "#0F172A"
+                      : roleTab === "tutor"
+                      ? "var(--tutor-accent)"
+                      : "var(--primary-learner)",
                 }}
               >
                 {loading
                   ? "Processing..."
                   : authMode === "signup"
-                  ? "Create Account & Enter →"
-                  : `Sign In as ${roleTab === "tutor" ? "Tutor" : "Student"} →`}
+                  ? `Create ${roleTab === "tutor" ? "Tutor" : "Student"} Account →`
+                  : `Sign In as ${roleTab === "admin" ? "Admin" : roleTab === "tutor" ? "Tutor" : "Student"} →`}
               </button>
             </form>
 
@@ -589,10 +649,20 @@ export default function Auth() {
               ) : roleTab === "tutor" ? (
                 <>
                   New to teaching?{" "}
-                  <Link to="/teach" style={{ color: "var(--primary-learner)", fontWeight: 600 }}>
-                    Apply to become a tutor
-                  </Link>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthMode("signup");
+                      setRoleTab("tutor");
+                      setError("");
+                    }}
+                    style={{ color: "var(--primary-learner)", fontWeight: 600, background: "none", border: "none", cursor: "pointer" }}
+                  >
+                    Create a Tutor account
+                  </button>
                 </>
+              ) : roleTab === "admin" ? (
+                <span>Authorized Peleekings administrator access only.</span>
               ) : (
                 <>
                   Don't have an account?{" "}

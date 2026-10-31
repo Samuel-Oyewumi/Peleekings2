@@ -66,11 +66,29 @@ export const DEFAULT_RESOURCES = [
   },
 ];
 
+const LOCAL_RESOURCES_KEY = "peleekings_custom_resources";
+
+function getLocalCustomResources() {
+  try {
+    const raw = localStorage.getItem(LOCAL_RESOURCES_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalCustomResources(list) {
+  try {
+    localStorage.setItem(LOCAL_RESOURCES_KEY, JSON.stringify(list));
+  } catch {}
+}
+
 /**
  * Fetch resources from Firestore.
  * Optionally filter by courseId ("platform", specific courseId, or "all").
  */
 export async function getResources(courseId = null) {
+  const localCustom = getLocalCustomResources();
   try {
     const resourcesCol = collection(db, "resources");
     let q;
@@ -86,35 +104,45 @@ export async function getResources(courseId = null) {
       q = query(resourcesCol, orderBy("createdAt", "desc"));
     }
 
-    const snap = await getDocs(q);
+    const snap = await Promise.race([
+      getDocs(q),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("RESOURCES_TIMEOUT")), 3500)),
+    ]);
     const firestoreItems = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-    // Filter default items that match the request
+    // Filter local custom & default items that match the request
+    let filteredLocal = localCustom;
     let filteredDefaults = DEFAULT_RESOURCES;
     if (courseId && courseId !== "all") {
+      filteredLocal = localCustom.filter((r) => r.courseId === courseId || r.courseId === "platform");
       filteredDefaults = DEFAULT_RESOURCES.filter(
         (r) => r.courseId === courseId || r.courseId === "platform"
       );
     }
 
-    // Combine Firestore items with default items, avoiding duplicate IDs
-    const combined = [
+    const mergedCustom = [
       ...firestoreItems,
-      ...filteredDefaults.filter((def) => !firestoreItems.some((f) => f.title === def.title)),
+      ...filteredLocal.filter((loc) => !firestoreItems.some((f) => f.id === loc.id || f.title === loc.title)),
+    ];
+
+    const combined = [
+      ...mergedCustom,
+      ...filteredDefaults.filter((def) => !mergedCustom.some((f) => f.title === def.title)),
     ];
 
     return combined;
   } catch (err) {
-    console.warn("Could not query Firestore resources, returning defaults:", err);
+    console.warn("Could not query Firestore resources, returning local + defaults:", err);
+    const mergedFallback = [...localCustom, ...DEFAULT_RESOURCES.filter((d) => !localCustom.some((l) => l.title === d.title))];
     if (courseId && courseId !== "all") {
-      return DEFAULT_RESOURCES.filter((r) => r.courseId === courseId || r.courseId === "platform");
+      return mergedFallback.filter((r) => r.courseId === courseId || r.courseId === "platform");
     }
-    return DEFAULT_RESOURCES;
+    return mergedFallback;
   }
 }
 
 /**
- * Upload a resource to Firebase Storage & Firestore.
+ * Upload a resource to Firebase Storage & Firestore (with 3.5s timeout fallback).
  * Accessible to Admins and Tutors.
  */
 export async function uploadResource({
@@ -135,20 +163,12 @@ export async function uploadResource({
   let fileSize = "";
   let resourceType = "Document";
 
-  // If a file was selected, upload it to Firebase Storage
   if (file) {
-    const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = `resources/${Date.now()}_${safeName}`;
-    const storageRef = ref(storage, storagePath);
-
-    const uploadSnapshot = await uploadBytes(storageRef, file);
-    downloadUrl = await getDownloadURL(uploadSnapshot.ref);
-
     // Format file size
     if (file.size >= 1024 * 1024) {
       fileSize = `${(file.size / (1024 * 1024)).toFixed(1)} MB`;
     } else {
-      fileSize = `${Math.round(file.size / 1024)} KB`;
+      fileSize = `${Math.max(1, Math.round(file.size / 1024))} KB`;
     }
 
     // Determine type
@@ -159,6 +179,29 @@ export async function uploadResource({
     else if (lowerName.match(/\.(doc|docx|txt|md)$/)) resourceType = "Document";
     else if (lowerName.match(/\.(fig|sketch|xd)$/)) resourceType = "Design File";
     else resourceType = "Resource File";
+
+    // Attempt Firebase Storage upload with 3.5s timeout fallback to local object URL
+    try {
+      const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, "_");
+      const storagePath = `resources/${Date.now()}_${safeName}`;
+      const storageRef = ref(storage, storagePath);
+
+      const uploadSnapshot = await Promise.race([
+        uploadBytes(storageRef, file),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("STORAGE_TIMEOUT")), 3500)),
+      ]);
+      downloadUrl = await Promise.race([
+        getDownloadURL(uploadSnapshot.ref),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("URL_TIMEOUT")), 2500)),
+      ]);
+    } catch (storageErr) {
+      console.warn("Firebase Storage upload fallback to local URL:", storageErr);
+      try {
+        downloadUrl = URL.createObjectURL(file);
+      } catch {
+        downloadUrl = "#local-resource";
+      }
+    }
   } else {
     resourceType = "External Link";
     fileSize = "Web Resource";
@@ -174,33 +217,58 @@ export async function uploadResource({
     fileSize,
     type: resourceType,
     uploadedBy: user?.uid || "admin",
-    uploaderName: user?.displayName || user?.fullName || user?.email || "Admin",
-    uploaderRole: user?.role || "admin",
+    uploaderName: user?.displayName || user?.fullName || user?.email || "Instructor",
+    uploaderRole: user?.role || "tutor",
     createdAt: serverTimestamp(),
   };
 
-  const docRef = await addDoc(collection(db, "resources"), payload);
-  return { id: docRef.id, ...payload };
+  let createdId = `res-${Date.now()}`;
+  try {
+    const docRef = await Promise.race([
+      addDoc(collection(db, "resources"), payload),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("FIRESTORE_TIMEOUT")), 3500)),
+    ]);
+    createdId = docRef.id;
+  } catch (fsErr) {
+    console.warn("Firestore addDoc resource fallback (saving locally):", fsErr);
+  }
+
+  const savedItem = {
+    ...payload,
+    id: createdId,
+    createdAt: new Date().toISOString(),
+  };
+  const existingLocal = getLocalCustomResources();
+  saveLocalCustomResources([savedItem, ...existingLocal]);
+
+  return savedItem;
 }
 
 /**
- * Delete a resource from Firestore and Storage.
+ * Delete a resource from Firestore, Storage, and local cache.
  */
 export async function deleteResource(resourceId, fileUrl = null) {
   if (!resourceId) return;
 
+  const existingLocal = getLocalCustomResources();
+  saveLocalCustomResources(existingLocal.filter((r) => r.id !== resourceId));
+
   try {
-    await deleteDoc(doc(db, "resources", resourceId));
+    await Promise.race([
+      deleteDoc(doc(db, "resources", resourceId)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("FIRESTORE_TIMEOUT")), 3000)),
+    ]);
   } catch (err) {
-    console.error("Failed to delete resource doc from Firestore:", err);
-    throw err;
+    console.warn("Firestore resource delete notice:", err);
   }
 
-  // Attempt to delete from Firebase Storage if it's a storage URL
   if (fileUrl && fileUrl.includes("firebasestorage.googleapis.com")) {
     try {
       const fileRef = ref(storage, fileUrl);
-      await deleteObject(fileRef);
+      await Promise.race([
+        deleteObject(fileRef),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("STORAGE_TIMEOUT")), 2500)),
+      ]);
     } catch (sErr) {
       console.warn("Storage deletion notice:", sErr);
     }

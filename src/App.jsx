@@ -72,7 +72,7 @@ export default function App() {
             />
             <Route
               path="/become-instructor"
-              element={<ProtectedRoute><BecomeInstructor /></ProtectedRoute>}
+              element={<ProtectedRoute><WithNavbar><BecomeInstructor /></WithNavbar></ProtectedRoute>}
             />
 
             {/* Learner Portal Routes */}

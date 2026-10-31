@@ -693,7 +693,7 @@ export default function AdminPanel() {
             <button className="btn btn-outline" onClick={() => navigate("/dashboard")}>
               Learner Portal &rarr;
             </button>
-            <button className="btn btn-outline" onClick={() => navigate("/become-instructor")}>
+            <button className="btn btn-outline" onClick={() => navigate("/teach-portal")}>
               Teaching Portal &rarr;
             </button>
           </div>
@@ -856,7 +856,7 @@ export default function AdminPanel() {
         {/* ── TAB 2: PLATFORM USAGE & AUDIT LOGS ─────────────────────── */}
         {activeTab === "analytics" && (
           <div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 20, marginBottom: 28 }}>
+            <div className="admin-analytics-3col">
               <div className="stat-metric-card">
                 <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>System Uptime</div>
                 <div style={{ fontSize: "2rem", fontWeight: 900, color: "#166534", margin: "8px 0" }}>100%</div>
@@ -874,7 +874,7 @@ export default function AdminPanel() {
               </div>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 24 }}>
+            <div className="admin-split-2col">
               {/* Audit Log Table */}
               <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", padding: 24 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
@@ -1160,7 +1160,7 @@ export default function AdminPanel() {
 
         {/* ── TAB 5: CERTIFICATES & VERIFICATION ─────────────────────── */}
         {activeTab === "certificates" && (
-          <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 24 }}>
+          <div className="admin-split-2col">
             <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", padding: 28 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                 <h2 style={{ fontSize: "1.4rem", fontWeight: 800 }}>Certificate Verification Engine</h2>
@@ -1477,7 +1477,7 @@ export default function AdminPanel() {
                 <button className="btn-ghost" onClick={() => setSelectedMilestoneModal(null)}>✕</button>
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 18 }}>
+              <div className="form-grid-2col" style={{ gap: 14, marginBottom: 18 }}>
                 <div>
                   <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Category</div>
                   <div style={{ fontWeight: 700, fontSize: "0.95rem" }}>{selectedMilestoneModal.category || "Milestone"}</div>
@@ -1541,7 +1541,7 @@ export default function AdminPanel() {
                 <button className="btn-ghost" onClick={() => setSelectedUser(null)}>✕</button>
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 20 }}>
+              <div className="form-grid-2col" style={{ gap: 14, marginBottom: 20 }}>
                 <div>
                   <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Registration ID</div>
                   <div style={{ fontWeight: 800, fontSize: "1.1rem" }}>{selectedUser.regId}</div>
@@ -1646,7 +1646,7 @@ export default function AdminPanel() {
                   />
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div className="form-grid-2col" style={{ gap: 12 }}>
                   <div className="form-field-group">
                     <label className="form-field-label">Email Address</label>
                     <input
@@ -1670,7 +1670,7 @@ export default function AdminPanel() {
                   </div>
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div className="form-grid-2col" style={{ gap: 12 }}>
                   <div className="form-field-group">
                     <label className="form-field-label">Registration Type</label>
                     <select
@@ -1810,7 +1810,7 @@ export default function AdminPanel() {
                   />
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div className="form-grid-2col" style={{ gap: 12 }}>
                   <div className="form-field-group">
                     <label className="form-field-label">Category</label>
                     <select
@@ -1834,7 +1834,7 @@ export default function AdminPanel() {
                   </div>
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div className="form-grid-2col" style={{ gap: 12 }}>
                   <div className="form-field-group">
                     <label className="form-field-label">Estimated Duration</label>
                     <input
@@ -1900,7 +1900,7 @@ export default function AdminPanel() {
                   />
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div className="form-grid-2col" style={{ gap: 12 }}>
                   <div className="form-field-group">
                     <label className="form-field-label">Duration</label>
                     <input
@@ -2050,7 +2050,7 @@ export default function AdminPanel() {
                   />
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div className="form-grid-2col" style={{ gap: 12 }}>
                   <div className="form-field-group">
                     <label className="form-field-label">Target Audience / Course</label>
                     <select
@@ -2082,7 +2082,7 @@ export default function AdminPanel() {
                   </div>
                 </div>
 
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <div className="form-grid-2col" style={{ gap: 12 }}>
                   <div className="form-field-group">
                     <label className="form-field-label">Upload File (PDF, ZIP, DOC, IMG)</label>
                     <input

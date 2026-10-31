@@ -51,6 +51,14 @@ export default function CoursePage() {
       const fromCatalog = COURSES_CATALOG.find(c => c.id === id);
       if (fromCatalog && isMounted) {
         setCourseData(fromCatalog);
+      } else {
+        try {
+          const customCourses = JSON.parse(localStorage.getItem("peleekings_custom_courses") || "[]");
+          const foundCustom = customCourses.find(c => c.id === id);
+          if (foundCustom && isMounted) {
+            setCourseData(foundCustom);
+          }
+        } catch (e) {}
       }
       try {
         const snap = await getDoc(doc(db, "courses", id));
@@ -213,6 +221,60 @@ export default function CoursePage() {
       } catch (err) {
         console.warn("Notice: could not load dynamic curriculum from Firestore:", err);
       }
+
+      // Also merge any locally published tutor modules/content for instant classroom preview
+      try {
+        const localMods = JSON.parse(localStorage.getItem(`peleekings_modules_${courseData.id}`) || "[]");
+        const localContent = JSON.parse(localStorage.getItem(`peleekings_course_content_${courseData.id}`) || "{}");
+        if ((localMods.length > 0 || Object.keys(localContent).length > 0) && isMounted) {
+          setModules((prevMods) => {
+            const existingMap = new Map(prevMods.map((m) => [m.id, { ...m, lessons: [...(m.lessons || [])] }]));
+            localMods.forEach((lm) => {
+              if (!existingMap.has(lm.id)) {
+                existingMap.set(lm.id, {
+                  id: lm.id,
+                  title: lm.title,
+                  order: lm.order || existingMap.size + 1,
+                  lessons: [
+                    {
+                      id: `l_${lm.id}_intro`,
+                      title: `${lm.title} - Module Overview`,
+                      duration: "10 min",
+                      completed: false,
+                      type: "reading",
+                      body: "Welcome to this module. Course material, presentations, and assessments uploaded by your instructor appear here.",
+                    },
+                  ],
+                });
+              }
+            });
+            Object.entries(localContent).forEach(([modId, items]) => {
+              if (existingMap.has(modId) && Array.isArray(items)) {
+                const modObj = existingMap.get(modId);
+                const lessonIds = new Set(modObj.lessons.map((l) => l.id));
+                items.forEach((item) => {
+                  const mappedType = item.type === "note" ? "reading" : item.type === "lesson" ? "video" : item.type;
+                  if (!lessonIds.has(item.id)) {
+                    modObj.lessons.push({
+                      id: item.id,
+                      title: item.title,
+                      duration: item.duration || (mappedType === "video" ? "15 min" : mappedType === "test" ? "20 min" : "10 min"),
+                      completed: false,
+                      type: mappedType || "reading",
+                      body: item.body || "",
+                      instructions: item.instructions || "",
+                      fileUrl: item.fileUrl || null,
+                      videoUrl: item.videoUrl || null,
+                      questions: item.questions || null,
+                    });
+                  }
+                });
+              }
+            });
+            return Array.from(existingMap.values());
+          });
+        }
+      } catch (e) {}
     }
 
     loadDynamicCurriculum();
@@ -815,12 +877,12 @@ export default function CoursePage() {
             ) : (
               <>
                 {/* Video Player Frame */}
-                <div className="video-frame-container" id="classroom-video-player" style={{ position: "relative", minHeight: 380, background: "#000" }}>
+                <div className="video-frame-container" id="classroom-video-player" style={{ position: "relative", background: "#000" }}>
                   {isPlaying && currentLesson.videoUrl ? (
                     getYouTubeEmbedUrl(currentLesson.videoUrl) ? (
                       <iframe
                         src={getYouTubeEmbedUrl(currentLesson.videoUrl)}
-                        style={{ width: "100%", height: "100%", minHeight: 380, border: "none" }}
+                        style={{ width: "100%", height: "100%", minHeight: 240, border: "none" }}
                         allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                         allowFullScreen
                         title={currentLesson.title}
@@ -830,7 +892,7 @@ export default function CoursePage() {
                         controls
                         autoPlay
                         src={currentLesson.videoUrl}
-                        style={{ width: "100%", height: "100%", minHeight: 380, objectFit: "contain", background: "#000" }}
+                        style={{ width: "100%", height: "100%", minHeight: 240, objectFit: "contain", background: "#000" }}
                       />
                     )
                   ) : (
@@ -907,7 +969,7 @@ export default function CoursePage() {
                 {/* Lesson Title & Module Info */}
                 <div style={{ marginTop: 24, display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 16 }}>
                   <div>
-                    <h1 style={{ fontSize: "1.6rem", fontWeight: 800, marginBottom: 4 }}>
+                    <h1 style={{ fontSize: "clamp(1.25rem, 4vw, 1.6rem)", fontWeight: 800, marginBottom: 4 }}>
                       {currentLesson.title}
                     </h1>
                     <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
@@ -915,7 +977,7 @@ export default function CoursePage() {
                     </div>
                   </div>
 
-                  <div style={{ display: "flex", gap: 10 }}>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                     <button
                       className="btn btn-outline btn-sm"
                       onClick={() => {
@@ -1234,7 +1296,7 @@ export default function CoursePage() {
                                 />
                               </div>
 
-                              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                              <div className="form-grid-2col" style={{ gap: 10 }}>
                                 <div>
                                   <label style={{ fontSize: "0.78rem", fontWeight: 700, color: "var(--text-muted)", display: "block", marginBottom: 4 }}>
                                     ATTACH FILE (PDF, ZIP, DOC, IMG)
@@ -1462,51 +1524,6 @@ export default function CoursePage() {
             )}
           </main>
         </div>
-
-        {/* Mobile Curriculum Drawer Modal */}
-        {showMobileCurriculum && (
-          <div className="modal-backdrop-overlay" onClick={() => setShowMobileCurriculum(false)}>
-            <div className="modal-dialog-box" onClick={e => e.stopPropagation()} style={{ maxHeight: "80vh" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-                <h3 style={{ fontSize: "1.2rem", fontWeight: 800 }}>Course Curriculum</h3>
-                <button className="btn-ghost" onClick={() => setShowMobileCurriculum(false)}>✕</button>
-              </div>
-              <div>
-                {modules.map((mod) => (
-                  <div key={mod.id} style={{ marginBottom: 14 }}>
-                    <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", padding: "6px 0" }}>
-                      {mod.title}
-                    </div>
-                    {mod.lessons.map(lesson => (
-                      <div
-                        key={lesson.id}
-                        style={{
-                          padding: "10px 12px",
-                          borderRadius: 8,
-                          background: lesson.id === activeLessonId ? "var(--primary-learner-light)" : "#F8FAFC",
-                          color: lesson.id === activeLessonId ? "var(--primary-learner)" : "var(--text-primary)",
-                          fontWeight: lesson.id === activeLessonId ? 700 : 500,
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          marginBottom: 6,
-                          cursor: "pointer"
-                        }}
-                        onClick={() => {
-                          setActiveLessonId(lesson.id);
-                          setShowMobileCurriculum(false);
-                        }}
-                      >
-                        <span>{lesson.title}</span>
-                        <span style={{ fontSize: "0.75rem" }}>{lesson.completed ? "✓" : lesson.duration}</span>
-                      </div>
-                    ))}
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
       </div>
     );
   }

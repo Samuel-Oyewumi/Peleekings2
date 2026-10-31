@@ -39,6 +39,66 @@ function computeUserRegCode(profile, uid) {
   return profile?.studentType === "corper" ? `${sInit}${fInit}${num}` : `${num}${fInit}${sInit}`;
 }
 
+function EmptyState({ icon: Icon, title, text, buttonText, onButtonClick }) {
+  return (
+    <div
+      style={{
+        border: "2px dashed var(--border-light)",
+        borderRadius: "var(--radius-md)",
+        padding: "40px 24px",
+        textAlign: "center",
+        background: "#F8FAFC",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 10,
+      }}
+    >
+      {Icon && (
+        <div
+          style={{
+            width: 48,
+            height: 48,
+            borderRadius: "50%",
+            background: "#FFFFFF",
+            border: "1px solid var(--border-light)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "var(--primary-learner)",
+            marginBottom: 4,
+          }}
+        >
+          {typeof Icon === "function" || typeof Icon === "object" ? (
+            <Icon size={22} aria-hidden="true" />
+          ) : (
+            Icon
+          )}
+        </div>
+      )}
+      <h3 style={{ fontSize: "1.1rem", fontWeight: 700, color: "var(--text-primary)", margin: 0 }}>
+        {title}
+      </h3>
+      {text && (
+        <p style={{ fontSize: "0.875rem", color: "var(--text-muted)", maxWidth: 420, margin: 0, lineHeight: 1.5 }}>
+          {text}
+        </p>
+      )}
+      {buttonText && onButtonClick && (
+        <button
+          type="button"
+          className="btn btn-solid-dark btn-sm"
+          style={{ marginTop: 8 }}
+          onClick={onButtonClick}
+        >
+          {buttonText}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const { currentUser, userProfile, logout } = useAuth();
   const navigate = useNavigate();
@@ -92,7 +152,7 @@ export default function Dashboard() {
 
   const [userActivity, setUserActivity] = useState(() => getUserActivity(currentUser?.uid));
   const [liveEnrollments, setLiveEnrollments] = useState([]);
-  const [weeklyActivityLive, setWeeklyActivityLive] = useState(null);
+  const [, setWeeklyActivityLive] = useState(null);
 
   // Load live weekly activity
   useEffect(() => {
@@ -183,33 +243,13 @@ export default function Dashboard() {
 
   // Active courses enrolled: prioritize live Firestore enrollments, fall back to cached
   const enrolledCourses = liveEnrollments.length > 0 ? liveEnrollments : (userActivity?.enrolledCourses || []);
-
-  const weeklyActivityData = weeklyActivityLive || userActivity?.weeklyActivity || [
-    { day: "Mon", hours: 4, label: "0m" },
-    { day: "Tue", hours: 4, label: "0m" },
-    { day: "Wed", hours: 4, label: "0m" },
-    { day: "Thu", hours: 4, label: "0m" },
-    { day: "Fri", hours: 4, label: "0m" },
-    { day: "Sat", hours: 4, label: "0m" },
-    { day: "Sun", hours: 4, label: "0m" },
-  ];
-
-  // Compute total minutes from live data
-  const totalWeeklyMinutes = weeklyActivityLive
-    ? weeklyActivityLive.reduce((sum, d) => sum + (d.minutes || 0), 0)
-    : null;
-  const totalWeeklyLabel = totalWeeklyMinutes != null
-    ? (totalWeeklyMinutes === 0 ? "0m this week"
-      : totalWeeklyMinutes < 60 ? `${totalWeeklyMinutes}m this week`
-      : `${Math.floor(totalWeeklyMinutes / 60)}h ${totalWeeklyMinutes % 60 > 0 ? totalWeeklyMinutes % 60 + "m" : ""}`.trim() + " this week")
-    : "4h 32m";
+  const completedCourses = enrolledCourses.filter((c) => (c.progress || 0) >= 100);
 
   const DEFAULT_ASSIGNMENTS = [
     {
       id: "ass-1",
       title: "Zapier Automated Pipeline Architecture",
       course: "AI Essentials & Automation",
-      due: "Fri, Oct 24 • 6:00 PM",
       status: "Pending Submission",
       badge: "pill-audio",
       description: "Design and implement an automated workflow integrating a webhook trigger with an AI agent or multi-step action. Submit your architecture blueprint as a PDF or export file."
@@ -218,7 +258,6 @@ export default function Dashboard() {
       id: "ass-2",
       title: "Visual Brand Identity Mockup in Figma",
       course: "Graphic Design Fundamentals",
-      due: "Mon, Oct 27 • 11:59 PM",
       status: "Pending Submission",
       badge: "pill-tech",
       description: "Create a complete visual style guide including color palette, typography hierarchy, and a mobile/desktop component set. Submit your Figma link or exported assets."
@@ -227,7 +266,6 @@ export default function Dashboard() {
       id: "ass-3",
       title: "Organic Social Media Campaign Blueprint",
       course: "Social Media Management",
-      due: "Nov 02 • 5:00 PM",
       status: "Pending Submission",
       badge: "pill-tech",
       description: "Draft a 30-day content calendar, hook scripts, and audience distribution plan for a target client. Submit as a document or spreadsheet."
@@ -423,7 +461,7 @@ export default function Dashboard() {
         {/* Switch Portal & Logout */}
         <div style={{ marginTop: "auto", borderTop: "1px solid var(--border-light)", paddingTop: 16 }}>
           <Link
-            to="/become-instructor"
+            to="/teach-portal"
             className="portal-nav-link"
             style={{ fontSize: "0.85rem", color: "var(--primary-learner)", marginBottom: 4 }}
           >
@@ -454,16 +492,16 @@ export default function Dashboard() {
                 <Menu size={18} aria-hidden="true" />
               </button>
               <div>
-                <h1 style={{ fontSize: "1.9rem", fontWeight: 800, marginBottom: 2 }}>
+                <h1 style={{ fontSize: "clamp(1.35rem, 4vw, 1.9rem)", fontWeight: 800, marginBottom: 2 }}>
                   Good morning, {firstName}
                 </h1>
-                <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem", margin: 0 }}>
+                <p style={{ color: "var(--text-secondary)", fontSize: "0.9rem", margin: 0 }}>
                   Ready to continue learning today?
                 </p>
               </div>
             </div>
           </div>
-          <div style={{ fontSize: "0.875rem", color: "var(--text-muted)", fontWeight: 500, background: "#FFFFFF", border: "1px solid var(--border-light)", padding: "8px 16px", borderRadius: "var(--radius-full)" }}>
+          <div className="dashboard-date-pill" style={{ fontSize: "0.825rem", color: "var(--text-muted)", fontWeight: 500, background: "#FFFFFF", border: "1px solid var(--border-light)", padding: "8px 16px", borderRadius: "var(--radius-full)" }}>
             {new Date().toLocaleDateString("en-US", { weekday: "long", year: "numeric", month: "short", day: "numeric" })}
           </div>
         </div>
@@ -501,18 +539,18 @@ export default function Dashboard() {
               background: "#FDF2F4",
               border: "1px solid #F9C6CE",
               borderRadius: "10px",
-              padding: "14px 20px",
+              padding: "14px 16px",
               marginBottom: 20,
               display: "flex",
               justifyContent: "space-between",
               alignItems: "center",
-              gap: 16,
+              gap: 12,
             }}
           >
-            <div style={{ fontSize: "0.9rem", color: "#3C181A" }}>
+            <div style={{ fontSize: "0.88rem", color: "#3C181A", lineHeight: 1.45 }}>
               <strong>Want to teach on Peleekings?</strong> Share your expertise with hundreds of students.{" "}
-              <Link to="/teach" style={{ color: "#EC586E", fontWeight: 700, textDecoration: "underline" }}>
-                Apply here &rarr;
+              <Link to="/teach-portal" style={{ color: "#EC586E", fontWeight: 700, textDecoration: "underline", whiteSpace: "nowrap" }}>
+                Open Tutor Portal &rarr;
               </Link>
             </div>
             <button
@@ -591,25 +629,6 @@ export default function Dashboard() {
                   ▶ {enrolledCourses.length > 0 ? "Start learning" : "Browse courses"}
                 </button>
               </div>
-
-              {/* Right: Next upcoming deadline panel */}
-              {enrolledCourses.length > 0 && (
-                <div className="dashboard-upcoming-deadline">
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                    <span style={{ fontSize: "0.7rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "#F9EFA7" }}>📋 Upcoming deadline</span>
-                  </div>
-                  <div style={{ fontWeight: 800, fontSize: "1.05rem", color: "#FFFFFF", lineHeight: 1.3 }}>
-                    Assignment Due
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.8rem", color: "#E2E8F0" }}>
-                    <span>⏰</span>
-                    <span>Fri, Oct 24 • 6:00 PM</span>
-                  </div>
-                  <div style={{ fontSize: "0.78rem", color: "#64748B", marginTop: 8, lineHeight: 1.5 }}>
-                    Submit your project link or file before the deadline to get graded.
-                  </div>
-                </div>
-              )}
             </div>
 
             {/* ── COMPACT INTERACTIVE STAT CARDS ── */}
@@ -666,7 +685,7 @@ export default function Dashboard() {
                 </div>
                 <div>
                   <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "var(--text-primary)", lineHeight: 1.1, letterSpacing: "-0.02em" }}>
-                    {DEFAULT_ASSIGNMENTS.length - Object.keys(userSubmissions).length}
+                    {enrolledCourses.length > 0 ? Math.max(0, DEFAULT_ASSIGNMENTS.length - Object.keys(userSubmissions).length) : 0}
                   </div>
                   <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginTop: 4, fontWeight: 500 }}>
                     Assignments pending
@@ -753,28 +772,38 @@ export default function Dashboard() {
           <div className="dashboard-tab-panel">
             <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>My Enrolled Courses</h2>
             <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Manage your active learning modules and track progress.</p>
-            <div className="dashboard-catalog-grid">
-              {enrolledCourses.map(c => (
-                <div key={c.id} style={{ border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", overflow: "hidden", background: "#F8FAFC" }}>
-                  <img src={c.image} alt={c.title} style={{ width: "100%", height: 140, objectFit: "cover" }} />
-                  <div style={{ padding: 16 }}>
-                    <span className="pill-badge pill-tech" style={{ marginBottom: 6 }}>{c.type}</span>
-                    <h3 style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 6 }}>{c.title}</h3>
-                    <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: 12 }}>{c.currentModule}</div>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.75rem", fontWeight: 600, marginBottom: 4 }}>
-                      <span>Progress</span>
-                      <span>{c.progress}%</span>
+            {enrolledCourses.length === 0 ? (
+              <EmptyState
+                icon={BookOpen}
+                title="No courses enrolled yet"
+                text="You haven't enrolled in any courses yet. Explore the catalog to start learning practical skills."
+                buttonText="Browse courses"
+                onButtonClick={() => setActiveNav("browse-courses")}
+              />
+            ) : (
+              <div className="dashboard-catalog-grid">
+                {enrolledCourses.map(c => (
+                  <div key={c.id} style={{ border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", overflow: "hidden", background: "#F8FAFC" }}>
+                    <img src={c.image} alt={c.title} style={{ width: "100%", height: 140, objectFit: "cover" }} />
+                    <div style={{ padding: 16 }}>
+                      <span className="pill-badge pill-tech" style={{ marginBottom: 6 }}>{c.type}</span>
+                      <h3 style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 6 }}>{c.title}</h3>
+                      <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: 12 }}>{c.currentModule}</div>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.75rem", fontWeight: 600, marginBottom: 4 }}>
+                        <span>Progress</span>
+                        <span>{c.progress}%</span>
+                      </div>
+                      <div style={{ width: "100%", height: 6, background: "#E2E8F0", borderRadius: 99, marginBottom: 16 }}>
+                        <div style={{ width: `${c.progress}%`, height: "100%", background: "var(--primary-learner)", borderRadius: 99 }} />
+                      </div>
+                      <button className="btn btn-solid-dark btn-sm" style={{ width: "100%" }} onClick={() => navigate(`/course/${c.id}`)}>
+                        Resume Course &rarr;
+                      </button>
                     </div>
-                    <div style={{ width: "100%", height: 6, background: "#E2E8F0", borderRadius: 99, marginBottom: 16 }}>
-                      <div style={{ width: `${c.progress}%`, height: "100%", background: "var(--primary-learner)", borderRadius: 99 }} />
-                    </div>
-                    <button className="btn btn-solid-dark btn-sm" style={{ width: "100%" }} onClick={() => navigate(`/course/${c.id}`)}>
-                      Resume Course &rarr;
-                    </button>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -812,7 +841,7 @@ export default function Dashboard() {
               }
               triggerToast(`🎉 Enrolled in "${course.title}"! Go to My Courses to start learning.`);
             } catch (err) {
-              console.error(err);
+              console.warn(err);
               triggerToast("Enrollment failed. Please try again.");
             } finally {
               setEnrollingId(null);
@@ -917,95 +946,107 @@ export default function Dashboard() {
                 <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Assignments &amp; Projects</h2>
                 <p style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>Submit required course deliverables, upload practical projects, and track instructor reviews.</p>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="pill-badge pill-tech" style={{ padding: "6px 12px", fontSize: "0.8rem" }}>
-                  {Object.keys(userSubmissions).length} of {DEFAULT_ASSIGNMENTS.length} Submitted
-                </span>
-              </div>
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-              {assignments.map((ass) => (
-                <div
-                  key={ass.id}
-                  style={{
-                    padding: 22,
-                    border: "1px solid var(--border-light)",
-                    borderRadius: "var(--radius-md)",
-                    background: ass.submission ? "#F0FDF4" : "#F8FAFC",
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 14,
-                    transition: "border-color 0.2s"
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12 }}>
-                    <div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                        <span className={`pill-badge ${ass.badge}`}>{ass.status}</span>
-                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>{ass.course}</span>
-                      </div>
-                      <h3 style={{ fontSize: "1.1rem", fontWeight: 700, color: "var(--text-primary)" }}>{ass.title}</h3>
-                      <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginTop: 6, maxWidth: 680, lineHeight: 1.5 }}>
-                        {ass.description}
-                      </p>
-                    </div>
-
-                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
-                      <span style={{ fontSize: "0.78rem", color: "var(--text-muted)", fontWeight: 500 }}>Due: {ass.due}</span>
-                      <button
-                        className={`btn ${ass.submission ? "btn-outline" : "btn-solid-dark"} btn-sm`}
-                        onClick={() => {
-                          setActiveUploadAssignment(ass);
-                          setUploadFile(null);
-                          setUploadLink(ass.submission?.projectLink || "");
-                          setUploadNotes(ass.submission?.notes || "");
-                        }}
-                      >
-                        {ass.submission ? "Replace / Re-upload ↻" : "Upload Deliverable ↑"}
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* If already submitted, display submission details */}
-                  {ass.submission && (
-                    <div style={{ background: "#FFFFFF", padding: "12px 16px", borderRadius: "var(--radius-sm)", border: "1px solid #BBF7D0", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        <div style={{ width: 34, height: 34, borderRadius: 6, background: "#DCFCE7", color: "#166534", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1rem" }}>
-                          📄
-                        </div>
-                        <div>
-                          <div style={{ fontWeight: 700, fontSize: "0.875rem", color: "#166534" }}>
-                            {ass.submission.fileName || "Project Link Submitted"}
-                          </div>
-                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-                            {ass.submission.fileSize && `${ass.submission.fileSize} • `}
-                            Submitted on {new Date(ass.submission.submittedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                          </div>
-                        </div>
-                      </div>
-
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        {ass.submission.projectLink && (
-                          <a
-                            href={ass.submission.projectLink}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="btn btn-ghost btn-sm"
-                            style={{ fontSize: "0.78rem", color: "var(--primary-learner)" }}
-                          >
-                            🔗 View Project Link
-                          </a>
-                        )}
-                        <span className="pill-badge pill-success" style={{ fontSize: "0.75rem" }}>
-                          ✓ Received by Instructor
-                        </span>
-                      </div>
-                    </div>
-                  )}
+              {enrolledCourses.length > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span className="pill-badge pill-tech" style={{ padding: "6px 12px", fontSize: "0.8rem" }}>
+                    {Object.keys(userSubmissions).length} of {DEFAULT_ASSIGNMENTS.length} Submitted
+                  </span>
                 </div>
-              ))}
+              )}
             </div>
+
+            {enrolledCourses.length === 0 ? (
+              <EmptyState
+                icon={ClipboardList}
+                title="No assignments yet"
+                text="Enroll in a course to access and submit course projects and practical assignments."
+                buttonText="Browse courses"
+                onButtonClick={() => setActiveNav("browse-courses")}
+              />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                {assignments.map((ass) => (
+                  <div
+                    key={ass.id}
+                    style={{
+                      padding: 22,
+                      border: "1px solid var(--border-light)",
+                      borderRadius: "var(--radius-md)",
+                      background: ass.submission ? "#F0FDF4" : "#F8FAFC",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 14,
+                      transition: "border-color 0.2s"
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12 }}>
+                      <div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                          <span className={`pill-badge ${ass.badge}`}>{ass.status}</span>
+                          <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>{ass.course}</span>
+                        </div>
+                        <h3 style={{ fontSize: "1.1rem", fontWeight: 700, color: "var(--text-primary)" }}>{ass.title}</h3>
+                        <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginTop: 6, maxWidth: 680, lineHeight: 1.5 }}>
+                          {ass.description}
+                        </p>
+                      </div>
+
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
+                        <span style={{ fontSize: "0.78rem", color: "var(--text-muted)", fontWeight: 500 }}>Deadline: set by your instructor</span>
+                        <button
+                          className={`btn ${ass.submission ? "btn-outline" : "btn-solid-dark"} btn-sm`}
+                          onClick={() => {
+                            setActiveUploadAssignment(ass);
+                            setUploadFile(null);
+                            setUploadLink(ass.submission?.projectLink || "");
+                            setUploadNotes(ass.submission?.notes || "");
+                          }}
+                        >
+                          {ass.submission ? "Replace / Re-upload ↻" : "Upload Deliverable ↑"}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* If already submitted, display submission details */}
+                    {ass.submission && (
+                      <div style={{ background: "#FFFFFF", padding: "12px 16px", borderRadius: "var(--radius-sm)", border: "1px solid #BBF7D0", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          <div style={{ width: 34, height: 34, borderRadius: 6, background: "#DCFCE7", color: "#166534", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1rem" }}>
+                            📄
+                          </div>
+                          <div>
+                            <div style={{ fontWeight: 700, fontSize: "0.875rem", color: "#166534" }}>
+                              {ass.submission.fileName || "Project Link Submitted"}
+                            </div>
+                            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                              {ass.submission.fileSize && `${ass.submission.fileSize} • `}
+                              Submitted on {new Date(ass.submission.submittedAt).toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          {ass.submission.projectLink && (
+                            <a
+                              href={ass.submission.projectLink}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="btn btn-ghost btn-sm"
+                              style={{ fontSize: "0.78rem", color: "var(--primary-learner)" }}
+                            >
+                              🔗 View Project Link
+                            </a>
+                          )}
+                          <span className="pill-badge pill-success" style={{ fontSize: "0.75rem" }}>
+                            ✓ Received by Instructor
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -1014,26 +1055,11 @@ export default function Dashboard() {
           <div className="dashboard-tab-panel">
             <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Quizzes &amp; Assessments</h2>
             <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Modular evaluations testing your practical mastery.</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              {[
-                { title: "Module 02 Assessment: AI Prompt Chaining", score: "96 / 100", date: "Completed Oct 14", badge: "pill-success" },
-                { title: "Module 01 Assessment: Introduction & ML Basics", score: "88 / 100", date: "Completed Oct 08", badge: "pill-success" },
-                { title: "Design Principles & Typography Test", score: "Upcoming", date: "Sat, Oct 25 • 10:00 AM", badge: "pill-tech" },
-              ].map((test, i) => (
-                <div key={i} style={{ padding: 18, border: "1px solid var(--border-light)", borderRadius: "var(--radius-sm)", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#F8FAFC" }}>
-                  <div>
-                    <h3 style={{ fontSize: "1rem", fontWeight: 700 }}>{test.title}</h3>
-                    <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 2 }}>{test.date}</div>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                    <span className={`pill-badge ${test.badge}`}>{test.score}</span>
-                    <button className="btn btn-outline btn-sm" onClick={() => triggerToast(`Reviewing results for ${test.title}`)}>
-                      Review &rarr;
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
+            <EmptyState
+              icon={Clock}
+              title="No tests yet"
+              text="Scheduled quizzes and module assessments from your instructors will appear here."
+            />
           </div>
         )}
 
@@ -1042,40 +1068,67 @@ export default function Dashboard() {
           <div className="dashboard-tab-panel">
             <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Certificates of Completion</h2>
             <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Official verified Peleekings credentials with your Registration Code.</p>
-            <div style={{ padding: 28, border: "2px solid var(--primary-learner-border)", background: "linear-gradient(135deg, #FDF2F4, #FEFCE8)", borderRadius: "var(--radius-md)" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
-                <div>
-                  <span className="pill-badge pill-success" style={{ marginBottom: 8 }}>VERIFIED CREDENTIAL</span>
-                  <h3 style={{ fontSize: "1.3rem", fontWeight: 800 }}>Foundations of Digital Computing</h3>
-                  <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginTop: 4 }}>
-                    Recipient: <strong>{userName}</strong> &bull; Registration ID: <strong>{regCode}</strong>
+            {completedCourses.length === 0 ? (
+              <EmptyState
+                icon={Award}
+                title="No certificates yet"
+                text="Complete 100% of an enrolled course to earn your official verified Peleekings certificate."
+                buttonText="Go to my courses"
+                onButtonClick={() => setActiveNav("my-courses")}
+              />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+                {completedCourses.map((course) => (
+                  <div
+                    key={course.id}
+                    style={{
+                      padding: 28,
+                      border: "2px solid var(--primary-learner-border)",
+                      background: "linear-gradient(135deg, #FDF2F4, #FEFCE8)",
+                      borderRadius: "var(--radius-md)",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+                      <div>
+                        <span className="pill-badge pill-success" style={{ marginBottom: 8 }}>VERIFIED CREDENTIAL</span>
+                        <h3 style={{ fontSize: "1.3rem", fontWeight: 800 }}>{course.title}</h3>
+                        <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginTop: 4 }}>
+                          Recipient: <strong>{userName}</strong> &bull; Registration ID: <strong>{regCode}</strong>
+                        </div>
+                      </div>
+                      <div className="brand-logo-icon" style={{ width: 48, height: 48, borderRadius: "50%" }}>
+                        <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="Peleekings" className="brand-submark-img" />
+                      </div>
+                    </div>
+                    <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: 20 }}>
+                      This is to certify that the recipient has satisfactorily completed all modules and practical project requirements for <strong>{course.title}</strong>.
+                    </p>
+                    <button
+                      className="btn btn-solid-dark btn-sm"
+                      onClick={() => {
+                        triggerToast(`Downloading Certificate for ${course.title}...`);
+                        const blob = new Blob(
+                          [
+                            `Official Certificate of Completion\nAwarded to: ${userName}\nReg ID: ${regCode}\nCourse: ${course.title}\nDate: ${new Date().toLocaleDateString()}`,
+                          ],
+                          { type: "text/plain" }
+                        );
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = `Certificate_${regCode}_${course.title.replace(/[^a-z0-9]+/gi, "_")}.txt`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                      }}
+                    >
+                      Download Official Certificate ↓
+                    </button>
                   </div>
-                </div>
-                <div className="brand-logo-icon" style={{ width: 48, height: 48, borderRadius: "50%" }}>
-                  <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="Peleekings" className="brand-submark-img" />
-                </div>
+                ))}
               </div>
-              <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: 20 }}>
-                This is to certify that the recipient has satisfactorily demonstrated proficiency in computing fundamentals and practical project applications.
-              </p>
-              <button
-                className="btn btn-solid-dark btn-sm"
-                onClick={() => {
-                  triggerToast("Downloading Certificate PDF...");
-                  const blob = new Blob([`Official Certificate of Completion\nAwarded to: ${userName}\nReg ID: ${regCode}\nCourse: Foundations of Digital Computing\nDate: ${new Date().toLocaleDateString()}`], { type: "text/plain" });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = `Certificate_${regCode}.txt`;
-                  document.body.appendChild(a);
-                  a.click();
-                  document.body.removeChild(a);
-                  URL.revokeObjectURL(url);
-                }}
-              >
-                Download Official Certificate ↓
-              </button>
-            </div>
+            )}
           </div>
         )}
 
@@ -1126,16 +1179,33 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* ── TAB: NOTES & ANNOUNCEMENTS FALLBACK ────────────────────── */}
-        {(activeNav === "notes" || activeNav === "announcements") && (
+        {/* ── TAB: NOTES ─────────────────────────────────────────────── */}
+        {activeNav === "notes" && (
           <div className="dashboard-tab-panel">
-            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, textTransform: "capitalize", marginBottom: 6 }}>{activeNav}</h2>
-            <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 20 }}>Stay updated with course broadcasts and downloadable reference material.</p>
-            <div style={{ padding: 18, background: "#F8FAFC", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)" }}>
-              <div style={{ fontWeight: 700, marginBottom: 4 }}>Module 4 Live Q&amp;A Scheduled</div>
-              <div style={{ fontSize: "0.825rem", color: "var(--text-muted)", marginBottom: 8 }}>Posted by Lead Instructor &bull; 2 days ago</div>
-              <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)" }}>Join us on Saturday 10:00 AM for an interactive walkthrough on setting up production webhooks.</p>
-            </div>
+            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Notes &amp; Resources</h2>
+            <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Downloadable lecture notes, study guides, and course reference materials.</p>
+            <EmptyState
+              icon={FileText}
+              title="No notes yet"
+              text="Lecture notes and downloadable study materials from your enrolled courses will appear here."
+              buttonText={enrolledCourses.length === 0 ? "Browse courses" : undefined}
+              onButtonClick={enrolledCourses.length === 0 ? () => setActiveNav("browse-courses") : undefined}
+            />
+          </div>
+        )}
+
+        {/* ── TAB: ANNOUNCEMENTS ─────────────────────────────────────── */}
+        {activeNav === "announcements" && (
+          <div className="dashboard-tab-panel">
+            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Announcements</h2>
+            <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Stay updated with course broadcasts and instructor notices.</p>
+            <EmptyState
+              icon={Megaphone}
+              title="No announcements yet"
+              text="Course broadcasts, live session updates, and instructor notices will be posted here."
+              buttonText={enrolledCourses.length === 0 ? "Browse courses" : undefined}
+              onButtonClick={enrolledCourses.length === 0 ? () => setActiveNav("browse-courses") : undefined}
+            />
           </div>
         )}
 

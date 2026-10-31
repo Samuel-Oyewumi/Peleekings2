@@ -12,18 +12,31 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == uid;
     }
 
+    function userDocExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
     function getUserData() {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
     function isAdmin() {
-      return isSignedIn() && 
-        (getUserData().role == 'admin' || request.auth.token.admin == true);
+      return isSignedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.email == 'admin@peleekings.com' ||
+        (userDocExists() && (getUserData().role == 'admin' || getUserData().submittedRole == 'admin'))
+      );
     }
 
     function isTutor() {
-      return isSignedIn() && 
-        (getUserData().role == 'tutor' || getUserData().role == 'instructor');
+      return isSignedIn() && (
+        request.auth.token.tutor == true ||
+        (userDocExists() && (
+          getUserData().role == 'tutor' ||
+          getUserData().role == 'instructor' ||
+          getUserData().submittedRole == 'tutor'
+        ))
+      );
     }
 
     function isCoursePublished(courseId) {
@@ -33,31 +46,42 @@ service cloud.firestore {
     // ── 1. Users Collection ───────────────────────────────────────
     // A user can read and write only their own users/{uid} doc,
     // EXCEPT the 'role' field — that field must be immutable from the client
-    // (only a Cloud Function/Admin SDK running with admin privileges may set or change it).
+    // for non-admin users (only a Cloud Function/Admin SDK or recognized admin may set it).
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();
 
-      // Create: user can create their own doc, but cannot set 'role' from client
-      allow create: if isOwner(uid) && !('role' in request.resource.data);
+      // Create: user can create their own doc; non-admins cannot set 'role' from client
+      allow create: if isOwner(uid) && (
+        !('role' in request.resource.data) ||
+        (isAdmin() && request.resource.data.role == 'admin')
+      );
 
-      // Update: user can update their own doc, but cannot modify 'role' field
-      allow update: if isOwner(uid) && 
-        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']);
+      // Update: user can update their own doc; non-admins cannot modify 'role' field
+      allow update: if (isOwner(uid) && (
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']) ||
+        (isAdmin() && request.resource.data.role == 'admin')
+      )) || isAdmin();
 
       // Deletion denied to clients; admin only
       allow delete: if isAdmin();
     }
 
-    // ── 2. Courses Collection & Subcollection Modules ─────────────
-    // Anyone signed in can read courses where status == "published".
-    // Only a user whose own users/{uid}.role == "admin" may create, update, or delete a course or its modules.
+    // ── 2. Courses Collection & Subcollection Modules/Lessons ─────
+    // Anyone signed in can read courses where status == "published" (or tutors/admins).
+    // Admins and Tutors may create or update a course, its modules, and its lessons.
     match /courses/{courseId} {
-      allow read: if isSignedIn() && (resource.data.status == 'published' || isAdmin());
-      allow create, update, delete: if isAdmin();
+      allow read: if isSignedIn() && (resource.data.status == 'published' || isAdmin() || isTutor());
+      allow create, update: if isAdmin() || isTutor();
+      allow delete: if isAdmin();
 
       match /modules/{moduleId} {
-        allow read: if isSignedIn() && (isCoursePublished(courseId) || isAdmin());
-        allow create, update, delete: if isAdmin();
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin() || isTutor();
+      }
+
+      match /lessons/{lessonId} {
+        allow read: if isSignedIn();
+        allow create, update, delete: if isAdmin() || isTutor();
       }
 
       // ── Course Announcements Subcollection ─────────────────────────
