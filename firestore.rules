@@ -2,7 +2,7 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ── Helper Functions ──────────────────────────────────────────
+    // ── Verified Custom Claims & Assignment Helper Functions ─────────
 
     function isSignedIn() {
       return request.auth != null;
@@ -12,227 +12,286 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == uid;
     }
 
-    function userDocExists() {
-      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
-    }
-
-    function getUserData() {
-      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
-    }
-
+    // Administrators: Strictly verified via Firebase Authentication Custom Claim
     function isAdmin() {
-      return isSignedIn() && (
-        request.auth.token.admin == true ||
-        request.auth.token.email == 'admin@peleekings.com' ||
-        (userDocExists() && (getUserData().role == 'admin' || getUserData().submittedRole == 'admin'))
-      );
+      return isSignedIn() && request.auth.token.admin == true;
     }
 
+    // Tutors: Strictly verified via Custom Claim { tutor: true } or Admin
     function isTutor() {
-      return isSignedIn() && (
-        request.auth.token.tutor == true ||
-        (userDocExists() && (
-          getUserData().role == 'tutor' ||
-          getUserData().role == 'instructor' ||
-          getUserData().submittedRole == 'tutor'
-        ))
+      return isSignedIn() && (request.auth.token.tutor == true || isAdmin());
+    }
+
+    // Verifies whether tutor is assigned to the course
+    function isAssignedTutor(courseData) {
+      return isTutor() && (
+        isAdmin() ||
+        courseData.tutorId == request.auth.uid ||
+        courseData.tutorUid == request.auth.uid ||
+        courseData.instructorId == request.auth.uid ||
+        (('assignedTutors' in courseData) && request.auth.uid in courseData.assignedTutors)
       );
     }
 
-    function isCoursePublished(courseId) {
-      return get(/databases/$(database)/documents/courses/$(courseId)).data.status == 'published';
+    function isAssignedCourseTutor(courseId) {
+      return isTutor() && (
+        isAdmin() ||
+        (
+          exists(/databases/$(database)/documents/courses/$(courseId)) &&
+          isAssignedTutor(get(/databases/$(database)/documents/courses/$(courseId)).data)
+        )
+      );
     }
 
-    // ── 1. Users Collection ───────────────────────────────────────
-    // A user can read and write only their own users/{uid} doc,
-    // EXCEPT the 'role' field — that field must be immutable from the client
-    // for non-admin users (only a Cloud Function/Admin SDK or recognized admin may set it).
+    // Unpublished course protection: only admin or assigned tutor can access unpublished course content
+    function canReadCourse(courseId) {
+      return isSignedIn() && (
+        !exists(/databases/$(database)/documents/courses/$(courseId)) ||
+        get(/databases/$(database)/documents/courses/$(courseId)).data.status == 'published' ||
+        isAdmin() ||
+        isAssignedCourseTutor(courseId)
+      );
+    }
+
+    function canManageCourse(courseId) {
+      return isAdmin() || isAssignedCourseTutor(courseId);
+    }
+
+    function isEnrolled(courseId, uid) {
+      return exists(/databases/$(database)/documents/enrollments/$(uid + '_' + courseId));
+    }
+
+    // ── 1. Users Collection ──────────────────────────────────────────
+    // Server-managed fields (role, submittedRole, regNumber, status, admin, tutor) cannot be set by clients.
+    // Explicit allowlists govern creation and modification.
     match /users/{uid} {
       allow read: if isOwner(uid) || isAdmin();
 
-      // Create: user can create their own doc; non-admins cannot set 'role' from client
-      allow create: if isOwner(uid) && (
-        !('role' in request.resource.data) ||
-        (isAdmin() && request.resource.data.role == 'admin')
+      // Explicit allowlist of registration fields; client cannot set role or server fields
+      allow create: if isOwner(uid) &&
+        request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'fullName', 'surname', 'firstName',
+          'studentType', 'nyscStateCode', 'phoneNumber',
+          'status', 'createdAt', 'photoURL', 'avatarUrl', 'bio', 'interests'
+        ]) &&
+        !request.resource.data.keys().hasAny([
+          'role', 'submittedRole', 'regNumber', 'admin', 'tutor'
+        ]) &&
+        (!('status' in request.resource.data) || request.resource.data.status == 'active');
+
+      // Update: strictly allowlisted non-privileged fields; server-managed fields blocked
+      allow update: if isAdmin() || (
+        isOwner(uid) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName', 'fullName', 'surname', 'firstName', 'phoneNumber',
+          'studentType', 'nyscStateCode', 'photoURL',
+          'avatarUrl', 'bio', 'interests', 'updatedAt'
+        ]) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'role', 'submittedRole', 'regNumber', 'status',
+          'admin', 'tutor', 'uid', 'email'
+        ])
       );
 
-      // Update: user can update their own doc; non-admins cannot modify 'role' field
-      allow update: if (isOwner(uid) && (
-        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']) ||
-        (isAdmin() && request.resource.data.role == 'admin')
-      )) || isAdmin();
-
-      // Deletion denied to clients; admin only
       allow delete: if isAdmin();
     }
 
-    // ── 2. Courses Collection & Subcollection Modules/Lessons ─────
-    // Anyone signed in can read courses where status == "published" (or tutors/admins).
-    // Admins and Tutors may create or update a course, its modules, and its lessons.
+    // ── 2. Courses Collection & Subcollections ───────────────────────
+    // Tutors can only manage courses assigned to them; unpublished content is protected.
     match /courses/{courseId} {
-      allow read: if isSignedIn() && (resource.data.status == 'published' || isAdmin() || isTutor());
-      allow create, update: if isAdmin() || isTutor();
+      allow read: if isSignedIn() && (resource.data.status == 'published' || isAdmin() || isAssignedTutor(resource.data));
+      allow create: if isAdmin() || (isTutor() && (request.resource.data.tutorId == request.auth.uid || request.resource.data.tutorUid == request.auth.uid));
+      allow update: if isAdmin() || (isTutor() && isAssignedTutor(resource.data));
       allow delete: if isAdmin();
 
       match /modules/{moduleId} {
-        allow read: if isSignedIn();
-        allow create, update, delete: if isAdmin() || isTutor();
+        allow read: if canReadCourse(courseId);
+        allow create, update, delete: if canManageCourse(courseId);
       }
 
       match /lessons/{lessonId} {
-        allow read: if isSignedIn();
-        allow create, update, delete: if isAdmin() || isTutor();
+        allow read: if canReadCourse(courseId);
+        allow create, update, delete: if canManageCourse(courseId);
       }
 
-      // ── Course Announcements Subcollection ─────────────────────────
-      // Signed-in users can read; tutors and admins can create/update/delete
       match /announcements/{announcementId} {
-        allow read: if isSignedIn();
-        allow create, update, delete: if isAdmin() || isTutor();
+        allow read: if canReadCourse(courseId);
+        allow create, update, delete: if canManageCourse(courseId);
       }
 
-      // ── Course Comments Subcollection ──────────────────────────────
-      // Signed-in users can read and post their own comments;
-      // owners or admins can delete
       match /comments/{commentId} {
-        allow read: if isSignedIn();
-        allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
-        allow update: if isSignedIn() && resource.data.uid == request.auth.uid;
-        allow delete: if isAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+        allow read: if canReadCourse(courseId);
+        allow create: if isSignedIn() && canReadCourse(courseId) && request.resource.data.uid == request.auth.uid;
+        allow update: if isOwner(resource.data.uid);
+        allow delete: if isAdmin() || isOwner(resource.data.uid) || canManageCourse(courseId);
       }
-      // ── Course Content Subcollections (notes, assignments, tests, announcements) ─
-      // Signed-in enrolled users can read; tutors/admins can create, update, delete
+
       match /notes/{noteId} {
-        allow read: if isSignedIn();
-        allow create, update, delete: if isAdmin() || isTutor();
+        allow read: if canReadCourse(courseId);
+        allow create, update, delete: if canManageCourse(courseId);
       }
+
       match /assignments/{assignmentId} {
-        allow read: if isSignedIn();
-        allow create, update, delete: if isAdmin() || isTutor();
+        allow read: if canReadCourse(courseId);
+        allow create, update, delete: if canManageCourse(courseId);
       }
+
       match /tests/{testId} {
-        allow read: if isSignedIn();
-        allow create, update, delete: if isAdmin() || isTutor();
+        allow read: if canReadCourse(courseId);
+        allow create, update, delete: if canManageCourse(courseId);
+      }
+
+      match /resources/{resourceId} {
+        allow read: if canReadCourse(courseId);
+        allow create, update, delete: if canManageCourse(courseId);
       }
     }
 
-    // ── 3. Enrollments Collection ─────────────────────────────────
-    // Doc ID format: {uid}_{courseId}
-    // A user can create/update an enrollments doc only where the doc's uid field
-    // equals their own request.auth.uid, and can read only their own enrollment docs.
+    // ── 3. Enrollments Collection ────────────────────────────────────
+    // Students can create enrollment requests and update only allowed learning-progress fields.
+    // Privileged status (approval, payment, access grants) can only be set by Admins or Cloud Functions.
     match /enrollments/{enrollmentId} {
-      allow create, update: if isSignedIn() && 
-        request.resource.data.uid == request.auth.uid;
+      allow read: if isOwner(resource.data.uid) || isAdmin() || isAssignedCourseTutor(resource.data.courseId);
 
-      allow read: if isSignedIn() && (resource == null || resource.data.uid == request.auth.uid || isAdmin());
+      // Student enrollment creation: cannot set paid, approved, or elevated access
+      allow create: if isSignedIn() &&
+        request.resource.data.uid == request.auth.uid &&
+        enrollmentId == request.auth.uid + '_' + request.resource.data.courseId &&
+        !request.resource.data.keys().hasAny([
+          'isPaid', 'paymentStatus', 'approvedAt', 'approvedBy',
+          'accessLevel', 'grade', 'certificateIssued'
+        ]) &&
+        (!('status' in request.resource.data) || request.resource.data.status in ['active', 'pending']);
+
+      // Student enrollment progress updates: learning-progress fields ONLY
+      allow update: if isAdmin() || isAssignedCourseTutor(resource.data.courseId) || (
+        isOwner(resource.data.uid) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'completedItemIds', 'completedLessonIds', 'lastAccessedLesson',
+          'currentModule', 'progressPercent', 'notes', 'updatedAt'
+        ]) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'status', 'isPaid', 'paymentStatus', 'approvedAt',
+          'approvedBy', 'accessLevel', 'grade', 'certificateIssued',
+          'uid', 'courseId', 'experienceType'
+        ])
+      );
 
       allow delete: if isAdmin();
     }
 
-    // ── 3b. Milestones & Celebrations Collection ──────────────────
-    // Visitors and learners can submit celebration milestones;
-    // Admins can read, update, and manage all celebration submissions.
-    match /milestones/{milestoneId} {
-      allow create: if true;
-      allow read: if isSignedIn() && (isAdmin() || resource.data.uid == request.auth.uid);
+    // ── 4. Submissions (Assignments & Tests) ─────────────────────────
+    // Students submit deliverables for enrolled courses.
+    // Tutors can only read and grade submissions for courses assigned to them.
+    match /assignmentSubmissions/{submissionId} {
+      allow read: if isOwner(resource.data.uid) || isAdmin() || isAssignedCourseTutor(resource.data.courseId);
+
+      allow create: if isSignedIn() &&
+        request.resource.data.uid == request.auth.uid &&
+        !request.resource.data.keys().hasAny(['grade', 'feedback', 'gradedAt', 'gradedBy']);
+
+      // Grading restricted exclusively to Admins and assigned course Tutors
+      allow update: if isAdmin() || (
+        isAssignedCourseTutor(resource.data.courseId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'grade', 'feedback', 'status', 'gradedAt', 'gradedBy'
+        ])
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    match /testSubmissions/{submissionId} {
+      allow read: if isOwner(resource.data.uid) || isAdmin() || isAssignedCourseTutor(resource.data.courseId);
+
+      allow create: if isSignedIn() &&
+        request.resource.data.uid == request.auth.uid &&
+        !request.resource.data.keys().hasAny(['grade', 'feedback', 'gradedAt', 'gradedBy']);
+
+      // Grading restricted exclusively to Admins and assigned course Tutors
+      allow update: if isAdmin() || (
+        isAssignedCourseTutor(resource.data.courseId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'grade', 'feedback', 'status', 'gradedAt', 'gradedBy'
+        ])
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ── 5. Tutor Applications Collection ─────────────────────────────
+    match /tutorApplications/{applicationId} {
+      allow create: if isSignedIn() &&
+        request.resource.data.applicantUid == request.auth.uid &&
+        request.resource.data.status == 'pending';
+
+      allow read: if isSignedIn() && (resource.data.applicantUid == request.auth.uid || isAdmin());
       allow update, delete: if isAdmin();
     }
 
-    // ── 4. Tutor Applications Collection ──────────────────────────
-    // A user can create one with applicantUid == request.auth.uid;
-    // only that applicant or an admin can read it;
-    // only an admin can update its status.
-    match /tutorApplications/{applicationId} {
-      allow create: if isSignedIn() && 
-        request.resource.data.applicantUid == request.auth.uid;
-
-      allow read: if isSignedIn() && 
-        (resource.data.applicantUid == request.auth.uid || isAdmin());
-
-      // Only admin can update status (or any other field)
-      allow update: if isAdmin();
-
-      allow delete: if isAdmin();
+    // ── 6. Milestones & Celebrations Collection ───────────────────────
+    match /milestones/{milestoneId} {
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow read: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin() || isTutor());
+      allow update, delete: if isAdmin();
     }
 
-    // ── 5. Test Submissions & Assignment Submissions ──────────────
-    // A user can create their own (uid == request.auth.uid) and read their own;
-    // only an admin or the assigned tutor can update the grade/feedback fields.
-    match /testSubmissions/{submissionId} {
-      allow create: if isSignedIn() && 
-        request.resource.data.uid == request.auth.uid &&
-        !('grade' in request.resource.data) &&
-        !('feedback' in request.resource.data);
-
-      allow read: if isSignedIn() && 
-        (resource.data.uid == request.auth.uid || isAdmin() || isTutor());
-
-      // Only admin or tutor can update grade/feedback fields
-      allow update: if isSignedIn() && (
-        isAdmin() || 
-        (isTutor() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['grade', 'feedback', 'status', 'gradedAt', 'gradedBy']))
-      );
-
-      allow delete: if isAdmin();
-    }
-
-    match /assignmentSubmissions/{submissionId} {
-      allow create: if isSignedIn() && 
-        request.resource.data.uid == request.auth.uid &&
-        !('grade' in request.resource.data) &&
-        !('feedback' in request.resource.data);
-
-      allow read: if isSignedIn() && 
-        (resource.data.uid == request.auth.uid || isAdmin() || isTutor());
-
-      // Only admin or tutor can update grade/feedback fields
-      allow update: if isSignedIn() && (
-        isAdmin() || 
-        (isTutor() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['grade', 'feedback', 'status', 'gradedAt', 'gradedBy']))
-      );
-
-      allow delete: if isAdmin();
-    }
-
-    // ── 6. Audit Logs Collection ──────────────────────────────────
-    // Only admins can read audit logs. Writes are performed by Cloud Functions (Admin SDK) or admins.
+    // ── 7. Audit Logs Collection ─────────────────────────────────────
     match /auditLogs/{logId} {
       allow read: if isAdmin();
       allow write: if isAdmin();
     }
 
-    // ── 7. User Notifications Subcollection ───────────────────────
-    // Users can read and update (mark as read) their own notifications.
-    // Admins and tutors can create notifications for any user (e.g., grade alerts).
-    // Cloud Functions (Admin SDK) bypass these rules entirely.
+    // ── 8. User Notifications Subcollection ──────────────────────────
     match /users/{uid}/notifications/{notifId} {
       allow read, update: if isOwner(uid);
-      allow create: if isSignedIn(); // tutors/admins notify enrolled students
+      allow create: if isAdmin() || isTutor();
       allow delete: if isOwner(uid) || isAdmin();
     }
 
-    // ── 7b. User Daily Activity Subcollection ─────────────────────
-    // Each user can read and write only their own daily activity records.
-    // Stored at users/{uid}/dailyActivity/{YYYY-MM-DD}
+    // ── 9. User Daily Activity Subcollection ─────────────────────────
     match /users/{uid}/dailyActivity/{dayId} {
       allow read, write: if isOwner(uid);
-      allow read: if isAdmin();
+      allow read: if isAdmin() || isTutor();
     }
 
-    // ── 7. Resources Collection & Course Resources ─────────────────
-    // Anyone signed in can read resources. Admins and tutors can create, update, or delete.
+    // ── 10. Platform Resources Collection ────────────────────────────
     match /resources/{resourceId} {
       allow read: if isSignedIn();
-      allow create, update, delete: if isAdmin() || isTutor();
+      allow create, update, delete: if isAdmin();
     }
 
-    match /courses/{courseId}/resources/{resourceId} {
+    // ── 11. Platform Announcements Collection ────────────────────────
+    match /announcements/{announcementId} {
+      // Admins can read all announcements (drafts, scheduled, expired).
+      // Regular users can only read published, non-expired announcements matching their audience.
+      allow read: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.status == 'published' &&
+        (!('expiresAt' in resource.data) || resource.data.expiresAt > request.time) &&
+        (
+          resource.data.audience == 'all' ||
+          (resource.data.audience == 'learners' && !isTutor()) ||
+          (resource.data.audience == 'tutors' && isTutor()) ||
+          (resource.data.courseId != null && isEnrolled(resource.data.courseId, request.auth.uid))
+        )
+      );
+
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ── 12. Platform Settings Collection ─────────────────────────────
+    match /platformSettings/{settingId} {
       allow read: if isSignedIn();
-      allow create, update, delete: if isAdmin() || isTutor();
+      allow create, update, delete: if isAdmin();
     }
 
-    // ── 8. Default Deny ───────────────────────────────────────────
-    // Deny all reads/writes by default for any unspecified path
+    // ── 13. Registration Numbers (Server Only) ──────────────────────
+    match /regNumbers/{code} {
+      allow read, write: if false;
+    }
+
+    // ── 14. Default Deny ─────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;
     }

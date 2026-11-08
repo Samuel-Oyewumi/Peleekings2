@@ -21,39 +21,34 @@ import { COURSES_CATALOG } from "../data/courses";
 
 // ── Daily Activity Tracking ────────────────────────────────────────────────
 
-function getLocalDailyActivity(uid) {
-  if (!uid || typeof window === "undefined") return {};
-  try {
-    const raw = localStorage.getItem(`peleekings_daily_activity_${uid}`);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
+const inMemoryDailyActivity = new Map();
+const inMemoryUserActivity = new Map();
+
+function getMemoryDailyActivity(uid) {
+  if (!uid) return {};
+  return inMemoryDailyActivity.get(uid) || {};
 }
 
-function saveLocalDailyActivity(uid, data) {
-  if (!uid || typeof window === "undefined") return;
-  try {
-    localStorage.setItem(`peleekings_daily_activity_${uid}`, JSON.stringify(data));
-  } catch {}
+function saveMemoryDailyActivity(uid, data) {
+  if (!uid) return;
+  inMemoryDailyActivity.set(uid, data);
 }
 
 /**
  * Increment a user's daily activity minutes for today.
- * Stored locally for instant UI responsiveness and synced to Firestore at:
- * users/{uid}/dailyActivity/{YYYY-MM-DD}
+ * Persists directly to Firestore at: users/{uid}/dailyActivity/{YYYY-MM-DD}
  */
 export async function incrementDailyActivity(uid, minutesToAdd = 1) {
   if (!uid) return;
   const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
-  // 1. Immediately update local storage
-  const localMap = getLocalDailyActivity(uid);
-  const updatedMinutes = (localMap[today] || 0) + minutesToAdd;
-  localMap[today] = updatedMinutes;
-  saveLocalDailyActivity(uid, localMap);
+  // 1. In-memory update for instant UI feedback
+  const memMap = getMemoryDailyActivity(uid);
+  const updatedMinutes = (memMap[today] || 0) + minutesToAdd;
+  memMap[today] = updatedMinutes;
+  saveMemoryDailyActivity(uid, memMap);
 
-  // 2. Dispatch immediate window event so open pages (Dashboard, CoursePage) update in real-time
+  // 2. Dispatch immediate window event so open pages update in real-time
   if (typeof window !== "undefined") {
     window.dispatchEvent(
       new CustomEvent("peleekings_activity_incremented", {
@@ -62,7 +57,7 @@ export async function incrementDailyActivity(uid, minutesToAdd = 1) {
     );
   }
 
-  // 3. Persist to Firestore in the background
+  // 3. Persist to Firestore
   const dayRef = doc(db, "users", uid, "dailyActivity", today);
   try {
     await setDoc(
@@ -75,14 +70,12 @@ export async function incrementDailyActivity(uid, minutesToAdd = 1) {
       { merge: true }
     );
   } catch (err) {
-    console.warn("Notice: could not update daily activity in Firestore (synced to local cache):", err);
+    console.error("Failed to update daily activity in Firestore:", err);
   }
 }
 
 /**
- * Get the last 7 days of learning activity for a user.
- * Prioritizes local tracking for zero-latency, reconciled with Firestore records.
- * Returns an array of {day, minutes, label, highlight, hours} objects for the chart.
+ * Get the last 7 days of learning activity for a user directly from Firestore.
  */
 export async function getWeeklyActivityData(uid) {
   if (!uid) return null;
@@ -99,51 +92,18 @@ export async function getWeeklyActivityData(uid) {
     days.push({ dateStr, dayLabel, minutes: 0 });
   }
 
-  // Read local baseline first
-  const localMap = getLocalDailyActivity(uid);
-  days.forEach((d) => {
-    if (localMap[d.dateStr]) {
-      d.minutes = localMap[d.dateStr];
-    }
-  });
-
-  // Reconcile with Firestore
   try {
     const fetchPromises = days.map((d) =>
       getDoc(doc(db, "users", uid, "dailyActivity", d.dateStr))
     );
     const snaps = await Promise.all(fetchPromises);
-    let updatedLocal = false;
     snaps.forEach((snap, i) => {
       if (snap.exists()) {
-        const fsMinutes = snap.data().minutes || 0;
-        if (fsMinutes > days[i].minutes) {
-          days[i].minutes = fsMinutes;
-          localMap[days[i].dateStr] = fsMinutes;
-          updatedLocal = true;
-        } else if (days[i].minutes > fsMinutes) {
-          // Push higher local minutes to Firestore to keep them in sync
-          setDoc(doc(db, "users", uid, "dailyActivity", days[i].dateStr), {
-            date: days[i].dateStr,
-            minutes: days[i].minutes,
-            updatedAt: serverTimestamp(),
-          }, { merge: true }).catch(() => {});
-        }
-      } else if (days[i].minutes > 0) {
-        // Doc didn't exist in Firestore yet, write it now
-        setDoc(doc(db, "users", uid, "dailyActivity", days[i].dateStr), {
-          date: days[i].dateStr,
-          minutes: days[i].minutes,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        }, { merge: true }).catch(() => {});
+        days[i].minutes = snap.data().minutes || 0;
       }
     });
-    if (updatedLocal) {
-      saveLocalDailyActivity(uid, localMap);
-    }
   } catch (err) {
-    console.warn("Notice: could not fetch weekly activity from Firestore, using local data:", err);
+    console.warn("Notice: could not fetch weekly activity from Firestore:", err);
   }
 
   const maxMinutes = Math.max(...days.map((d) => d.minutes), 1);
@@ -215,13 +175,18 @@ export async function enrollInCourse(uid, courseId, experienceType = "online", t
     console.warn("Notice: could not update local cache for enrollment:", cacheErr);
   }
 
-  // 2. Persist directly to Firestore in background (never blocks UI)
+  // 2. Persist directly to Firestore: check existence first and only create if it doesn't exist
+  // Using setDoc(..., {merge: true}) triggers an UPDATE on existing docs which violates strict update rules
   try {
-    setDoc(enrollmentRef, newEnrollment, { merge: true }).catch((err) => {
-      console.warn(`Firestore enrollment sync notice for ${enrollmentId}:`, err);
-    });
+    const existingSnap = await getDoc(enrollmentRef);
+    if (!existingSnap.exists()) {
+      await setDoc(enrollmentRef, newEnrollment);
+    } else {
+      return { id: enrollmentId, ...existingSnap.data() };
+    }
   } catch (err) {
-    console.warn(`Firestore enrollment sync notice for ${enrollmentId}:`, err);
+    console.error(`Firestore enrollment error for ${enrollmentId}:`, err);
+    throw err;
   }
 
   return { id: enrollmentId, ...newEnrollment };
@@ -239,26 +204,8 @@ export async function getCourseEnrollment(uid, courseId) {
       return { id: enrollmentId, ...snap.data() };
     }
   } catch (err) {
-    console.warn(`Notice fetching enrollment for ${enrollmentId}:`, err);
+    console.error(`Error fetching enrollment for ${enrollmentId}:`, err);
   }
-
-  // Fallback to local cache check so user is never locked out of classroom
-  try {
-    const local = getUserActivity(uid);
-    const found = (local.enrolledCourses || []).find((c) => c.id === courseId);
-    if (found) {
-      return {
-        id: enrollmentId,
-        uid,
-        courseId,
-        status: "active",
-        experienceType: found.type?.includes("Hands-on") ? "hands-on" : "online",
-        progressPercent: found.progress || 0,
-        completedItemIds: Object.keys(local.completedLessons || {}).filter((k) => local.completedLessons[k]),
-      };
-    }
-  } catch {}
-
   return null;
 }
 
@@ -267,7 +214,6 @@ export async function getCourseEnrollment(uid, courseId) {
  */
 export async function getUserEnrollments(uid) {
   if (!uid) return [];
-  let firestoreList = [];
   try {
     const q = query(
       collection(db, "enrollments"),
@@ -276,33 +222,13 @@ export async function getUserEnrollments(uid) {
     );
     const snap = await getDocs(q);
     if (!snap.empty) {
-      firestoreList = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     }
+    return [];
   } catch (err) {
-    console.warn(`Notice fetching Firestore enrollments for ${uid}:`, err);
+    console.error(`Error fetching Firestore enrollments for ${uid}:`, err);
+    return [];
   }
-
-  // Always merge with local cache so user enrollments never disappear
-  try {
-    const local = getUserActivity(uid);
-    const localCourses = local.enrolledCourses || [];
-    const fsCourseIds = new Set(firestoreList.map((f) => f.courseId));
-
-    for (const lc of localCourses) {
-      if (!fsCourseIds.has(lc.id)) {
-        firestoreList.push({
-          id: `${uid}_${lc.id}`,
-          courseId: lc.id,
-          courseTitle: lc.title,
-          experienceType: lc.type?.includes("Hands-on") ? "hands-on" : "online",
-          progressPercent: lc.progress || 0,
-          completedItemIds: [],
-        });
-      }
-    }
-  } catch {}
-
-  return firestoreList;
 }
 
 /**
@@ -635,37 +561,19 @@ export function getUserActivity(userId) {
     return {
       enrolledCourses: [],
       completedLessons: {},
-      weeklyActivity: [
-        { day: "Mon", hours: 45, label: "45m" },
-        { day: "Tue", hours: 60, label: "1h" },
-        { day: "Wed", hours: 30, label: "30m" },
-        { day: "Thu", hours: 85, label: "1h 25m", highlight: true },
-        { day: "Fri", hours: 40, label: "40m" },
-        { day: "Sat", hours: 90, label: "1h 30m" },
-        { day: "Sun", hours: 20, label: "20m" },
-      ],
+      weeklyActivity: [],
       milestones: [],
       assignmentSubmissions: {},
     };
   }
 
-  try {
-    const raw = localStorage.getItem(`peleekings_user_activity_${userId}`);
-    if (raw) return JSON.parse(raw);
-  } catch {}
+  const cached = inMemoryUserActivity.get(userId);
+  if (cached) return cached;
 
   return {
     enrolledCourses: [],
     completedLessons: {},
-    weeklyActivity: [
-      { day: "Mon", hours: 45, label: "45m" },
-      { day: "Tue", hours: 60, label: "1h" },
-      { day: "Wed", hours: 30, label: "30m" },
-      { day: "Thu", hours: 85, label: "1h 25m", highlight: true },
-      { day: "Fri", hours: 40, label: "40m" },
-      { day: "Sat", hours: 90, label: "1h 30m" },
-      { day: "Sun", hours: 20, label: "20m" },
-    ],
+    weeklyActivity: [],
     milestones: [],
     assignmentSubmissions: {},
   };
@@ -673,17 +581,14 @@ export function getUserActivity(userId) {
 
 export function saveUserActivity(userId, data) {
   if (!userId) return;
-  try {
-    localStorage.setItem(`peleekings_user_activity_${userId}`, JSON.stringify(data));
+  inMemoryUserActivity.set(userId, data);
+  if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent("peleekings_activity_updated", { detail: { userId, data } }));
-  } catch (err) {
-    console.warn("Failed to persist user activity cache:", err);
   }
 }
 
 export async function submitUserMilestone(userId, milestone) {
   const newMilestone = {
-    id: `ms_${Date.now()}`,
     uid: userId || "guest",
     fullName: milestone.fullName || "Anonymous",
     milestoneType: milestone.milestoneType || "General Milestone",
@@ -691,67 +596,39 @@ export async function submitUserMilestone(userId, milestone) {
     celebrationDate: milestone.celebrationDate || new Date().toISOString().split("T")[0],
     email: milestone.email || "",
     status: "submitted",
-    createdAt: new Date().toISOString(),
+    submittedAt: serverTimestamp(),
   };
 
-  // 1. Save to local storage cache for instant UI feedback
+  const docRef = await addDoc(collection(db, "milestones"), newMilestone);
+  const created = { id: docRef.id, ...newMilestone };
+
+  // Update in-memory state for instant UI feedback
   try {
     const current = getUserActivity(userId);
     const updated = {
       ...current,
-      milestones: [newMilestone, ...(current.milestones || [])],
+      milestones: [created, ...(current.milestones || [])],
     };
     saveUserActivity(userId, updated);
-
-    // Also persist in global milestones array for admin viewing
-    const allRaw = localStorage.getItem("peleekings_all_milestones");
-    const allList = allRaw ? JSON.parse(allRaw) : [];
-    localStorage.setItem("peleekings_all_milestones", JSON.stringify([newMilestone, ...allList]));
   } catch (err) {
-    console.warn("Failed to cache milestone locally:", err);
+    console.warn("Notice: could not update in-memory milestone cache:", err);
   }
 
-  // 2. Persist to Firestore milestones collection for Admin review
-  try {
-    const docRef = await addDoc(collection(db, "milestones"), {
-      ...newMilestone,
-      submittedAt: serverTimestamp(),
-    });
-    newMilestone.firestoreId = docRef.id;
-  } catch (err) {
-    console.warn("Notice: could not persist milestone to Firestore:", err);
-  }
-
-  return newMilestone;
+  return created;
 }
 
 /**
- * Fetch all submitted milestones for Admin review
+ * Fetch all submitted milestones for Admin review (Firestore-only)
  */
 export async function getAllMilestones() {
-  let list = [];
   try {
     const snap = await getDocs(query(collection(db, "milestones"), orderBy("submittedAt", "desc")));
     if (!snap.empty) {
-      list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     }
+    return [];
   } catch (err) {
     console.warn("Notice: fetching milestones from Firestore:", err);
+    return [];
   }
-
-  // Merge with local storage cache so newly submitted milestones always appear
-  try {
-    const allRaw = localStorage.getItem("peleekings_all_milestones");
-    if (allRaw) {
-      const localList = JSON.parse(allRaw);
-      const fsIds = new Set(list.map((m) => m.id || m.firestoreId));
-      for (const loc of localList) {
-        if (!fsIds.has(loc.id)) {
-          list.push(loc);
-        }
-      }
-    }
-  } catch {}
-
-  return list;
 }

@@ -23,7 +23,7 @@ import { getResources, uploadResource, DEFAULT_RESOURCES } from "../contexts/res
 import { subscribeToNotifications, markNotificationAsRead, markAllNotificationsAsRead } from "../contexts/notificationsService";
 
 export default function Navbar() {
-  const { currentUser, userProfile, logout, updateUserRole } = useAuth();
+  const { currentUser, userProfile, logout, isAdmin, isTutor, role } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -144,7 +144,7 @@ export default function Navbar() {
               uid: currentUser.uid,
               displayName: currentUser.displayName || userProfile?.fullName,
               email: currentUser.email,
-              role: userProfile?.role,
+              role: role || (isAdmin ? "admin" : isTutor ? "tutor" : "student"),
             }
           : null,
       });
@@ -475,8 +475,8 @@ export default function Navbar() {
                       {currentUser?.email || ""}
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8 }}>
-                      <span className={`pill-badge ${userProfile?.role === "admin" ? "pill-solid-dark" : userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.submittedRole === "tutor" ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
-                        {userProfile?.role === "admin" ? "Admin" : userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.submittedRole === "tutor" ? "Tutor" : "Student"}
+                      <span className={`pill-badge ${isAdmin ? "pill-solid-dark" : isTutor ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.7rem", padding: "2px 8px" }}>
+                        {isAdmin ? "Admin" : isTutor ? "Tutor" : "Student"}
                       </span>
                       {userProfile?.regNumber && (
                         <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontWeight: 600 }}>
@@ -502,7 +502,7 @@ export default function Navbar() {
                     >
                       <Briefcase size={15} aria-hidden="true" /> Teaching Portal
                     </Link>
-                    {userProfile?.role === "admin" && (
+                    {isAdmin && (
                       <Link
                         to="/admin"
                         onClick={() => setShowMenu(false)}
@@ -588,8 +588,8 @@ export default function Navbar() {
                     {currentUser?.displayName || userProfile?.fullName || "Learner"}
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
-                    <span className={`pill-badge ${userProfile?.role === "admin" ? "pill-solid-dark" : userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.submittedRole === "tutor" ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.65rem", padding: "1px 6px" }}>
-                      {userProfile?.role === "admin" ? "Admin" : userProfile?.role === "tutor" || userProfile?.role === "instructor" || userProfile?.submittedRole === "tutor" ? "Tutor" : "Student"}
+                    <span className={`pill-badge ${isAdmin ? "pill-solid-dark" : isTutor ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.65rem", padding: "1px 6px" }}>
+                      {isAdmin ? "Admin" : isTutor ? "Tutor" : "Student"}
                     </span>
                     {userProfile?.regNumber && (
                       <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 600 }}>
@@ -658,7 +658,7 @@ export default function Navbar() {
                 >
                   <Briefcase size={18} aria-hidden="true" /> Teaching Portal
                 </Link>
-                {userProfile?.role === "admin" && (
+                {isAdmin && (
                   <Link
                     to="/admin"
                     className={`mobile-nav-link ${isActive("/admin") ? "active" : ""}`}
@@ -784,7 +784,7 @@ export default function Navbar() {
             )}
 
             {/* Admin & Tutor Upload Control */}
-            {(userProfile?.role === "admin" || userProfile?.role === "tutor" || userProfile?.role === "instructor") && (
+            {(isAdmin || isTutor) && (
               <div style={{ marginBottom: 20 }}>
                 <button
                   className="btn btn-solid-dark btn-sm"

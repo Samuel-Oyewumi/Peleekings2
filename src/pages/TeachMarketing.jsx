@@ -3,15 +3,10 @@ import { GraduationCap, Users, BarChart3, Zap } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 
 export default function TeachMarketing() {
-  const { currentUser, userProfile } = useAuth();
+  const { currentUser, isTutor: hasTutorClaim, isAdmin } = useAuth();
   const navigate = useNavigate();
 
-  const isTutor =
-    userProfile?.role === "tutor" ||
-    userProfile?.role === "instructor" ||
-    userProfile?.role === "admin" ||
-    userProfile?.submittedRole === "tutor" ||
-    userProfile?.submittedRole === "instructor";
+  const isTutor = hasTutorClaim || isAdmin;
 
   function handleGetStarted() {
     if (isTutor || currentUser) {

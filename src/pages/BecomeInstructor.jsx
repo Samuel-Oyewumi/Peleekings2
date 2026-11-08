@@ -6,16 +6,11 @@ import { db } from "../firebase";
 import { getResources, uploadResource } from "../contexts/resourcesService";
 
 export default function BecomeInstructor() {
-  const { currentUser, userProfile, updateUserRole } = useAuth();
+  const { currentUser, userProfile, isTutor: hasTutorClaim, isAdmin } = useAuth();
   const navigate = useNavigate();
 
-  // If user is already instructor/tutor or toggling to portal view:
-  const isTutor =
-    userProfile?.role === "instructor" ||
-    userProfile?.role === "tutor" ||
-    userProfile?.role === "admin" ||
-    userProfile?.submittedRole === "tutor" ||
-    userProfile?.submittedRole === "instructor";
+  // If user is already instructor/tutor or admin:
+  const isTutor = hasTutorClaim || isAdmin;
   const [activeTab, setActiveTab] = useState(isTutor ? "dashboard" : "apply");
 
   // Application form state
@@ -74,7 +69,7 @@ export default function BecomeInstructor() {
           ? {
               uid: currentUser.uid,
               displayName: currentUser.displayName || userProfile?.fullName || "Tutor",
-              role: userProfile?.role || "tutor",
+              role: isAdmin ? "admin" : (hasTutorClaim ? "tutor" : "student"),
             }
           : null,
       });
@@ -124,27 +119,11 @@ export default function BecomeInstructor() {
         appliedAt: serverTimestamp(),
       };
 
-      try {
-        await Promise.race([
-          addDoc(collection(db, "tutorApplications"), appData),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("TIMEOUT")), 2500)),
-        ]);
-      } catch (fsErr) {
-        console.warn("Notice: Firestore write for tutor application fallback:", fsErr);
-      }
-
-      try {
-        const existingApps = JSON.parse(localStorage.getItem("peleekings_pending_tutor_applications") || "[]");
-        localStorage.setItem(
-          "peleekings_pending_tutor_applications",
-          JSON.stringify([{ id: `app_${Date.now()}`, ...appData, submittedAt: new Date().toISOString() }, ...existingApps])
-        );
-      } catch {}
-
+      await addDoc(collection(db, "tutorApplications"), appData);
       setApplied(true);
     } catch (err) {
-      console.error(err);
-      setError("Failed to submit application. Please try again.");
+      console.error("Tutor application submission error:", err);
+      setError(err.message || "Failed to submit application. Please try again.");
     } finally {
       setSubmitting(false);
     }
@@ -507,18 +486,17 @@ export default function BecomeInstructor() {
                   Your Application is Under Review!
                 </h2>
                 <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem", maxWidth: 460, margin: "0 auto 24px" }}>
-                  Thank you for applying to teach on Peleekings. You can now open the Teaching Portal Studio to begin structuring your curriculum.
+                  Thank you for applying to teach on Peleekings. Your application has been submitted to the Admin team for review and approval.
                 </p>
                 <div style={{ display: "flex", justifyContent: "center", gap: 12, flexWrap: "wrap" }}>
                   <button
                     type="button"
                     className="btn btn-solid-dark btn-lg"
                     onClick={() => {
-                      updateUserRole("tutor");
-                      navigate("/teach-portal");
+                      navigate("/dashboard");
                     }}
                   >
-                    Open Teaching Portal Studio &rarr;
+                    Return to Dashboard &rarr;
                   </button>
                   <button type="button" className="btn btn-outline btn-lg" onClick={() => setActiveTab("dashboard")}>
                     View Tutor Overview

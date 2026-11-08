@@ -16,50 +16,11 @@ import {
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { db, storage } from "../firebase";
 import { getResources, uploadResource } from "../contexts/resourcesService";
-import { COURSES_CATALOG } from "../data/courses";
 import { createNotification } from "../contexts/notificationsService";
 
-const withTimeout = (promise, ms = 3000) =>
-  Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error("TIMEOUT")), ms)),
-  ]);
-
-const INITIAL_SAMPLE_SUBMISSIONS = [
-  {
-    id: "sub-sample-1",
-    studentName: "Adebayo Ogunlesi",
-    studentEmail: "adebayo.o@nysc.gov.ng",
-    courseId: "ai-essentials",
-    courseTitle: "AI Essentials & Automation",
-    content: "Submitted link to automated customer triage workflow built with Gemini API + Google Sheets webhook.",
-    status: "pending",
-    grade: "",
-    feedback: "",
-  },
-  {
-    id: "sub-sample-2",
-    studentName: "Chidinma Nwosu",
-    studentEmail: "chidinma.nwosu@gmail.com",
-    courseId: "graphic-design",
-    courseTitle: "Graphic Design Fundamentals",
-    content: "Brand identity system deliverable: primary logo, submark, color palette tokens, and social templates.",
-    status: "graded",
-    grade: "A (94%)",
-    feedback: "Excellent hierarchy and consistent brand token usage across all mockups.",
-  },
-];
-
 export default function TeachingPortal() {
-  const { currentUser, userProfile, updateUserRole } = useAuth();
+  const { currentUser, userProfile, isAdmin, isTutor } = useAuth();
   const navigate = useNavigate();
-
-  const isTutor =
-    userProfile?.role === "instructor" ||
-    userProfile?.role === "tutor" ||
-    userProfile?.role === "admin" ||
-    userProfile?.submittedRole === "tutor" ||
-    userProfile?.submittedRole === "instructor";
 
   const [activeTab, setActiveTab] = useState("courses");
   const [toastMessage, setToastMessage] = useState("");
@@ -80,50 +41,27 @@ export default function TeachingPortal() {
   const [appliedSuccess, setAppliedSuccess] = useState(false);
   const [applyError, setApplyError] = useState("");
 
-  // ── Courses & Modules State (Initialized immediately so UI never blocks) ──
-  const [courses, setCourses] = useState(() => {
-    let custom = [];
-    try {
-      custom = JSON.parse(localStorage.getItem("peleekings_custom_courses") || "[]");
-    } catch {}
-    const defaults = COURSES_CATALOG.slice(0, 3).map((c) => ({
-      ...c,
-      status: "published",
-    }));
-    const merged = [...custom, ...defaults.filter((d) => !custom.some((c) => c.id === d.id))];
-    return merged;
-  });
-
-  const [selectedCourse, setSelectedCourse] = useState(() => {
-    let custom = [];
-    try {
-      custom = JSON.parse(localStorage.getItem("peleekings_custom_courses") || "[]");
-    } catch {}
-    return custom[0] || { ...COURSES_CATALOG[0], status: "published" };
-  });
-
-  const [modules, setModules] = useState([
-    { id: "m1", title: "Module 1: Foundations & Setup", order: 1, itemsCount: 3 },
-    { id: "m2", title: "Module 2: Core Concepts & Practice", order: 2, itemsCount: 4 },
-    { id: "m3", title: "Module 3: Capstone & Review", order: 3, itemsCount: 2 },
-  ]);
+  // ── Courses & Modules State (Firestore-only) ─────────────────────────
+  const [courses, setCourses] = useState([]);
+  const [selectedCourse, setSelectedCourse] = useState(null);
+  const [modules, setModules] = useState([]);
   const [moduleItemsMap, setModuleItemsMap] = useState({});
   const [newModuleTitle, setNewModuleTitle] = useState("");
   const [isCreatingModule, setIsCreatingModule] = useState(false);
 
   // ── Submissions & Grading State ──────────────────────────────────────
-  const [submissions, setSubmissions] = useState(INITIAL_SAMPLE_SUBMISSIONS);
+  const [submissions, setSubmissions] = useState([]);
   const [loadingSubmissions, setLoadingSubmissions] = useState(false);
   const [gradingState, setGradingState] = useState({}); // { [subId]: { grade: "", feedback: "" } }
   const [savingGradeId, setSavingGradeId] = useState(null);
 
   // ── Analytics State ──────────────────────────────────────────────────
   const [analytics, setAnalytics] = useState({
-    enrolledCount: 28,
-    avgScore: "86%",
-    submissionRate: "79%",
-    moduleCount: 3,
-    trend: [4, 9, 14, 18, 22, 25, 28],
+    enrolledCount: null,
+    avgScore: null,
+    submissionRate: null,
+    moduleCount: 0,
+    trend: [],
   });
   const [loadingAnalytics, setLoadingAnalytics] = useState(false);
 
@@ -169,127 +107,96 @@ export default function TeachingPortal() {
     setTimeout(() => setToastMessage(""), 3500);
   }
 
-  // Load Tutor Courses
+  // Load Tutor Courses (Firestore-only: Tutors see their courses, Admins see all)
   useEffect(() => {
     async function loadTutorCourses() {
       if (!currentUser?.uid) return;
-      let localCustom = [];
       try {
-        localCustom = JSON.parse(localStorage.getItem("peleekings_custom_courses") || "[]");
-      } catch {}
-
-      try {
-        const q = userProfile?.role === "admin"
+        const q = isAdmin
           ? collection(db, "courses")
           : query(collection(db, "courses"), where("tutorId", "==", currentUser.uid));
-        const snap = await withTimeout(getDocs(q), 3000);
+        const snap = await getDocs(q);
         const fsList = !snap.empty ? snap.docs.map((d) => ({ id: d.id, ...d.data() })) : [];
-        const fallback = COURSES_CATALOG.slice(0, 3).map((c) => ({
-          ...c,
-          tutorId: currentUser.uid,
-          status: "published",
-        }));
-        const combined = [
-          ...localCustom,
-          ...fsList.filter((f) => !localCustom.some((l) => l.id === f.id)),
-          ...fallback.filter((d) => !localCustom.some((l) => l.id === d.id) && !fsList.some((f) => f.id === d.id)),
-        ];
-        setCourses(combined);
-        setSelectedCourse((prev) => combined.find((c) => c.id === prev?.id) || combined[0]);
+        setCourses(fsList);
+        setSelectedCourse((prev) => fsList.find((c) => c.id === prev?.id) || fsList[0] || null);
       } catch (err) {
-        console.warn("Tutor courses fallback notice:", err);
+        console.error("Tutor courses fetch error:", err);
+        triggerToast("Failed to load courses: " + (err.message || "Network error"));
       }
     }
 
     if (isTutor) {
       loadTutorCourses();
     }
-  }, [currentUser?.uid, isTutor, userProfile?.role]);
+  }, [currentUser?.uid, isTutor, isAdmin]);
 
-  // Load Modules & Saved Content for selected course
+  // Load Modules & Items for selected course (Firestore-only)
   useEffect(() => {
     async function loadModules() {
-      if (!selectedCourse?.id) return;
-      let localMods = null;
-      try {
-        const raw = localStorage.getItem(`peleekings_modules_${selectedCourse.id}`);
-        if (raw) localMods = JSON.parse(raw);
-      } catch {}
-
-      try {
-        const rawItems = localStorage.getItem(`peleekings_course_content_${selectedCourse.id}`);
-        if (rawItems) {
-          setModuleItemsMap(JSON.parse(rawItems));
-        } else {
-          setModuleItemsMap({});
-        }
-      } catch {
+      if (!selectedCourse?.id) {
+        setModules([]);
         setModuleItemsMap({});
-      }
-
-      if (localMods && localMods.length > 0) {
-        setModules(localMods);
+        return;
       }
 
       try {
-        const modSnap = await withTimeout(
-          getDocs(query(collection(db, "courses", selectedCourse.id, "modules"), orderBy("order", "asc"))),
-          2500
+        const modSnap = await getDocs(
+          query(collection(db, "courses", selectedCourse.id, "modules"), orderBy("order", "asc"))
         );
-        if (!modSnap.empty) {
-          const fsMods = modSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          const mergedMods = localMods
-            ? [...fsMods, ...localMods.filter((lm) => !fsMods.some((fm) => fm.id === lm.id || fm.title === lm.title))]
-            : fsMods;
-          setModules(mergedMods);
-        } else if (!localMods) {
-          setModules([
-            { id: "m1", title: "Module 1: Foundations & Setup", order: 1, itemsCount: 3 },
-            { id: "m2", title: "Module 2: Core Concepts & Practice", order: 2, itemsCount: 4 },
-            { id: "m3", title: "Module 3: Capstone & Review", order: 3, itemsCount: 2 },
-          ]);
-        }
-      } catch {
-        if (!localMods) {
-          setModules([
-            { id: "m1", title: "Module 1: Foundations & Setup", order: 1, itemsCount: 3 },
-            { id: "m2", title: "Module 2: Core Concepts & Practice", order: 2, itemsCount: 4 },
-            { id: "m3", title: "Module 3: Capstone & Review", order: 3, itemsCount: 2 },
-          ]);
-        }
+        const fsMods = modSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        setModules(fsMods);
+
+        // Fetch lessons, notes, tests, assignments subcollections
+        const [lessonsSnap, notesSnap, testsSnap, asnSnap] = await Promise.all([
+          getDocs(collection(db, "courses", selectedCourse.id, "lessons")).catch(() => ({ docs: [] })),
+          getDocs(collection(db, "courses", selectedCourse.id, "notes")).catch(() => ({ docs: [] })),
+          getDocs(collection(db, "courses", selectedCourse.id, "tests")).catch(() => ({ docs: [] })),
+          getDocs(collection(db, "courses", selectedCourse.id, "assignments")).catch(() => ({ docs: [] })),
+        ]);
+
+        const allItems = [
+          ...lessonsSnap.docs.map((d) => ({ id: d.id, contentType: "video", ...d.data() })),
+          ...notesSnap.docs.map((d) => ({ id: d.id, contentType: "note", ...d.data() })),
+          ...testsSnap.docs.map((d) => ({ id: d.id, contentType: "test", ...d.data() })),
+          ...asnSnap.docs.map((d) => ({ id: d.id, contentType: "assignment", ...d.data() })),
+        ];
+
+        const newMap = {};
+        allItems.forEach((item) => {
+          const mId = item.moduleId || "unassigned";
+          if (!newMap[mId]) newMap[mId] = [];
+          newMap[mId].push(item);
+        });
+        setModuleItemsMap(newMap);
+      } catch (err) {
+        console.error("Error loading course curriculum:", err);
       }
     }
     loadModules();
   }, [selectedCourse?.id]);
 
-  // Load Submissions
+  // Load Submissions (Firestore-only)
   useEffect(() => {
     async function loadSubmissions() {
       setLoadingSubmissions(true);
-      let localSubs = [];
       try {
-        localSubs = JSON.parse(localStorage.getItem("peleekings_tutor_submissions") || "[]");
-      } catch {}
+        const subQuery = isAdmin
+          ? query(collection(db, "assignmentSubmissions"), orderBy("submittedAt", "desc"))
+          : selectedCourse?.id
+            ? query(collection(db, "assignmentSubmissions"), where("courseId", "==", selectedCourse.id))
+            : null;
 
-      try {
-        const snap = await withTimeout(
-          getDocs(query(collection(db, "assignmentSubmissions"), orderBy("submittedAt", "desc"))),
-          2500
-        );
-        const fsItems = !snap.empty ? snap.docs.map((d) => ({ id: d.id, ...d.data() })) : [];
-        const combined = [
-          ...fsItems,
-          ...localSubs.filter((l) => !fsItems.some((f) => f.id === l.id)),
-          ...INITIAL_SAMPLE_SUBMISSIONS.filter((s) => !fsItems.some((f) => f.id === s.id) && !localSubs.some((l) => l.id === s.id)),
-        ];
-        setSubmissions(combined);
+        if (subQuery) {
+          const snap = await getDocs(subQuery);
+          const fsItems = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          setSubmissions(fsItems);
+        } else {
+          setSubmissions([]);
+        }
       } catch (err) {
-        console.warn("Notice: using local/sample submissions:", err);
-        const combined = [
-          ...localSubs,
-          ...INITIAL_SAMPLE_SUBMISSIONS.filter((s) => !localSubs.some((l) => l.id === s.id)),
-        ];
-        setSubmissions(combined);
+        console.error("Failed to load submissions:", err);
+        triggerToast("Failed to load submissions: " + (err.message || "Error"));
+        setSubmissions([]);
       } finally {
         setLoadingSubmissions(false);
       }
@@ -298,19 +205,27 @@ export default function TeachingPortal() {
     if (isTutor && activeTab === "submissions") {
       loadSubmissions();
     }
-  }, [isTutor, activeTab]);
+  }, [isTutor, isAdmin, activeTab, selectedCourse?.id]);
 
-  // ── Load Live Analytics from Firestore ──────────────────────────────
+  // ── Load Live Analytics from Firestore (Zero fake numbers) ───────────
   useEffect(() => {
     async function loadAnalytics() {
-      if (!selectedCourse?.id) return;
+      if (!selectedCourse?.id) {
+        setAnalytics({
+          enrolledCount: null,
+          avgScore: null,
+          submissionRate: null,
+          moduleCount: 0,
+          trend: [],
+        });
+        return;
+      }
       setLoadingAnalytics(true);
       try {
-        const enrollSnap = await withTimeout(
-          getDocs(query(collection(db, "enrollments"), where("courseId", "==", selectedCourse.id))),
-          2500
+        const enrollSnap = await getDocs(
+          query(collection(db, "enrollments"), where("courseId", "==", selectedCourse.id))
         );
-        const enrolledCount = enrollSnap.size || 28;
+        const enrolledCount = enrollSnap.size;
 
         const now = Date.now();
         const weekMs = 7 * 24 * 60 * 60 * 1000;
@@ -322,35 +237,52 @@ export default function TeachingPortal() {
             trendBuckets[6 - weeksAgo] += 1;
           }
         });
-        const cumulativeTrend = enrollSnap.size > 0
+        const cumulativeTrend = enrolledCount > 0
           ? trendBuckets.reduce((acc, val, idx) => {
               acc.push((acc[idx - 1] || 0) + val);
               return acc;
             }, [])
-          : [4, 9, 14, 18, 22, 25, 28];
+          : [];
 
-        const asnSnap = await withTimeout(
-          getDocs(query(collection(db, "assignmentSubmissions"), where("courseId", "==", selectedCourse.id))),
-          2500
+        const asnSnap = await getDocs(
+          query(collection(db, "assignmentSubmissions"), where("courseId", "==", selectedCourse.id))
         );
         const totalSubs = asnSnap.size;
-        const submissionRate = enrollSnap.size > 0
-          ? `${Math.min(100, Math.round((totalSubs / enrollSnap.size) * 100))}%`
-          : "79%";
+        const submissionRate = enrolledCount > 0
+          ? `${Math.min(100, Math.round((totalSubs / enrolledCount) * 100))}%`
+          : null;
+
+        // Graded test submissions for avgScore
+        const testSnap = await getDocs(
+          query(collection(db, "testSubmissions"), where("courseId", "==", selectedCourse.id))
+        );
+        let totalScore = 0;
+        let gradedCount = 0;
+        testSnap.docs.forEach((d) => {
+          const sData = d.data();
+          if (typeof sData.score === "number") {
+            totalScore += sData.score;
+            gradedCount++;
+          }
+        });
+        const avgScore = gradedCount > 0 ? `${Math.round(totalScore / gradedCount)}%` : null;
 
         setAnalytics({
           enrolledCount,
-          avgScore: "86%",
+          avgScore,
           submissionRate,
-          moduleCount: modules.length || 3,
+          moduleCount: modules.length,
           trend: cumulativeTrend,
         });
       } catch (err) {
-        console.warn("Analytics fallback notice:", err);
-        setAnalytics((prev) => ({
-          ...prev,
-          moduleCount: modules.length || 3,
-        }));
+        console.error("Analytics fetch error:", err);
+        setAnalytics({
+          enrolledCount: null,
+          avgScore: null,
+          submissionRate: null,
+          moduleCount: modules.length,
+          trend: [],
+        });
       } finally {
         setLoadingAnalytics(false);
       }
@@ -376,6 +308,44 @@ export default function TeachingPortal() {
     }
   }, [isTutor, activeTab, selectedCourse?.id]);
 
+  // Load Tutor & Platform Announcements
+  const [tutorAnnouncements, setTutorAnnouncements] = useState([]);
+  const [loadingTutorAnnouncements, setLoadingTutorAnnouncements] = useState(false);
+
+  useEffect(() => {
+    async function loadTutorAnnouncements() {
+      setLoadingTutorAnnouncements(true);
+      try {
+        const q = query(
+          collection(db, "announcements"),
+          where("status", "==", "published"),
+          orderBy("createdAt", "desc")
+        );
+        const snap = await getDocs(q);
+        const list = snap.docs
+          .map((d) => {
+            const data = d.data();
+            let dateStr = "Recent";
+            if (data.createdAt?.toDate) {
+              dateStr = data.createdAt.toDate().toLocaleDateString();
+            } else if (data.createdAt) {
+              dateStr = new Date(data.createdAt).toLocaleDateString();
+            }
+            return { id: d.id, ...data, date: dateStr };
+          })
+          .filter((a) => a.audience === "all" || a.audience === "tutors");
+        setTutorAnnouncements(list);
+      } catch (err) {
+        console.warn("Notice loading instructor announcements:", err);
+      } finally {
+        setLoadingTutorAnnouncements(false);
+      }
+    }
+    if (isTutor && activeTab === "announcements") {
+      loadTutorAnnouncements();
+    }
+  }, [isTutor, activeTab]);
+
   // ── Handle Tutor Application ─────────────────────────────────────────
   async function handleApplicationSubmit(e) {
     e.preventDefault();
@@ -391,14 +361,10 @@ export default function TeachingPortal() {
     try {
       let portraitUrl = portraitPreview || null;
       if (portraitFile) {
-        try {
-          const safeName = portraitFile.name.replace(/[^a-zA-Z0-9.-]/g, "_");
-          const portraitRef = ref(storage, `users/${currentUser.uid}/portrait/${Date.now()}_${safeName}`);
-          const uploadRes = await withTimeout(uploadBytes(portraitRef, portraitFile), 2500);
-          portraitUrl = await withTimeout(getDownloadURL(uploadRes.ref), 2000);
-        } catch (storageErr) {
-          console.warn("Notice: portrait storage upload fallback:", storageErr);
-        }
+        const safeName = portraitFile.name.replace(/[^a-zA-Z0-9.-]/g, "_");
+        const portraitRef = ref(storage, `users/${currentUser.uid}/portrait/${Date.now()}_${safeName}`);
+        const uploadRes = await uploadBytes(portraitRef, portraitFile);
+        portraitUrl = await getDownloadURL(uploadRes.ref);
       }
 
       const payload = {
@@ -416,27 +382,11 @@ export default function TeachingPortal() {
         submittedAt: serverTimestamp(),
       };
 
-      try {
-        await withTimeout(addDoc(collection(db, "tutorApplications"), payload), 2500);
-      } catch (fsErr) {
-        console.warn("Notice: Firestore write for tutor application fallback:", fsErr);
-      }
-
-      // Cache locally so AdminPanel immediately sees it even before server sync
-      try {
-        const existingApps = JSON.parse(localStorage.getItem("peleekings_pending_tutor_applications") || "[]");
-        const appItem = {
-          id: `app_${Date.now()}`,
-          ...payload,
-          submittedAt: new Date().toISOString(),
-        };
-        localStorage.setItem("peleekings_pending_tutor_applications", JSON.stringify([appItem, ...existingApps]));
-      } catch {}
-
+      await addDoc(collection(db, "tutorApplications"), payload);
       setAppliedSuccess(true);
       triggerToast("Application submitted successfully!");
     } catch (err) {
-      console.error(err);
+      console.error("Tutor application submission error:", err);
       setApplyError(err.message || "Failed to submit tutor application.");
     } finally {
       setSubmittingApply(false);
@@ -446,7 +396,11 @@ export default function TeachingPortal() {
   // ── Handle Add Module ────────────────────────────────────────────────
   async function handleAddModule(e) {
     e.preventDefault();
-    const targetCourseId = selectedCourse?.id || courses[0]?.id || "ai-essentials";
+    const targetCourseId = selectedCourse?.id;
+    if (!targetCourseId) {
+      triggerToast("Please select a course first.");
+      return;
+    }
     if (!newModuleTitle.trim()) return;
     setIsCreatingModule(true);
     try {
@@ -456,30 +410,14 @@ export default function TeachingPortal() {
         order,
         createdAt: serverTimestamp(),
       };
-      let newId = `mod-${Date.now()}`;
-      try {
-        const docRef = await withTimeout(
-          addDoc(collection(db, "courses", targetCourseId, "modules"), modData),
-          2500
-        );
-        newId = docRef.id;
-      } catch (fsErr) {
-        console.warn("Firestore addModule fallback to local state:", fsErr);
-      }
-
-      const createdMod = { id: newId, title: newModuleTitle.trim(), order, itemsCount: 0 };
-      setModules((prev) => {
-        const updated = [...prev, createdMod];
-        try {
-          localStorage.setItem(`peleekings_modules_${targetCourseId}`, JSON.stringify(updated));
-        } catch {}
-        return updated;
-      });
+      const docRef = await addDoc(collection(db, "courses", targetCourseId, "modules"), modData);
+      const createdMod = { id: docRef.id, title: newModuleTitle.trim(), order, itemsCount: 0 };
+      setModules((prev) => [...prev, createdMod]);
       setNewModuleTitle("");
       triggerToast("✓ Module added successfully!");
     } catch (err) {
-      console.error(err);
-      triggerToast("Could not add module.");
+      console.error("Add module error:", err);
+      triggerToast("Could not add module: " + (err.message || "Write failed"));
     } finally {
       setIsCreatingModule(false);
     }
@@ -505,44 +443,25 @@ export default function TeachingPortal() {
           "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80",
         tutorId: currentUser?.uid || "tutor",
         tutorName: userProfile?.fullName || currentUser?.displayName || "Instructor",
-        status: "published",
+        status: "draft",
         badge: "Certificate",
         rating: 5.0,
         enrolledCount: 0,
+        createdAt: serverTimestamp(),
       };
 
+      await setDoc(doc(db, "courses", courseId), courseData);
+      const modDocRef = await addDoc(collection(db, "courses", courseId, "modules"), {
+        title: "Module 1: Orientation & Foundations",
+        order: 1,
+        createdAt: serverTimestamp(),
+      });
+
       const firstMod = {
-        id: `mod-${Date.now()}`,
+        id: modDocRef.id,
         title: "Module 1: Orientation & Foundations",
         order: 1,
       };
-
-      try {
-        await withTimeout(
-          setDoc(doc(db, "courses", courseId), { ...courseData, createdAt: serverTimestamp() }),
-          2500
-        );
-        const modDocRef = await withTimeout(
-          addDoc(collection(db, "courses", courseId, "modules"), {
-            title: firstMod.title,
-            order: 1,
-            createdAt: serverTimestamp(),
-          }),
-          2000
-        );
-        firstMod.id = modDocRef.id;
-      } catch (fsErr) {
-        console.warn("Firestore createCourse fallback to local persistence:", fsErr);
-      }
-
-      try {
-        const existingCustom = JSON.parse(localStorage.getItem("peleekings_custom_courses") || "[]");
-        localStorage.setItem(
-          "peleekings_custom_courses",
-          JSON.stringify([courseData, ...existingCustom.filter((c) => c.id !== courseId)])
-        );
-        localStorage.setItem(`peleekings_modules_${courseId}`, JSON.stringify([firstMod]));
-      } catch {}
 
       setCourses((prev) => [courseData, ...prev.filter((c) => c.id !== courseId)]);
       setSelectedCourse(courseData);
@@ -555,10 +474,10 @@ export default function TeachingPortal() {
         duration: "6 weeks",
         image: "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80",
       });
-      triggerToast("✓ New course created and published to Peleekings!");
+      triggerToast("✓ Course draft created successfully!");
     } catch (err) {
       console.error("Failed to create course:", err);
-      triggerToast("Failed to create course. Please try again.");
+      triggerToast("Failed to create course: " + (err.message || "Write failed"));
     } finally {
       setIsCreatingCourse(false);
     }
@@ -567,26 +486,25 @@ export default function TeachingPortal() {
   // ── Handle Add Content to Module ─────────────────────────────────────
   async function handleAddContent(e) {
     e.preventDefault();
-    const targetCourseId = selectedCourse?.id || courses[0]?.id || "ai-essentials";
-    const targetModId = addContentModuleId || modules[0]?.id || "m1";
+    const targetCourseId = selectedCourse?.id;
+    if (!targetCourseId) {
+      triggerToast("Please select a course first.");
+      return;
+    }
+    const targetModId = addContentModuleId || modules[0]?.id;
+    if (!targetModId) {
+      triggerToast("Please create a module first.");
+      return;
+    }
     if (!addContentTitle.trim()) return;
     setIsSubmittingContent(true);
     try {
       let fileUrl = null;
       if (addContentFile) {
-        try {
-          const safeName = addContentFile.name.replace(/[^a-zA-Z0-9.-]/g, "_");
-          const storageRef = ref(storage, `courses/${targetCourseId}/${targetModId}/${Date.now()}_${safeName}`);
-          const uploadRes = await withTimeout(uploadBytes(storageRef, addContentFile), 2500);
-          fileUrl = await withTimeout(getDownloadURL(uploadRes.ref), 2000);
-        } catch (storageErr) {
-          console.warn("Storage upload notice: falling back gracefully:", storageErr);
-          try {
-            fileUrl = URL.createObjectURL(addContentFile);
-          } catch {
-            fileUrl = `https://storage.peleekings.com/materials/${encodeURIComponent(addContentFile.name)}`;
-          }
-        }
+        const safeName = addContentFile.name.replace(/[^a-zA-Z0-9.-]/g, "_");
+        const storageRef = ref(storage, `courses/${targetCourseId}/${targetModId}/${Date.now()}_${safeName}`);
+        const uploadRes = await uploadBytes(storageRef, addContentFile);
+        fileUrl = await getDownloadURL(uploadRes.ref);
       }
 
       const collectionName =
@@ -628,32 +546,21 @@ export default function TeachingPortal() {
         payload.type = "test";
       }
 
-      try {
-        await withTimeout(
-          addDoc(collection(db, "courses", targetCourseId, collectionName), {
-            ...payload,
-            createdAt: serverTimestamp(),
-          }),
-          2500
-        );
-      } catch (fsErr) {
-        console.warn("Firestore addContent fallback to local persistence:", fsErr);
-      }
+      const docRef = await addDoc(collection(db, "courses", targetCourseId, collectionName), {
+        ...payload,
+        createdAt: serverTimestamp(),
+      });
 
-      // Persist added content locally so both Tutor Portal and Classroom reflect it immediately
-      const localItem = {
-        id: `item-${Date.now()}`,
+      const newItem = {
+        id: docRef.id,
         ...payload,
         contentType: addContentType,
         createdAt: new Date().toISOString(),
       };
+
       setModuleItemsMap((prev) => {
         const modList = prev[targetModId] || [];
-        const updated = { ...prev, [targetModId]: [...modList, localItem] };
-        try {
-          localStorage.setItem(`peleekings_course_content_${targetCourseId}`, JSON.stringify(updated));
-        } catch {}
-        return updated;
+        return { ...prev, [targetModId]: [...modList, newItem] };
       });
 
       // Notify enrolled students in background (non-blocking)
@@ -693,8 +600,8 @@ export default function TeachingPortal() {
       setShowAddContentModal(false);
       triggerToast(`✓ ${addContentType.charAt(0).toUpperCase() + addContentType.slice(1)} published to module!`);
     } catch (err) {
-      console.error(err);
-      triggerToast("Failed to add content. Please try again.");
+      console.error("Add content error:", err);
+      triggerToast("Failed to add content: " + (err.message || "Write failed"));
     } finally {
       setIsSubmittingContent(false);
     }
@@ -711,33 +618,22 @@ export default function TeachingPortal() {
 
     setSavingGradeId(submissionId);
     try {
-      try {
-        const subRef = doc(db, "assignmentSubmissions", submissionId);
-        await withTimeout(
-          updateDoc(subRef, {
-            grade: data.grade.trim(),
-            feedback: data.feedback?.trim() || "",
-            status: "graded",
-            gradedAt: serverTimestamp(),
-            gradedBy: currentUser?.uid || "tutor",
-          }),
-          2500
-        );
-      } catch (fsErr) {
-        console.warn("Firestore grade update fallback to local state:", fsErr);
-      }
+      const subRef = doc(db, "assignmentSubmissions", submissionId);
+      await updateDoc(subRef, {
+        grade: data.grade.trim(),
+        feedback: data.feedback?.trim() || "",
+        status: "graded",
+        gradedAt: serverTimestamp(),
+        gradedBy: currentUser?.uid || "tutor",
+      });
 
-      setSubmissions((prev) => {
-        const updated = prev.map((s) =>
+      setSubmissions((prev) =>
+        prev.map((s) =>
           s.id === submissionId
             ? { ...s, grade: data.grade.trim(), feedback: data.feedback?.trim() || "", status: "graded" }
             : s
-        );
-        try {
-          localStorage.setItem("peleekings_tutor_submissions", JSON.stringify(updated));
-        } catch {}
-        return updated;
-      });
+        )
+      );
 
       if (targetSub?.uid) {
         createNotification(targetSub.uid, {
@@ -750,8 +646,8 @@ export default function TeachingPortal() {
 
       triggerToast("✓ Grade saved and student notified!");
     } catch (err) {
-      console.error(err);
-      triggerToast("Failed to save grade.");
+      console.error("Grade update error:", err);
+      triggerToast("Failed to save grade: " + (err.message || "Write failed"));
     } finally {
       setSavingGradeId(null);
     }
@@ -826,17 +722,10 @@ export default function TeachingPortal() {
               </div>
               <h3 style={{ fontSize: "1.3rem", fontWeight: 700, marginBottom: 8 }}>Application Submitted!</h3>
               <p style={{ color: "var(--text-secondary)", fontSize: "0.925rem", lineHeight: 1.6, maxWidth: 480, margin: "0 auto 24px" }}>
-                Your instructor application has been sent to the Admin team. Click below to open the <strong>Teaching Portal Studio</strong> and start building your course modules right away.
+                Your instructor application has been sent to the Admin team for review and approval. Once verified and approved by an Administrator, you will be notified and granted access to the Teaching Portal Studio.
               </p>
               <div style={{ display: "flex", justifyContent: "center", gap: 12, flexWrap: "wrap" }}>
-                <button
-                  onClick={() => updateUserRole("tutor")}
-                  className="btn btn-solid-dark btn-md"
-                  style={{ background: "var(--primary-learner)", color: "#FFFFFF" }}
-                >
-                  Open Teaching Portal Studio &rarr;
-                </button>
-                <button onClick={() => navigate("/dashboard")} className="btn btn-outline btn-md">
+                <button onClick={() => navigate("/dashboard")} className="btn btn-solid-dark btn-md" style={{ background: "var(--primary-learner)", color: "#FFFFFF" }}>
                   Return to Learner Dashboard
                 </button>
               </div>
@@ -1064,6 +953,7 @@ export default function TeachingPortal() {
             { id: "submissions", label: `Student Submissions (${submissions.length})` },
             { id: "analytics", label: "Course Analytics" },
             { id: "resources", label: "Course Resources" },
+            { id: "announcements", label: "Broadcasts" },
           ].map((tab) => (
             <button
               key={tab.id}
@@ -1642,8 +1532,8 @@ export default function TeachingPortal() {
                 <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", fontWeight: 700, textTransform: "uppercase" }}>
                   Enrolled Students
                 </div>
-                <div style={{ fontSize: "2rem", fontWeight: 800, color: "var(--primary-learner)", marginTop: 6 }}>
-                  {analytics.enrolledCount}
+                <div style={{ fontSize: analytics.enrolledCount !== null ? "2rem" : "1.25rem", fontWeight: 800, color: "var(--primary-learner)", marginTop: 6 }}>
+                  {analytics.enrolledCount !== null ? analytics.enrolledCount : "No data yet"}
                 </div>
                 <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 4 }}>Active cohort</div>
               </div>
@@ -1652,8 +1542,8 @@ export default function TeachingPortal() {
                 <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", fontWeight: 700, textTransform: "uppercase" }}>
                   Avg Test Score
                 </div>
-                <div style={{ fontSize: "2rem", fontWeight: 800, color: "var(--text-primary)", marginTop: 6 }}>
-                  {analytics.avgScore}
+                <div style={{ fontSize: analytics.avgScore ? "2rem" : "1.25rem", fontWeight: 800, color: "var(--text-primary)", marginTop: 6 }}>
+                  {analytics.avgScore || "No data yet"}
                 </div>
                 <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 4 }}>Across all test submissions</div>
               </div>
@@ -1662,8 +1552,8 @@ export default function TeachingPortal() {
                 <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", fontWeight: 700, textTransform: "uppercase" }}>
                   Assignment Submission Rate
                 </div>
-                <div style={{ fontSize: "2rem", fontWeight: 800, color: "var(--text-primary)", marginTop: 6 }}>
-                  {analytics.submissionRate}
+                <div style={{ fontSize: analytics.submissionRate ? "2rem" : "1.25rem", fontWeight: 800, color: "var(--text-primary)", marginTop: 6 }}>
+                  {analytics.submissionRate || "No data yet"}
                 </div>
                 <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 4 }}>Submissions ÷ enrollments</div>
               </div>
@@ -1672,8 +1562,8 @@ export default function TeachingPortal() {
                 <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", fontWeight: 700, textTransform: "uppercase" }}>
                   Published Modules
                 </div>
-                <div style={{ fontSize: "2rem", fontWeight: 800, color: "var(--text-primary)", marginTop: 6 }}>
-                  {analytics.moduleCount}
+                <div style={{ fontSize: analytics.moduleCount > 0 ? "2rem" : "1.25rem", fontWeight: 800, color: "var(--text-primary)", marginTop: 6 }}>
+                  {analytics.moduleCount > 0 ? analytics.moduleCount : "No data yet"}
                 </div>
                 <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 4 }}>Total course modules</div>
               </div>
@@ -1830,6 +1720,55 @@ export default function TeachingPortal() {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* ── TAB: ANNOUNCEMENTS & BROADCASTS ────────────────────────── */}
+        {activeTab === "announcements" && (
+          <div>
+            <div style={{ marginBottom: 20 }}>
+              <h2 style={{ fontSize: "clamp(1.2rem, 3.5vw, 1.45rem)", fontWeight: 800 }}>Faculty &amp; Academic Broadcasts</h2>
+              <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginTop: 4 }}>
+                Platform notices, academic schedules, and messages broadcast to instructors.
+              </p>
+            </div>
+
+            {loadingTutorAnnouncements ? (
+              <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading broadcasts...</div>
+            ) : tutorAnnouncements.length === 0 ? (
+              <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: 12, padding: 36, textAlign: "center" }}>
+                <div style={{ fontSize: "2rem", marginBottom: 8 }}>📢</div>
+                <h4 style={{ margin: 0, fontWeight: 700 }}>No Active Broadcasts</h4>
+                <p style={{ margin: "4px 0 0", fontSize: "0.85rem", color: "var(--text-muted)" }}>
+                  There are currently no announcements for instructors.
+                </p>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                {tutorAnnouncements.map((ann) => (
+                  <div
+                    key={ann.id}
+                    style={{
+                      background: "#FFFFFF",
+                      border: "1px solid var(--border-light)",
+                      borderRadius: 12,
+                      padding: 20,
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                      <span className="pill-badge pill-tech">{ann.category || "Faculty"}</span>
+                      {ann.pinned && <span className="pill-badge pill-creative">📌 PINNED</span>}
+                      {ann.priority === "urgent" && <span className="pill-badge pill-danger">URGENT</span>}
+                      <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Posted {ann.date}</span>
+                    </div>
+                    <h3 style={{ margin: "0 0 8px", fontSize: "1.15rem", fontWeight: 800 }}>{ann.title}</h3>
+                    <p style={{ margin: 0, fontSize: "0.9rem", color: "var(--text-secondary)", lineHeight: 1.6, whiteSpace: "pre-line" }}>
+                      {ann.body}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </main>

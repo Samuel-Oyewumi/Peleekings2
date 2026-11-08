@@ -18,26 +18,8 @@ import {
 import { useAuth } from "../contexts/AuthContext";
 import { getUserActivity, submitAssignment, getUserEnrollments, enrollInCourse, getWeeklyActivityData, incrementDailyActivity } from "../contexts/userActivity";
 import { COURSES_CATALOG } from "../data/courses";
-import { doc, setDoc, getDocs, collection } from "firebase/firestore";
+import { doc, getDocs, collection, query, where, orderBy, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase";
-
-function computeUserRegCode(profile, uid) {
-  if (profile?.regNumber && profile.regNumber !== "Pending assignment") {
-    return profile.regNumber;
-  }
-  const nameParts = (profile?.fullName || profile?.displayName || "Learner").trim().split(/\s+/);
-  const sInit = (profile?.surname?.[0] || (nameParts.length > 1 ? nameParts[0][0] : "P")).toUpperCase();
-  const fInit = (profile?.firstName?.[0] || (nameParts.length > 1 ? nameParts[1][0] : "K")).toUpperCase();
-
-  if (profile?.studentType === "corper" && profile?.nyscStateCode) {
-    const raw = profile.nyscStateCode.replace(/\D/g, "");
-    if (raw.length >= 4) return `${sInit}${fInit}${raw.slice(-4)}`;
-  }
-
-  const seedStr = uid || profile?.email || "peleekings";
-  const num = 1000 + Math.abs(seedStr.split("").reduce((acc, c) => acc + c.charCodeAt(0) * 19, 0) % 9000);
-  return profile?.studentType === "corper" ? `${sInit}${fInit}${num}` : `${num}${fInit}${sInit}`;
-}
 
 function EmptyState({ icon: Icon, title, text, buttonText, onButtonClick }) {
   return (
@@ -131,19 +113,33 @@ export default function Dashboard() {
   const isNonCorper = userProfile?.studentType === "non_corper";
   const userName = userProfile?.fullName || currentUser?.displayName || currentUser?.email?.split("@")[0] || "Learner";
   const firstName = userProfile?.firstName || (userName.split(" ").length > 1 ? userName.split(" ")[0] : userName) || "Learner";
-  const regCode = computeUserRegCode(userProfile, currentUser?.uid);
   const email = currentUser?.email || userProfile?.email || "";
   const nyscCode = isNonCorper ? "Not Applicable (Non-Corper)" : (userProfile?.nyscStateCode || "Not provided");
 
-  // Sync valid regNumber to Firestore if missing or was set to 'Pending assignment'
+  const [realRegNumber, setRealRegNumber] = useState(userProfile?.regNumber || null);
+
   useEffect(() => {
-    if (currentUser?.uid && (!userProfile?.regNumber || userProfile.regNumber === "Pending assignment")) {
-      const generated = computeUserRegCode(userProfile, currentUser.uid);
-      if (generated) {
-        setDoc(doc(db, "users", currentUser.uid), { regNumber: generated }, { merge: true }).catch(() => {});
-      }
+    if (userProfile?.regNumber) {
+      setRealRegNumber(userProfile.regNumber);
+      return;
     }
+    if (!currentUser?.uid) return;
+
+    const unsub = onSnapshot(
+      doc(db, "users", currentUser.uid),
+      (docSnap) => {
+        if (docSnap.exists() && docSnap.data().regNumber) {
+          setRealRegNumber(docSnap.data().regNumber);
+        }
+      },
+      (err) => {
+        console.warn("Notice: onSnapshot regNumber subscription:", err);
+      }
+    );
+    return () => unsub();
   }, [currentUser?.uid, userProfile?.regNumber]);
+
+  const regCode = realRegNumber || "Generating your code...";
 
   function triggerToast(msg) {
     setToastMessage(msg);
@@ -244,6 +240,47 @@ export default function Dashboard() {
   // Active courses enrolled: prioritize live Firestore enrollments, fall back to cached
   const enrolledCourses = liveEnrollments.length > 0 ? liveEnrollments : (userActivity?.enrolledCourses || []);
   const completedCourses = enrolledCourses.filter((c) => (c.progress || 0) >= 100);
+
+  // Live Announcements from Firestore
+  const [liveAnnouncements, setLiveAnnouncements] = useState([]);
+  const [loadingAnnouncements, setLoadingAnnouncements] = useState(false);
+
+  useEffect(() => {
+    async function loadAnnouncements() {
+      setLoadingAnnouncements(true);
+      try {
+        const q = query(
+          collection(db, "announcements"),
+          where("status", "==", "published"),
+          orderBy("createdAt", "desc")
+        );
+        const snap = await getDocs(q);
+        const enrolledCourseIds = new Set(enrolledCourses.map((c) => c.id));
+        const list = snap.docs
+          .map((d) => {
+            const data = d.data();
+            let dateStr = "Recent";
+            if (data.createdAt?.toDate) {
+              dateStr = data.createdAt.toDate().toLocaleDateString();
+            } else if (data.createdAt) {
+              dateStr = new Date(data.createdAt).toLocaleDateString();
+            }
+            return { id: d.id, ...data, date: dateStr };
+          })
+          .filter((a) => {
+            if (a.audience === "all" || a.audience === "learners") return true;
+            if (a.audience === "course" && a.courseId && enrolledCourseIds.has(a.courseId)) return true;
+            return false;
+          });
+        setLiveAnnouncements(list);
+      } catch (err) {
+        console.warn("Notice loading announcements for student dashboard:", err);
+      } finally {
+        setLoadingAnnouncements(false);
+      }
+    }
+    loadAnnouncements();
+  }, [enrolledCourses]);
 
   const DEFAULT_ASSIGNMENTS = [
     {
@@ -1197,15 +1234,45 @@ export default function Dashboard() {
         {/* ── TAB: ANNOUNCEMENTS ─────────────────────────────────────── */}
         {activeNav === "announcements" && (
           <div className="dashboard-tab-panel">
-            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Announcements</h2>
+            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Announcements &amp; Broadcasts</h2>
             <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Stay updated with course broadcasts and instructor notices.</p>
-            <EmptyState
-              icon={Megaphone}
-              title="No announcements yet"
-              text="Course broadcasts, live session updates, and instructor notices will be posted here."
-              buttonText={enrolledCourses.length === 0 ? "Browse courses" : undefined}
-              onButtonClick={enrolledCourses.length === 0 ? () => setActiveNav("browse-courses") : undefined}
-            />
+
+            {loadingAnnouncements ? (
+              <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading announcements...</div>
+            ) : liveAnnouncements.length === 0 ? (
+              <EmptyState
+                icon={Megaphone}
+                title="No announcements yet"
+                text="Course broadcasts, live session updates, and instructor notices will be posted here."
+                buttonText={enrolledCourses.length === 0 ? "Browse courses" : undefined}
+                onButtonClick={enrolledCourses.length === 0 ? () => setActiveNav("browse-courses") : undefined}
+              />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                {liveAnnouncements.map((ann) => (
+                  <div
+                    key={ann.id}
+                    style={{
+                      padding: 20,
+                      borderRadius: 12,
+                      background: "#FFFFFF",
+                      border: "1px solid var(--border-light)",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                      <span className="pill-badge pill-tech">{ann.category || "General"}</span>
+                      {ann.pinned && <span className="pill-badge pill-creative">📌 PINNED</span>}
+                      {ann.priority === "urgent" && <span className="pill-badge pill-danger">URGENT</span>}
+                      <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Posted {ann.date}</span>
+                    </div>
+                    <h3 style={{ margin: "0 0 8px", fontSize: "1.2rem", fontWeight: 800 }}>{ann.title}</h3>
+                    <p style={{ margin: 0, fontSize: "0.9rem", color: "var(--text-secondary)", lineHeight: 1.6, whiteSpace: "pre-line" }}>
+                      {ann.body}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

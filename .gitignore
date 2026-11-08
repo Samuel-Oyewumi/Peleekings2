@@ -22,3 +22,12 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Environment & Firebase Admin / Google Cloud Credentials (NEVER COMMIT)
+.env
+.env.*
+!.env.example
+*service-account*.json
+*firebase-adminsdk*.json
+application_default_credentials.json
+credentials.json

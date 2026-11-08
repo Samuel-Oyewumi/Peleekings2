@@ -12,7 +12,7 @@ const HERO_PHOTO =
   "https://images.unsplash.com/photo-1522202176988-66273c2fd55f?w=1200&auto=format&fit=crop&q=80";
 
 export default function Home() {
-  const { currentUser, userProfile } = useAuth();
+  const { currentUser, isAdmin, isTutor } = useAuth();
   const navigate = useNavigate();
   const [activeFilter, setActiveFilter] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
@@ -20,19 +20,18 @@ export default function Home() {
   const [showHowItWorksModal, setShowHowItWorksModal] = useState(false);
   const [userActivity, setUserActivity] = useState(() => getUserActivity(currentUser?.uid));
 
-  // Redirect authenticated users to their role portal
+  // Redirect authenticated users to their verified role portal
   useEffect(() => {
     if (currentUser) {
-      const effectiveRole = userProfile?.role || userProfile?.submittedRole;
-      if (effectiveRole === "admin") {
+      if (isAdmin) {
         navigate("/admin", { replace: true });
-      } else if (effectiveRole === "tutor" || effectiveRole === "instructor") {
+      } else if (isTutor) {
         navigate("/teach-portal", { replace: true });
       } else {
         navigate("/dashboard", { replace: true });
       }
     }
-  }, [currentUser, userProfile?.role, userProfile?.submittedRole, navigate]);
+  }, [currentUser, isAdmin, isTutor, navigate]);
 
   useEffect(() => {
     setUserActivity(getUserActivity(currentUser?.uid));

@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate, useLocation, Link } from "react-router-dom";
 import { User, GraduationCap } from "lucide-react";
+import { doc, onSnapshot } from "firebase/firestore";
+import { db } from "../firebase";
 import { useAuth } from "../contexts/AuthContext";
 
 export default function Auth() {
@@ -36,6 +38,33 @@ export default function Auth() {
   const [fpStatus, setFpStatus] = useState(""); // "sent" | "error" | ""
   // Success state for showing the green confirmation panel
   const [registeredProfile, setRegisteredProfile] = useState(null);
+
+  // Subscribe to real regNumber from Firestore users/{uid} until generated
+  useEffect(() => {
+    if (!registeredProfile?.uid) return;
+    if (registeredProfile.regNumber && registeredProfile.regNumber !== "Assigned" && registeredProfile.regNumber !== "PENDING") {
+      return;
+    }
+    const unsub = onSnapshot(
+      doc(db, "users", registeredProfile.uid),
+      (snap) => {
+        if (snap.exists()) {
+          const uData = snap.data();
+          if (uData.regNumber) {
+            setRegisteredProfile((prev) => ({
+              ...prev,
+              ...uData,
+              regNumber: uData.regNumber,
+            }));
+          }
+        }
+      },
+      (err) => {
+        console.warn("Notice: Auth registration code listener error:", err);
+      }
+    );
+    return () => unsub();
+  }, [registeredProfile?.uid, registeredProfile?.regNumber]);
 
   function handleChange(e) {
     const { name, value } = e.target;
@@ -74,7 +103,6 @@ export default function Auth() {
         }
 
         const cleanEmail = formData.email.trim().toLowerCase();
-        const isAdmin = cleanEmail === "admin@peleekings.com";
         const fullName = `${formData.surname.trim()} ${formData.firstName.trim()}`;
         const effectiveStudentType = roleTab === "tutor" ? "non_corper" : studentType;
         const customProfile = {
@@ -85,55 +113,47 @@ export default function Auth() {
           phoneNumber: formData.phoneNumber.trim() || "",
           studentType: effectiveStudentType,
           nyscStateCode: effectiveStudentType === "corper" ? formData.nyscStateCode.trim() : null,
-          submittedRole: isAdmin ? "admin" : (roleTab === "tutor" ? "tutor" : "student"),
         };
 
         const authRes = await signup(cleanEmail, formData.password, fullName, customProfile);
         setLoading(false);
 
-        // If admin signed up, take them immediately to /admin
-        if (isAdmin || authRes.role === "admin") {
+        // If admin signed up with verified admin claim, route to /admin
+        if (authRes.role === "admin") {
           navigate("/admin", { state: { welcomeToast: "Welcome Admin! Your account has been initialized." } });
           return;
         }
 
         // Show green confirmation panel for learners/tutors
-        setRegisteredProfile(authRes.profile || { fullName, regNumber: "Assigned" });
+        setRegisteredProfile({
+          uid: authRes.user.uid,
+          fullName,
+          regNumber: authRes.profile?.regNumber || null,
+          role: authRes.role,
+        });
       } else {
         // Log In
         const cleanEmail = formData.email.trim().toLowerCase();
         if (!cleanEmail) throw new Error("Please enter your email address.");
         if (!formData.password) throw new Error("Please enter your password.");
 
-        const authRes = await login(cleanEmail, formData.password, roleTab);
-        const role = authRes.role;
+        const authRes = await login(cleanEmail, formData.password);
+        const isUserAdmin = authRes.isAdmin === true;
+        const isUserTutor = authRes.isTutor === true;
         const profile = authRes.profile;
-        const isUserAdmin =
-          roleTab === "admin" ||
-          role === "admin" ||
-          cleanEmail === "admin@peleekings.com" ||
-          profile?.role === "admin" ||
-          profile?.submittedRole === "admin";
-        const isUserTutor =
-          roleTab === "tutor" ||
-          role === "tutor" ||
-          role === "instructor" ||
-          profile?.role === "tutor" ||
-          profile?.role === "instructor" ||
-          profile?.submittedRole === "tutor";
 
-        // Validate Admin tab access: prevent non-admin accounts from logging in through Admin tab
+        // Validate Admin tab access: strictly require verified Custom Claim
         if (roleTab === "admin" && !isUserAdmin) {
           await logout();
-          throw new Error("Access denied: This account does not have Administrator privileges. Please use the Student or Tutor tab.");
+          throw new Error("Access denied: This account does not have verified Administrator privileges.");
         }
 
         setLoading(false);
 
-        // Route based on verified role or selected tab
+        // Route based on verified role from Custom Claims
         if (isUserAdmin) {
           navigate("/admin", { state: { welcomeToast: "Welcome Admin! Signed in successfully." } });
-        } else if (isUserTutor || roleTab === "tutor") {
+        } else if (isUserTutor) {
           navigate("/teach-portal", { state: { welcomeToast: `Welcome back, ${profile?.fullName || "Instructor"}!` } });
         } else {
           navigate("/dashboard", {
@@ -150,17 +170,17 @@ export default function Auth() {
   }
 
   function handleContinueFromConfirmation() {
-    if (formData.email.trim().toLowerCase() === "admin@peleekings.com" || registeredProfile?.role === "admin") {
+    if (registeredProfile?.role === "admin") {
       navigate("/admin", { state: { welcomeToast: "Welcome Admin! Signed in successfully." } });
-    } else if (roleTab === "tutor" || registeredProfile?.role === "tutor" || registeredProfile?.submittedRole === "tutor") {
+    } else if (registeredProfile?.role === "tutor") {
       navigate("/teach-portal", {
         state: { welcomeToast: `Welcome ${registeredProfile?.fullName || ""}! You can now access your teaching portal.` },
       });
     } else {
       navigate("/dashboard", {
         state: {
-          welcomeToast: `Welcome ${registeredProfile?.fullName || ""}! Your Registration Code is ${
-            registeredProfile?.regNumber || "Verified"
+          welcomeToast: `Welcome ${registeredProfile?.fullName || ""}!${
+            registeredProfile?.regNumber ? ` Your Registration Code is ${registeredProfile.regNumber}.` : ""
           }`,
         },
       });
@@ -229,7 +249,7 @@ export default function Auth() {
                   marginBottom: 8,
                 }}
               >
-                {registeredProfile.regNumber || "PENDING"}
+                {registeredProfile.regNumber || "Generating..."}
               </div>
               <div style={{ fontSize: "0.8rem", color: "#4B5563" }}>
                 Generated automatically for instant clearance
@@ -533,7 +553,7 @@ export default function Auth() {
                       type="email"
                       name="email"
                       required
-                      placeholder={roleTab === "admin" ? "admin@peleekings.com" : "name@example.com"}
+                      placeholder={roleTab === "admin" ? "admin@example.com" : "name@example.com"}
                       className="form-field-input"
                       value={formData.email}
                       onChange={handleChange}

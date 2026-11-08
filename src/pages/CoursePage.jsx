@@ -27,7 +27,7 @@ export default function CoursePage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
-  const { currentUser, userProfile } = useAuth();
+  const { currentUser, userProfile, isAdmin, isTutor, role } = useAuth();
 
   const [courseData, setCourseData] = useState(() => {
     return COURSES_CATALOG.find(c => c.id === id) || {
@@ -51,14 +51,6 @@ export default function CoursePage() {
       const fromCatalog = COURSES_CATALOG.find(c => c.id === id);
       if (fromCatalog && isMounted) {
         setCourseData(fromCatalog);
-      } else {
-        try {
-          const customCourses = JSON.parse(localStorage.getItem("peleekings_custom_courses") || "[]");
-          const foundCustom = customCourses.find(c => c.id === id);
-          if (foundCustom && isMounted) {
-            setCourseData(foundCustom);
-          }
-        } catch (e) {}
       }
       try {
         const snap = await getDoc(doc(db, "courses", id));
@@ -221,60 +213,6 @@ export default function CoursePage() {
       } catch (err) {
         console.warn("Notice: could not load dynamic curriculum from Firestore:", err);
       }
-
-      // Also merge any locally published tutor modules/content for instant classroom preview
-      try {
-        const localMods = JSON.parse(localStorage.getItem(`peleekings_modules_${courseData.id}`) || "[]");
-        const localContent = JSON.parse(localStorage.getItem(`peleekings_course_content_${courseData.id}`) || "{}");
-        if ((localMods.length > 0 || Object.keys(localContent).length > 0) && isMounted) {
-          setModules((prevMods) => {
-            const existingMap = new Map(prevMods.map((m) => [m.id, { ...m, lessons: [...(m.lessons || [])] }]));
-            localMods.forEach((lm) => {
-              if (!existingMap.has(lm.id)) {
-                existingMap.set(lm.id, {
-                  id: lm.id,
-                  title: lm.title,
-                  order: lm.order || existingMap.size + 1,
-                  lessons: [
-                    {
-                      id: `l_${lm.id}_intro`,
-                      title: `${lm.title} - Module Overview`,
-                      duration: "10 min",
-                      completed: false,
-                      type: "reading",
-                      body: "Welcome to this module. Course material, presentations, and assessments uploaded by your instructor appear here.",
-                    },
-                  ],
-                });
-              }
-            });
-            Object.entries(localContent).forEach(([modId, items]) => {
-              if (existingMap.has(modId) && Array.isArray(items)) {
-                const modObj = existingMap.get(modId);
-                const lessonIds = new Set(modObj.lessons.map((l) => l.id));
-                items.forEach((item) => {
-                  const mappedType = item.type === "note" ? "reading" : item.type === "lesson" ? "video" : item.type;
-                  if (!lessonIds.has(item.id)) {
-                    modObj.lessons.push({
-                      id: item.id,
-                      title: item.title,
-                      duration: item.duration || (mappedType === "video" ? "15 min" : mappedType === "test" ? "20 min" : "10 min"),
-                      completed: false,
-                      type: mappedType || "reading",
-                      body: item.body || "",
-                      instructions: item.instructions || "",
-                      fileUrl: item.fileUrl || null,
-                      videoUrl: item.videoUrl || null,
-                      questions: item.questions || null,
-                    });
-                  }
-                });
-              }
-            });
-            return Array.from(existingMap.values());
-          });
-        }
-      } catch (e) {}
     }
 
     loadDynamicCurriculum();
@@ -477,7 +415,7 @@ export default function CoursePage() {
               uid: currentUser.uid,
               displayName: currentUser.displayName || userProfile?.fullName,
               email: currentUser.email,
-              role: userProfile?.role,
+              role: role || (isAdmin ? "admin" : isTutor ? "tutor" : "student"),
             }
           : null,
       });
@@ -1245,8 +1183,8 @@ export default function CoursePage() {
 
                   {activeTab === "Resources" && (
                     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                      {/* Admin & Tutor Upload Bar */}
-                      {(userProfile?.role === "admin" || userProfile?.role === "tutor" || userProfile?.role === "instructor") && (
+                      {/* Admin & Assigned Tutor Upload Bar */}
+                      {(isAdmin || isTutor) && (
                         <div style={{ background: "#F8FAFC", border: "1px solid var(--border-light)", borderRadius: "var(--radius-sm)", padding: 16 }}>
                           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                             <div>
@@ -1393,7 +1331,7 @@ export default function CoursePage() {
                   {activeTab === "Announcements" && (
                     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                       {/* Tutor / Admin Post Announcement Bar */}
-                      {(userProfile?.role === "admin" || userProfile?.role === "tutor" || userProfile?.role === "instructor") && (
+                      {(isAdmin || isTutor) && (
                         <div style={{ background: "#F8FAFC", border: "1px solid var(--border-light)", borderRadius: "var(--radius-sm)", padding: 16 }}>
                           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                             <div>

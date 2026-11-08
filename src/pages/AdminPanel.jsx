@@ -1,9 +1,10 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import {
   collection,
   doc,
+  getDoc,
   getDocs,
   setDoc,
   updateDoc,
@@ -12,41 +13,296 @@ import {
   where,
   orderBy,
   limit,
-  startAfter,
   serverTimestamp,
 } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
 import { db, functions } from "../firebase";
 import { COURSES_CATALOG } from "../data/courses";
 import { getResources, uploadResource, deleteResource } from "../contexts/resourcesService";
-import { getAllMilestones } from "../contexts/userActivity";
 
 export default function AdminPanel() {
-  const { userProfile } = useAuth();
+  const { userProfile, currentUser } = useAuth();
   const navigate = useNavigate();
 
-  // Navigation tabs: "applications", "analytics", "registrations", "courses", "resources", "celebrations", "certificates"
-  const [activeTab, setActiveTab] = useState("applications");
+  // Active navigation tab
+  // Options: "overview", "learners", "tutors", "applications", "courses", "announcements", "notifications", "resources", "analytics", "audit", "settings"
+  const [activeTab, setActiveTab] = useState("overview");
 
-  // ── Live State: Celebrations & Milestones ──────────────────────
-  const [milestones, setMilestones] = useState([]);
-  const [loadingMilestones, setLoadingMilestones] = useState(true);
-  const [milestoneFilter, setMilestoneFilter] = useState("all");
-  const [selectedMilestoneModal, setSelectedMilestoneModal] = useState(null);
+  // Global Toast State
+  const [toastMessage, setToastMessage] = useState("");
+  const [toastType, setToastType] = useState("success"); // "success" | "error" | "info"
 
-  async function fetchMilestones() {
-    setLoadingMilestones(true);
+  const triggerToast = useCallback((msg, type = "success") => {
+    setToastMessage(msg);
+    setToastType(type);
+    setTimeout(() => setToastMessage(""), 4000);
+  }, []);
+
+  // ── Global Loading State ──────────────────────────────────────────
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  // ══════════════════════════════════════════════════════════════════
+  // 1. DATA STATE: TUTOR APPLICATIONS
+  // ══════════════════════════════════════════════════════════════════
+  const [applications, setApplications] = useState([]);
+  const [loadingApps, setLoadingApps] = useState(true);
+  const [appFilter, setAppFilter] = useState("all");
+  const [appSearch, setAppSearch] = useState("");
+  const [selectedAppModal, setSelectedAppModal] = useState(null);
+  const [rejectModalApp, setRejectModalApp] = useState(null);
+  const [rejectionReasonText, setRejectionReasonText] = useState("");
+
+  const fetchApplications = useCallback(async () => {
+    setLoadingApps(true);
     try {
-      const data = await getAllMilestones();
-      setMilestones(data || []);
+      const snap = await getDocs(collection(db, "tutorApplications"));
+      const list = snap.docs.map((d) => {
+        const data = d.data();
+        let dateStr = "Recent";
+        if (data.submittedAt?.toDate) {
+          dateStr = data.submittedAt.toDate().toLocaleDateString();
+        } else if (data.createdAt?.toDate) {
+          dateStr = data.createdAt.toDate().toLocaleDateString();
+        } else if (data.submittedAt || data.createdAt) {
+          dateStr = new Date(data.submittedAt || data.createdAt).toLocaleDateString();
+        }
+        return {
+          id: d.id,
+          applicantUid: data.applicantUid || data.uid,
+          fullName: data.fullName || data.name || "Instructor Applicant",
+          email: data.email || "",
+          courseTitle: data.courseTitle || "Proposed Course",
+          category: data.category || "Tech & Digital Skills",
+          courseDescription: data.courseDescription || data.description || "",
+          learningOutcomes: data.learningOutcomes || "",
+          syllabus: data.syllabus || "",
+          status: data.status || "pending",
+          date: dateStr,
+          reviewedBy: data.reviewedBy || null,
+          rejectionReason: data.rejectionReason || null,
+          ...data,
+        };
+      });
+      setApplications(list);
     } catch (err) {
-      console.warn("Notice: could not load milestones:", err);
+      console.error("Failed to load tutor applications from Firestore:", err);
+      triggerToast("Failed to fetch tutor applications: " + err.message, "error");
     } finally {
-      setLoadingMilestones(false);
+      setLoadingApps(false);
     }
-  }
+  }, [triggerToast]);
 
-  // ── Live State: Resources & Uploads ───────────────────────────
+  // ══════════════════════════════════════════════════════════════════
+  // 2. DATA STATE: LEARNERS (STUDENTS) & TUTORS
+  // ══════════════════════════════════════════════════════════════════
+  const [usersList, setUsersList] = useState([]);
+  const [loadingUsers, setLoadingUsers] = useState(true);
+  const [learnerSearch, setLearnerSearch] = useState("");
+  const [learnerStatusFilter, setLearnerStatusFilter] = useState("all");
+  const [learnerCourseFilter, setLearnerCourseFilter] = useState("all");
+  const [learnerSortBy, setLearnerSortBy] = useState("newest");
+  const [selectedLearner, setSelectedLearner] = useState(null);
+  const [learnerEnrollments, setLearnerEnrollments] = useState([]);
+  const [loadingLearnerEnrollments, setLoadingLearnerEnrollments] = useState(false);
+
+  // Modals for Learner Management
+  const [showEditLearnerModal, setShowEditLearnerModal] = useState(false);
+  const [editLearnerForm, setEditLearnerForm] = useState({
+    targetUid: "",
+    fullName: "",
+    phoneNumber: "",
+    bio: "",
+    studentType: "non_corper",
+    nyscStateCode: "",
+  });
+
+  const [showSuspendModal, setShowSuspendModal] = useState(false);
+  const [suspendTargetUser, setSuspendTargetUser] = useState(null);
+  const [suspendReasonText, setSuspendReasonText] = useState("");
+
+  const [showManualEnrollModal, setShowManualEnrollModal] = useState(false);
+  const [enrollTargetCourseId, setEnrollTargetCourseId] = useState("");
+
+  const fetchUsers = useCallback(async () => {
+    setLoadingUsers(true);
+    try {
+      const q = query(collection(db, "users"), limit(200));
+      const snap = await getDocs(q);
+      const docs = snap.docs.map((d) => {
+        const data = d.data();
+        const userName = data.fullName || data.displayName || data.email?.split("@")[0] || "User";
+        const userType = data.studentType === "corper" ? "Corper" : "Non-Corper";
+        let dateStr = "Recent";
+        if (data.createdAt?.toDate) {
+          dateStr = data.createdAt.toDate().toLocaleDateString();
+        } else if (data.createdAt) {
+          dateStr = new Date(data.createdAt).toLocaleDateString();
+        }
+        return {
+          id: d.id,
+          uid: d.id,
+          name: userName,
+          fullName: data.fullName || userName,
+          email: data.email || "",
+          phone: data.phoneNumber || data.phone || "N/A",
+          phoneNumber: data.phoneNumber || data.phone || "",
+          type: userType,
+          studentType: data.studentType || "non_corper",
+          regId: data.regNumber || "Pending",
+          regNumber: data.regNumber || "Pending",
+          nyscCode: data.nyscStateCode || "",
+          nyscStateCode: data.nyscStateCode || "",
+          role: data.role || "student",
+          status: data.status || "active",
+          bio: data.bio || "",
+          date: dateStr,
+          suspensionReason: data.suspensionReason || null,
+          suspendedAt: data.suspendedAt || null,
+          ...data,
+        };
+      });
+      setUsersList(docs);
+    } catch (err) {
+      console.error("Failed to load users from Firestore:", err);
+      triggerToast("Error loading users from database: " + err.message, "error");
+    } finally {
+      setLoadingUsers(false);
+    }
+  }, [triggerToast]);
+
+  // Load individual learner's enrollments from Firestore
+  const loadLearnerEnrollments = useCallback(async (uid) => {
+    if (!uid) return;
+    setLoadingLearnerEnrollments(true);
+    try {
+      const q = query(collection(db, "enrollments"), where("uid", "==", uid));
+      const snap = await getDocs(q);
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setLearnerEnrollments(list);
+    } catch (err) {
+      console.warn("Notice loading learner enrollments:", err);
+      setLearnerEnrollments([]);
+    } finally {
+      setLoadingLearnerEnrollments(false);
+    }
+  }, []);
+
+  // ══════════════════════════════════════════════════════════════════
+  // 3. DATA STATE: TUTOR MANAGEMENT & ASSIGNMENTS
+  // ══════════════════════════════════════════════════════════════════
+  const [tutorSearch, setTutorSearch] = useState("");
+  const [selectedTutor, setSelectedTutor] = useState(null);
+  const [showCourseAssignModal, setShowCourseAssignModal] = useState(false);
+  const [assignCourseSelectId, setAssignCourseSelectId] = useState("");
+
+  const approvedTutors = useMemo(() => {
+    return usersList.filter((u) => u.role === "tutor" || u.role === "admin");
+  }, [usersList]);
+
+  // ══════════════════════════════════════════════════════════════════
+  // 4. DATA STATE: COURSES MANAGEMENT
+  // ══════════════════════════════════════════════════════════════════
+  const [adminCourses, setAdminCourses] = useState([]);
+  const [loadingCourses, setLoadingCourses] = useState(true);
+  const [courseCategoryFilter, setCourseCategoryFilter] = useState("all");
+  const [courseStatusFilter, setCourseStatusFilter] = useState("all");
+  const [courseSearch, setCourseSearch] = useState("");
+  const [showAddCourseModal, setShowAddCourseModal] = useState(false);
+  const [editingCourse, setEditingCourse] = useState(null);
+  const [selectedCourseCurriculum, setSelectedCourseCurriculum] = useState(null);
+  const [newCourseForm, setNewCourseForm] = useState({
+    title: "",
+    category: "Tech & Digital Skills",
+    level: "Beginner",
+    duration: "6h 00m",
+    description: "",
+    learningOutcomes: "",
+    syllabus: "",
+    image: "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80",
+    status: "published",
+    tutorId: "",
+  });
+
+  const fetchCourses = useCallback(async () => {
+    setLoadingCourses(true);
+    try {
+      const snap = await getDocs(collection(db, "courses"));
+      if (!snap.empty) {
+        const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        setAdminCourses(list);
+      } else {
+        // Fallback to catalog defaults if empty
+        setAdminCourses(COURSES_CATALOG.map((c) => ({ ...c, status: "published" })));
+      }
+    } catch (err) {
+      console.error("Failed to load courses from Firestore:", err);
+      triggerToast("Error loading courses: " + err.message, "error");
+    } finally {
+      setLoadingCourses(false);
+    }
+  }, [triggerToast]);
+
+  // ══════════════════════════════════════════════════════════════════
+  // 5. DATA STATE: ANNOUNCEMENTS
+  // ══════════════════════════════════════════════════════════════════
+  const [announcements, setAnnouncements] = useState([]);
+  const [loadingAnnouncements, setLoadingAnnouncements] = useState(true);
+  const [announcementFilter, setAnnouncementFilter] = useState("all");
+  const [showAnnouncementModal, setShowAnnouncementModal] = useState(false);
+  const [editingAnnouncement, setEditingAnnouncement] = useState(null);
+  const [announcementForm, setAnnouncementForm] = useState({
+    id: null,
+    title: "",
+    body: "",
+    category: "General",
+    priority: "normal",
+    audience: "all",
+    courseId: "",
+    pinned: false,
+    status: "published",
+    expiresAt: "",
+  });
+
+  const fetchAnnouncements = useCallback(async () => {
+    setLoadingAnnouncements(true);
+    try {
+      const q = query(collection(db, "announcements"), orderBy("createdAt", "desc"));
+      const snap = await getDocs(q);
+      const list = snap.docs.map((d) => {
+        const data = d.data();
+        let dateStr = "Recent";
+        if (data.createdAt?.toDate) {
+          dateStr = data.createdAt.toDate().toLocaleDateString();
+        } else if (data.createdAt) {
+          dateStr = new Date(data.createdAt).toLocaleDateString();
+        }
+        return { id: d.id, ...data, date: dateStr };
+      });
+      setAnnouncements(list);
+    } catch (err) {
+      console.warn("Notice fetching announcements:", err);
+      setAnnouncements([]);
+    } finally {
+      setLoadingAnnouncements(false);
+    }
+  }, []);
+
+  // ══════════════════════════════════════════════════════════════════
+  // 6. DATA STATE: NOTIFICATIONS DISPATCH
+  // ══════════════════════════════════════════════════════════════════
+  const [showSendNotifModal, setShowSendNotifModal] = useState(false);
+  const [notifForm, setNotifForm] = useState({
+    target: "all_learners",
+    targetId: "",
+    title: "",
+    body: "",
+    type: "announcement",
+    courseId: "",
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  // 7. DATA STATE: RESOURCES & UPLOADS
+  // ══════════════════════════════════════════════════════════════════
   const [adminResources, setAdminResources] = useState([]);
   const [loadingResources, setLoadingResources] = useState(true);
   const [resourceFilter, setResourceFilter] = useState("all");
@@ -59,9 +315,8 @@ export default function AdminPanel() {
     externalUrl: "",
     file: null,
   });
-  const [isUploadingResource, setIsUploadingResource] = useState(false);
 
-  async function fetchAdminResources() {
+  const fetchAdminResources = useCallback(async () => {
     setLoadingResources(true);
     try {
       const res = await getResources("all");
@@ -71,236 +326,23 @@ export default function AdminPanel() {
     } finally {
       setLoadingResources(false);
     }
-  }
-
-  useEffect(() => {
-    fetchAdminResources();
   }, []);
 
-  async function handleAdminUploadResource(e) {
-    e.preventDefault();
-    if (!newResourceForm.title.trim() || (!newResourceForm.file && !newResourceForm.externalUrl.trim())) {
-      alert("Please provide a title and either a file or link.");
-      return;
-    }
-    setIsUploadingResource(true);
-    try {
-      const created = await uploadResource({
-        file: newResourceForm.file,
-        title: newResourceForm.title,
-        description: newResourceForm.description,
-        category: newResourceForm.category,
-        courseId: newResourceForm.courseId,
-        externalUrl: newResourceForm.externalUrl,
-        user: { uid: userProfile?.uid || "admin", displayName: userProfile?.fullName || "Admin", role: "admin" },
-      });
-      setAdminResources(prev => [created, ...prev]);
-      setShowAddResourceModal(false);
-      setNewResourceForm({
-        title: "",
-        description: "",
-        category: "Tech & Digital Skills",
-        courseId: "platform",
-        externalUrl: "",
-        file: null,
-      });
-      triggerToast("✓ Resource published across platform!");
-    } catch (err) {
-      console.error("Failed to upload resource:", err);
-      alert("Failed to upload resource. Please check file permissions.");
-    } finally {
-      setIsUploadingResource(false);
-    }
-  }
-
-  async function handleDeleteResource(resourceId, fileUrl) {
-    if (window.confirm("Are you sure you want to remove this resource from the platform?")) {
-      try {
-        await deleteResource(resourceId, fileUrl);
-        setAdminResources(prev => prev.filter(r => r.id !== resourceId));
-        triggerToast("Resource removed.");
-      } catch (err) {
-        console.error("Failed to delete resource:", err);
-        triggerToast("Failed to delete resource.");
-      }
-    }
-  }
-
-  // ── 1. Live State: Tutor Applications ─────────────────────────
-  const [applications, setApplications] = useState([]);
-  const [loadingApps, setLoadingApps] = useState(true);
-  const [appFilter, setAppFilter] = useState("all");
-  const [selectedAppModal, setSelectedAppModal] = useState(null);
-
-  async function fetchApplications() {
-    setLoadingApps(true);
-    try {
-      // Query pending applications (or all applications for admin view)
-      let q = collection(db, "tutorApplications");
-      const snap = await getDocs(q);
-      const list = snap.docs.map(d => {
-        const data = d.data();
-        let dateStr = "Recent";
-        if (data.submittedAt?.toDate) {
-          dateStr = data.submittedAt.toDate().toLocaleDateString();
-        } else if (data.createdAt) {
-          dateStr = new Date(data.createdAt).toLocaleDateString();
-        }
-        return {
-          id: d.id,
-          applicantUid: data.applicantUid || data.uid,
-          fullName: data.fullName || data.name || "Applicant",
-          email: data.email || "",
-          courseTitle: data.courseTitle || "Proposed Course",
-          category: data.category || "Tech & Digital Skills",
-          courseDescription: data.courseDescription || data.description || "",
-          status: data.status || "pending",
-          date: dateStr,
-          syllabus: data.syllabus || "",
-          ...data,
-        };
-      });
-      // Merge local storage pending submissions so tutor applications are never lost
-      try {
-        const localAppsRaw = localStorage.getItem("peleekings_pending_tutor_applications");
-        if (localAppsRaw) {
-          const localApps = JSON.parse(localAppsRaw);
-          const existingIds = new Set(list.map(a => a.id));
-          for (const localApp of localApps) {
-            if (!existingIds.has(localApp.id)) {
-              list.unshift(localApp);
-            }
-          }
-        }
-      } catch {}
-      setApplications(list);
-    } catch (err) {
-      console.error("Failed to load tutor applications from Firestore:", err);
-      try {
-        const localAppsRaw = localStorage.getItem("peleekings_pending_tutor_applications");
-        if (localAppsRaw) {
-          setApplications(JSON.parse(localAppsRaw));
-        }
-      } catch {}
-    } finally {
-      setLoadingApps(false);
-    }
-  }
-
-  // ── 2. Live State: Users & Registrations ──────────────────────
-  const [usersList, setUsersList] = useState([]);
-  const [loadingUsers, setLoadingUsers] = useState(true);
-  const [lastUserDoc, setLastUserDoc] = useState(null);
-  const [hasMoreUsers, setHasMoreUsers] = useState(false);
-  const [userSearch, setUserSearch] = useState("");
-  const [filterType, setFilterType] = useState("All");
-  const [selectedUser, setSelectedUser] = useState(null);
-  const [showAddUserModal, setShowAddUserModal] = useState(false);
-  const [newUserForm, setNewUserForm] = useState({
-    name: "",
-    email: "",
-    phone: "+234 ",
-    type: "Corper",
-    nyscCode: "AB/24A/1000",
-    role: "student",
-  });
-
-  async function fetchUsers(isNextPage = false) {
-    setLoadingUsers(true);
-    try {
-      let q = query(collection(db, "users"), orderBy("email"), limit(15));
-      if (isNextPage && lastUserDoc) {
-        q = query(collection(db, "users"), orderBy("email"), startAfter(lastUserDoc), limit(15));
-      }
-      const snap = await getDocs(q);
-      const docs = snap.docs.map(d => {
-        const data = d.data();
-        const userName = data.fullName || data.displayName || data.email?.split("@")[0] || "Learner";
-        const userType = data.studentType === "corper" ? "Corper" : "Non-Corper";
-        let dateStr = "Recent";
-        if (data.createdAt?.toDate) {
-          dateStr = data.createdAt.toDate().toLocaleDateString();
-        } else if (data.createdAt) {
-          dateStr = new Date(data.createdAt).toLocaleDateString();
-        }
-        return {
-          id: d.id,
-          name: userName,
-          email: data.email || "",
-          phone: data.phoneNumber || data.phone || "N/A",
-          type: userType,
-          regId: data.regNumber || "Pending",
-          nyscCode: data.nyscStateCode || null,
-          role: data.role || "student",
-          status: data.status || "Active",
-          date: dateStr,
-          enrolledCourses: data.enrolledCourses || ["AI Essentials & Automation"],
-          ...data,
-        };
-      });
-
-      if (isNextPage) {
-        setUsersList(prev => [...prev, ...docs]);
-      } else {
-        setUsersList(docs);
-      }
-
-      setLastUserDoc(snap.docs[snap.docs.length - 1] || null);
-      setHasMoreUsers(snap.docs.length === 15);
-    } catch (err) {
-      console.error("Failed to load users from Firestore:", err);
-    } finally {
-      setLoadingUsers(false);
-    }
-  }
-
-  // ── 3. Live State: Courses Management ─────────────────────────
-  const [adminCourses, setAdminCourses] = useState([]);
-  const [loadingCourses, setLoadingCourses] = useState(true);
-  const [courseCategoryFilter, setCourseCategoryFilter] = useState("All");
-  const [courseSearch, setCourseSearch] = useState("");
-  const [showAddCourseModal, setShowAddCourseModal] = useState(false);
-  const [editingCourse, setEditingCourse] = useState(null);
-  const [newCourseForm, setNewCourseForm] = useState({
-    title: "",
-    category: "Tech & Digital Skills",
-    badge: "TECHNOLOGY",
-    badgeClass: "pill-tech",
-    level: "Beginner",
-    duration: "6h 00m",
-    modulesCount: 8,
-    description: "",
-    image: "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80"
-  });
-
-  async function fetchCourses() {
-    setLoadingCourses(true);
-    try {
-      const snap = await getDocs(collection(db, "courses"));
-      if (!snap.empty) {
-        const list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        setAdminCourses(list);
-      } else {
-        // Default template catalog preview if Firestore collection is initially empty
-        setAdminCourses(COURSES_CATALOG.map(c => ({ ...c, status: "Published" })));
-      }
-    } catch (err) {
-      console.error("Failed to load courses from Firestore:", err);
-    } finally {
-      setLoadingCourses(false);
-    }
-  }
-
-  // ── 4. Live State: Audit Logs ─────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════
+  // 8. DATA STATE: AUDIT LOGS
+  // ══════════════════════════════════════════════════════════════════
   const [auditLogs, setAuditLogs] = useState([]);
   const [loadingLogs, setLoadingLogs] = useState(true);
+  const [auditFilter, setAuditFilter] = useState("all");
+  const [auditSearch, setAuditSearch] = useState("");
+  const [selectedAuditLog, setSelectedAuditLog] = useState(null);
 
-  async function fetchAuditLogs() {
+  const fetchAuditLogs = useCallback(async () => {
     setLoadingLogs(true);
     try {
-      const q = query(collection(db, "auditLogs"), orderBy("timestamp", "desc"), limit(50));
+      const q = query(collection(db, "auditLogs"), orderBy("timestamp", "desc"), limit(100));
       const snap = await getDocs(q);
-      const list = snap.docs.map(d => {
+      const list = snap.docs.map((d) => {
         const data = d.data();
         let dateStr = "Just now";
         if (data.timestamp?.toDate) {
@@ -314,433 +356,826 @@ export default function AdminPanel() {
           detail: data.detail || "",
           badge: data.badge || "pill-tech",
           timestamp: dateStr,
+          rawTimestamp: data.timestamp,
           ...data,
         };
       });
       setAuditLogs(list);
     } catch (err) {
       console.warn("Failed to load audit logs from Firestore:", err);
+      setAuditLogs([]);
     } finally {
       setLoadingLogs(false);
     }
-  }
+  }, []);
 
-  // Initial load
+  // ══════════════════════════════════════════════════════════════════
+  // 9. DATA STATE: PLATFORM SETTINGS
+  // ══════════════════════════════════════════════════════════════════
+  const [platformSettings, setPlatformSettings] = useState({
+    platformName: "Peleekings LMS",
+    supportEmail: "support@peleekings.com",
+    maintenanceMode: false,
+    openRegistrations: true,
+    announcementBannerActive: false,
+    bannerMessage: "Welcome to the new academic quarter at Peleekings!",
+    allowTutorApplications: true,
+  });
+  const [loadingSettings, setLoadingSettings] = useState(true);
+  const [savingSettings, setSavingSettings] = useState(false);
+
+  const fetchPlatformSettings = useCallback(async () => {
+    setLoadingSettings(true);
+    try {
+      const docSnap = await getDoc(doc(db, "platformSettings", "general"));
+      if (docSnap.exists()) {
+        setPlatformSettings((prev) => ({ ...prev, ...docSnap.data() }));
+      }
+    } catch (err) {
+      console.warn("Notice loading platform settings:", err);
+    } finally {
+      setLoadingSettings(false);
+    }
+  }, []);
+
+  // Initial Data Fetch
   useEffect(() => {
     fetchApplications();
     fetchUsers();
     fetchCourses();
+    fetchAnnouncements();
+    fetchAdminResources();
     fetchAuditLogs();
-    fetchMilestones();
-  }, []);
+    fetchPlatformSettings();
+  }, [
+    fetchApplications,
+    fetchUsers,
+    fetchCourses,
+    fetchAnnouncements,
+    fetchAdminResources,
+    fetchAuditLogs,
+    fetchPlatformSettings,
+  ]);
 
-  // ── 5. State: Certificates ────────────────────────────────────
-  const [certSearchId, setCertSearchId] = useState("");
-  const [certResult, setCertResult] = useState(null);
-  const [showIssueCertModal, setShowIssueCertModal] = useState(false);
-  const [issueCertForm, setIssueCertForm] = useState({
-    studentName: "",
-    regId: "",
-    course: "AI Essentials & Automation",
-    grade: "Distinction (96%)",
-  });
-
-  // Toast
-  const [toastMessage, setToastMessage] = useState("");
-
-  function triggerToast(msg) {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(""), 3500);
-  }
-
-  // Handle Tutor Application Review (Approve calls promoteToTutor Cloud Function)
-  async function handleReviewApplication(appId, status, applicantUid) {
-    if (status === "approved") {
-      try {
-        triggerToast("Approving application and promoting user...");
-        const promoteFn = httpsCallable(functions, "promoteToTutor");
-        await promoteFn({ applicationId: appId });
-        triggerToast("Application approved! User promoted to Tutor.");
-        fetchApplications();
-        fetchAuditLogs();
-      } catch (err) {
-        console.error("Failed to promote tutor via Cloud Function:", err);
-        triggerToast("Promotion error: " + (err.message || "Failed."));
-      }
-    } else {
-      try {
-        await updateDoc(doc(db, "tutorApplications", appId), {
-          status: "rejected",
-          reviewedAt: serverTimestamp(),
-        });
-        triggerToast("Application marked as rejected.");
-        fetchApplications();
-      } catch (err) {
-        console.error("Failed to reject application:", err);
-        triggerToast("Error rejecting application.");
-      }
+  // ══════════════════════════════════════════════════════════════════
+  // ACTIONS: TUTOR APPLICATION DECISIONS
+  // ══════════════════════════════════════════════════════════════════
+  async function handleApproveApplication(app) {
+    if (!window.confirm(`Approve instructor application for "${app.fullName}"? This will assign the tutor role, create an initial course draft, and notify the applicant.`)) {
+      return;
     }
-  }
 
-  // Handle User Status Toggle in Firestore
-  async function handleToggleUserStatus(userId, currentStatus) {
-    const nextStatus = currentStatus === "Active" ? "Suspended" : "Active";
+    setIsProcessing(true);
     try {
-      await updateDoc(doc(db, "users", userId), {
-        status: nextStatus,
-        updatedAt: serverTimestamp(),
-      });
-      triggerToast(`User status set to ${nextStatus}.`);
-      setUsersList(prev => prev.map(u => u.id === userId ? { ...u, status: nextStatus } : u));
+      triggerToast("Executing atomic tutor promotion via Cloud Function...", "info");
+      const promoteFn = httpsCallable(functions, "promoteToTutor");
+      await promoteFn({ applicationId: app.id });
+      triggerToast(`✓ Application approved! ${app.fullName} is now an active Tutor.`);
+      setSelectedAppModal(null);
+      await fetchApplications();
+      await fetchUsers();
+      await fetchCourses();
+      await fetchAuditLogs();
     } catch (err) {
-      console.error("Failed to update user status in Firestore:", err);
-      triggerToast("Failed to update user status.");
+      console.error("Failed to promote tutor:", err);
+      triggerToast("Promotion error: " + (err.message || "Failed to approve application."), "error");
+    } finally {
+      setIsProcessing(false);
     }
   }
 
-  // Handle Delete User in Firestore
-  async function handleDeleteUser(userId, userName) {
-    if (window.confirm(`Are you sure you want to remove user "${userName || "this user"}" from Firestore?`)) {
-      try {
-        await deleteDoc(doc(db, "users", userId));
-        triggerToast(`User removed from Firestore.`);
-        setUsersList(prev => prev.filter(u => u.id !== userId));
-        setSelectedUser(null);
-      } catch (err) {
-        console.error("Failed to delete user:", err);
-        triggerToast("Failed to delete user document.");
-      }
-    }
-  }
-
-  // Handle Manual Add User via Firestore setDoc
-  async function handleCreateUser(e) {
+  async function handleConfirmRejectApplication(e) {
     e.preventDefault();
-    if (!newUserForm.name.trim() || !newUserForm.email.trim()) return;
+    if (!rejectModalApp) return;
 
-    const names = newUserForm.name.trim().split(" ");
-    const sInit = (names[0] || "A")[0].toUpperCase();
-    const fInit = (names[1] || names[0] || "S")[0].toUpperCase();
-
-    let autoRegId = "";
-    if (newUserForm.type === "Corper") {
-      const nums = (newUserForm.nyscCode || "1000").replace(/\D/g, "");
-      const segment = nums.length >= 4 ? nums.slice(-4) : "1399";
-      autoRegId = `${sInit}${fInit}${segment}`;
-    } else {
-      const randDigits = Math.floor(1000 + Math.random() * 9000);
-      autoRegId = `${randDigits}${fInit}${sInit}`;
-    }
-
+    setIsProcessing(true);
     try {
-      const newUid = `user_${Date.now()}`;
-      const payload = {
-        uid: newUid,
-        email: newUserForm.email.trim().toLowerCase(),
-        fullName: newUserForm.name.trim(),
-        displayName: newUserForm.name.trim(),
-        phoneNumber: newUserForm.phone.trim(),
-        studentType: newUserForm.type === "Corper" ? "corper" : "non_corper",
-        nyscStateCode: newUserForm.type === "Corper" ? newUserForm.nyscCode.trim() : null,
-        status: "Active",
-        enrolledCourses: ["AI Essentials & Automation"],
-        createdAt: serverTimestamp(),
-      };
-
-      await setDoc(doc(db, "users", newUid), payload);
-      setShowAddUserModal(false);
-      triggerToast(`Firestore record created. Note: this user must sign up via /auth to get a real Firebase Auth account.`);
-      fetchUsers();
+      const rejectFn = httpsCallable(functions, "rejectTutorApplication");
+      await rejectFn({
+        applicationId: rejectModalApp.id,
+        reason: rejectionReasonText.trim() || "Application does not meet current qualification criteria.",
+      });
+      triggerToast(`Application for ${rejectModalApp.fullName} rejected.`);
+      setRejectModalApp(null);
+      setSelectedAppModal(null);
+      setRejectionReasonText("");
+      await fetchApplications();
+      await fetchAuditLogs();
     } catch (err) {
-      console.error("Failed to create user in Firestore:", err);
-      triggerToast("Error registering user in Firestore.");
+      console.error("Failed to reject application:", err);
+      triggerToast("Rejection error: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
     }
   }
 
-  // Handle Export CSV
-  function handleExportUsersCSV() {
-    const headers = ["ID", "Name", "Type", "Registration ID", "NYSC Code", "Email", "Phone", "Status", "Role", "Date"];
-    const rows = usersList.map(u => [
-      u.id,
-      `"${u.name}"`,
-      u.type,
-      u.regId,
-      u.nyscCode || "N/A",
-      u.email,
-      `"${u.phone}"`,
-      u.status,
-      u.role,
-      u.date
-    ]);
-    const csvContent = [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.setAttribute("href", url);
-    link.setAttribute("download", `peleekings_users_${Date.now()}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    triggerToast("Exported user registrations to CSV.");
-  }
+  // ══════════════════════════════════════════════════════════════════
+  // ACTIONS: LEARNER MANAGEMENT
+  // ══════════════════════════════════════════════════════════════════
+  async function handleSaveLearnerProfile(e) {
+    e.preventDefault();
+    if (!editLearnerForm.targetUid) return;
 
-  // Seed default catalog to Firestore if empty
-  async function handleSeedCatalog() {
+    setIsProcessing(true);
     try {
-      triggerToast("Seeding catalog courses to Firestore...");
-      for (const c of COURSES_CATALOG) {
-        await setDoc(doc(db, "courses", c.id), {
-          ...c,
-          status: "published",
-          createdAt: serverTimestamp(),
-        });
+      const updateLearnerFn = httpsCallable(functions, "adminUpdateLearner");
+      await updateLearnerFn(editLearnerForm);
+      triggerToast("✓ Learner profile successfully updated!");
+      setShowEditLearnerModal(false);
+      await fetchUsers();
+      if (selectedLearner && selectedLearner.id === editLearnerForm.targetUid) {
+        setSelectedLearner((prev) => ({ ...prev, ...editLearnerForm }));
       }
-      triggerToast("Default catalog seeded to Firestore!");
-      fetchCourses();
+      await fetchAuditLogs();
     } catch (err) {
-      console.error("Failed to seed catalog:", err);
-      triggerToast("Error seeding catalog to Firestore.");
+      console.error("Failed to update learner profile:", err);
+      triggerToast("Update error: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
     }
   }
 
-  // Add Course directly in Firestore
+  async function handleConfirmSuspend(e) {
+    e.preventDefault();
+    if (!suspendTargetUser) return;
+
+    setIsProcessing(true);
+    try {
+      const setStatusFn = httpsCallable(functions, "adminSetAccountStatus");
+      await setStatusFn({
+        targetUid: suspendTargetUser.id,
+        status: "suspended",
+        reason: suspendReasonText.trim() || "Administrative suspension.",
+      });
+      triggerToast(`Account for ${suspendTargetUser.name} has been suspended.`);
+      setShowSuspendModal(false);
+      setSuspendReasonText("");
+      await fetchUsers();
+      if (selectedLearner && selectedLearner.id === suspendTargetUser.id) {
+        setSelectedLearner((prev) => ({ ...prev, status: "suspended", suspensionReason: suspendReasonText }));
+      }
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to suspend account:", err);
+      triggerToast("Suspension error: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleReactivateLearner(user) {
+    if (!window.confirm(`Reactivate account for ${user.name}? This will restore their access.`)) {
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const setStatusFn = httpsCallable(functions, "adminSetAccountStatus");
+      await setStatusFn({
+        targetUid: user.id,
+        status: "active",
+      });
+      triggerToast(`✓ Account for ${user.name} is now active.`);
+      await fetchUsers();
+      if (selectedLearner && selectedLearner.id === user.id) {
+        setSelectedLearner((prev) => ({ ...prev, status: "active", suspensionReason: null }));
+      }
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to reactivate account:", err);
+      triggerToast("Reactivation error: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleManualEnrollLearner(e) {
+    e.preventDefault();
+    if (!selectedLearner || !enrollTargetCourseId) return;
+
+    const targetCourse = adminCourses.find((c) => c.id === enrollTargetCourseId) || {
+      id: enrollTargetCourseId,
+      title: enrollTargetCourseId,
+    };
+
+    setIsProcessing(true);
+    try {
+      const manageEnrollFn = httpsCallable(functions, "adminManageEnrollment");
+      await manageEnrollFn({
+        action: "grant",
+        uid: selectedLearner.id,
+        courseId: targetCourse.id,
+        courseTitle: targetCourse.title,
+      });
+      triggerToast(`✓ Enrolled ${selectedLearner.name} in "${targetCourse.title}".`);
+      setShowManualEnrollModal(false);
+      setEnrollTargetCourseId("");
+      await loadLearnerEnrollments(selectedLearner.id);
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to enroll learner:", err);
+      triggerToast("Enrollment error: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleRevokeEnrollment(enrollment) {
+    if (!window.confirm(`Revoke enrollment in "${enrollment.courseTitle || enrollment.courseId}" for ${selectedLearner?.name}?`)) {
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const manageEnrollFn = httpsCallable(functions, "adminManageEnrollment");
+      await manageEnrollFn({
+        action: "revoke",
+        uid: enrollment.uid,
+        courseId: enrollment.courseId,
+      });
+      triggerToast(`Enrollment revoked for "${enrollment.courseTitle || enrollment.courseId}".`);
+      await loadLearnerEnrollments(enrollment.uid);
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to revoke enrollment:", err);
+      triggerToast("Error revoking enrollment: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // ACTIONS: TUTOR COURSE ASSIGNMENTS
+  // ══════════════════════════════════════════════════════════════════
+  async function handleAssignCourseToTutor(e) {
+    e.preventDefault();
+    if (!selectedTutor || !assignCourseSelectId) return;
+
+    setIsProcessing(true);
+    try {
+      const assignFn = httpsCallable(functions, "adminAssignCourseTutor");
+      await assignFn({
+        courseId: assignCourseSelectId,
+        tutorUid: selectedTutor.id,
+        action: "assign",
+      });
+      triggerToast(`✓ Assigned course to ${selectedTutor.name}.`);
+      setShowCourseAssignModal(false);
+      setAssignCourseSelectId("");
+      await fetchCourses();
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to assign course to tutor:", err);
+      triggerToast("Assignment error: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleRemoveCourseFromTutor(courseId, tutorUid) {
+    if (!window.confirm("Remove this course assignment from the tutor?")) return;
+
+    setIsProcessing(true);
+    try {
+      const assignFn = httpsCallable(functions, "adminAssignCourseTutor");
+      await assignFn({
+        courseId,
+        tutorUid,
+        action: "remove",
+      });
+      triggerToast("Course assignment removed.");
+      await fetchCourses();
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to remove course assignment:", err);
+      triggerToast("Error removing assignment: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // ACTIONS: COURSE MANAGEMENT
+  // ══════════════════════════════════════════════════════════════════
   async function handleCreateCourse(e) {
     e.preventDefault();
     if (!newCourseForm.title.trim()) return;
 
+    setIsProcessing(true);
     try {
-      const courseId = newCourseForm.title.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+      const slug = newCourseForm.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+      const courseId = `${slug}-${Date.now().toString().slice(-4)}`;
+
+      const assignedTutor = approvedTutors.find((t) => t.id === newCourseForm.tutorId);
+
       const payload = {
-        ...newCourseForm,
         id: courseId,
-        rating: 5.0,
-        reviewsCount: "1",
-        students: 0,
-        status: "published",
+        title: newCourseForm.title.trim(),
+        category: newCourseForm.category,
+        level: newCourseForm.level,
+        duration: newCourseForm.duration,
+        description: newCourseForm.description.trim(),
+        learningOutcomes: newCourseForm.learningOutcomes.trim(),
+        syllabus: newCourseForm.syllabus.trim(),
+        image: newCourseForm.image || "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80",
+        status: newCourseForm.status || "published",
+        tutorId: newCourseForm.tutorId || null,
+        tutorName: assignedTutor ? assignedTutor.name : null,
+        assignedTutors: newCourseForm.tutorId ? [newCourseForm.tutorId] : [],
         createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
       };
 
       await setDoc(doc(db, "courses", courseId), payload);
+
+      // Create default Module 1 for the new course
+      await setDoc(doc(db, "courses", courseId, "modules", "module-1"), {
+        title: "Module 1: Orientation & Foundations",
+        order: 1,
+        createdAt: serverTimestamp(),
+      });
+
+      triggerToast(`✓ Course "${newCourseForm.title}" created successfully!`);
       setShowAddCourseModal(false);
-      triggerToast(`Course "${newCourseForm.title}" published to Firestore!`);
-      fetchCourses();
       setNewCourseForm({
         title: "",
         category: "Tech & Digital Skills",
-        badge: "TECHNOLOGY",
-        badgeClass: "pill-tech",
         level: "Beginner",
         duration: "6h 00m",
-        modulesCount: 8,
         description: "",
-        image: "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80"
+        learningOutcomes: "",
+        syllabus: "",
+        image: "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80",
+        status: "published",
+        tutorId: "",
       });
+      await fetchCourses();
+      await fetchAuditLogs();
     } catch (err) {
-      console.error("Error creating course in Firestore:", err);
-      triggerToast("Failed to create course in Firestore.");
+      console.error("Failed to create course:", err);
+      triggerToast("Error creating course: " + err.message, "error");
+    } finally {
+      setIsProcessing(false);
     }
   }
 
-  // Edit Course directly in Firestore
   async function handleSaveEditCourse(e) {
     e.preventDefault();
     if (!editingCourse) return;
 
+    setIsProcessing(true);
     try {
-      await updateDoc(doc(db, "courses", editingCourse.id), {
-        title: editingCourse.title,
+      const courseRef = doc(db, "courses", editingCourse.id);
+      const assignedTutor = approvedTutors.find((t) => t.id === editingCourse.tutorId);
+
+      const updates = {
+        title: editingCourse.title.trim(),
+        category: editingCourse.category,
+        level: editingCourse.level,
         duration: editingCourse.duration,
+        description: (editingCourse.description || "").trim(),
         status: editingCourse.status,
-        description: editingCourse.description,
+        image: editingCourse.image,
+        tutorId: editingCourse.tutorId || null,
+        tutorName: assignedTutor ? assignedTutor.name : null,
         updatedAt: serverTimestamp(),
-      });
+      };
+
+      if (editingCourse.tutorId) {
+        updates.assignedTutors = [editingCourse.tutorId];
+      }
+
+      await updateDoc(courseRef, updates);
+      triggerToast(`✓ Course "${editingCourse.title}" updated.`);
       setEditingCourse(null);
-      triggerToast(`Course "${editingCourse.title}" updated in Firestore.`);
-      fetchCourses();
+      await fetchCourses();
+      await fetchAuditLogs();
     } catch (err) {
-      console.error("Failed to update course in Firestore:", err);
-      triggerToast("Failed to update course.");
+      console.error("Failed to update course:", err);
+      triggerToast("Error updating course: " + err.message, "error");
+    } finally {
+      setIsProcessing(false);
     }
   }
 
-  // Toggle Course Status in Firestore
-  async function handleToggleCourseStatus(courseId, currentStatus) {
-    const nextStatus = currentStatus === "published" || currentStatus === "Published" ? "draft" : "published";
+  async function handleToggleCourseStatus(course) {
+    const nextStatus = course.status === "published" ? "draft" : "published";
+    setIsProcessing(true);
     try {
-      await updateDoc(doc(db, "courses", courseId), {
+      await updateDoc(doc(db, "courses", course.id), {
         status: nextStatus,
         updatedAt: serverTimestamp(),
       });
       triggerToast(`Course status updated to ${nextStatus}.`);
-      setAdminCourses(prev => prev.map(c => c.id === courseId ? { ...c, status: nextStatus } : c));
+      setAdminCourses((prev) =>
+        prev.map((c) => (c.id === course.id ? { ...c, status: nextStatus } : c))
+      );
+      await fetchAuditLogs();
     } catch (err) {
-      console.error("Failed to toggle course status in Firestore:", err);
-      triggerToast("Error updating course status.");
+      console.error("Failed to toggle course status:", err);
+      triggerToast("Error updating course status: " + err.message, "error");
+    } finally {
+      setIsProcessing(false);
     }
   }
 
-  // Delete Course in Firestore
-  async function handleDeleteCourse(courseId, courseTitle) {
-    if (window.confirm(`Delete course "${courseTitle}" from Firestore?`)) {
-      try {
-        await deleteDoc(doc(db, "courses", courseId));
-        triggerToast(`Course deleted from Firestore.`);
-        setAdminCourses(prev => prev.filter(c => c.id !== courseId));
-      } catch (err) {
-        console.error("Failed to delete course:", err);
-        triggerToast("Failed to delete course.");
+  async function handleDeleteCourse(course) {
+    if (!window.confirm(`Are you sure you want to delete course "${course.title}"? This action is permanent.`)) {
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      await deleteDoc(doc(db, "courses", course.id));
+      triggerToast(`Course "${course.title}" deleted.`);
+      setAdminCourses((prev) => prev.filter((c) => c.id !== course.id));
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to delete course:", err);
+      triggerToast("Error deleting course: " + err.message, "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // ACTIONS: ANNOUNCEMENTS MANAGEMENT
+  // ══════════════════════════════════════════════════════════════════
+  async function handleSaveAnnouncement(e) {
+    e.preventDefault();
+    if (!announcementForm.title.trim() || !announcementForm.body.trim()) {
+      triggerToast("Please provide both title and announcement body.", "error");
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const pubFn = httpsCallable(functions, "adminPublishAnnouncement");
+      await pubFn(announcementForm);
+      triggerToast("✓ Announcement published successfully!");
+      setShowAnnouncementModal(false);
+      setEditingAnnouncement(null);
+      setAnnouncementForm({
+        id: null,
+        title: "",
+        body: "",
+        category: "General",
+        priority: "normal",
+        audience: "all",
+        courseId: "",
+        pinned: false,
+        status: "published",
+        expiresAt: "",
+      });
+      await fetchAnnouncements();
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to save announcement:", err);
+      triggerToast("Announcement error: " + (err.message || "Failed to publish."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleDeleteAnnouncement(announcement) {
+    if (!window.confirm(`Delete announcement "${announcement.title}"?`)) return;
+
+    setIsProcessing(true);
+    try {
+      await deleteDoc(doc(db, "announcements", announcement.id));
+      triggerToast("Announcement removed.");
+      setAnnouncements((prev) => prev.filter((a) => a.id !== announcement.id));
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to delete announcement:", err);
+      triggerToast("Error deleting announcement: " + err.message, "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // ACTIONS: NOTIFICATIONS DISPATCH
+  // ══════════════════════════════════════════════════════════════════
+  async function handleSendNotification(e) {
+    e.preventDefault();
+    if (!notifForm.title.trim() || !notifForm.body.trim()) {
+      triggerToast("Please fill in both title and message.", "error");
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const sendNotifFn = httpsCallable(functions, "adminSendNotification");
+      const res = await sendNotifFn(notifForm);
+      triggerToast(`✓ Dispatched notification to ${res.data?.count || 0} recipient(s)!`);
+      setShowSendNotifModal(false);
+      setNotifForm({
+        target: "all_learners",
+        targetId: "",
+        title: "",
+        body: "",
+        type: "announcement",
+        courseId: "",
+      });
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to send notifications:", err);
+      triggerToast("Dispatch error: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // ACTIONS: RESOURCES MANAGEMENT
+  // ══════════════════════════════════════════════════════════════════
+  async function handleUploadResource(e) {
+    e.preventDefault();
+    if (!newResourceForm.title.trim() || (!newResourceForm.file && !newResourceForm.externalUrl.trim())) {
+      triggerToast("Please provide a title and either a file upload or external URL.", "error");
+      return;
+    }
+
+    setIsProcessing(true);
+    try {
+      const created = await uploadResource({
+        file: newResourceForm.file,
+        title: newResourceForm.title,
+        description: newResourceForm.description,
+        category: newResourceForm.category,
+        courseId: newResourceForm.courseId,
+        externalUrl: newResourceForm.externalUrl,
+        user: {
+          uid: currentUser?.uid || "admin",
+          displayName: userProfile?.fullName || "Administrator",
+          role: "admin",
+        },
+      });
+
+      setAdminResources((prev) => [created, ...prev]);
+      setShowAddResourceModal(false);
+      setNewResourceForm({
+        title: "",
+        description: "",
+        category: "Tech & Digital Skills",
+        courseId: "platform",
+        externalUrl: "",
+        file: null,
+      });
+      triggerToast("✓ Resource uploaded and published to platform!");
+      await fetchAdminResources();
+    } catch (err) {
+      console.error("Resource upload failure:", err);
+      triggerToast("Upload failed: " + (err.message || "Cloud Storage error."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleDeleteResourceItem(resource) {
+    if (!window.confirm(`Delete resource "${resource.title}"?`)) return;
+
+    setIsProcessing(true);
+    try {
+      await deleteResource(resource.id, resource.fileUrl);
+      setAdminResources((prev) => prev.filter((r) => r.id !== resource.id));
+      triggerToast("Resource removed.");
+    } catch (err) {
+      console.error("Failed to delete resource:", err);
+      triggerToast("Failed to delete resource: " + err.message, "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // ACTIONS: PLATFORM SETTINGS
+  // ══════════════════════════════════════════════════════════════════
+  async function handleSaveSettings(e) {
+    e.preventDefault();
+    setSavingSettings(true);
+    try {
+      const settingsRef = doc(db, "platformSettings", "general");
+      await setDoc(settingsRef, {
+        ...platformSettings,
+        updatedAt: serverTimestamp(),
+        updatedBy: currentUser?.uid || "admin",
+      }, { merge: true });
+
+      // Record audit log
+      await setDoc(doc(collection(db, "auditLogs")), {
+        action: "Platform Settings Updated",
+        detail: "Administrator updated platform system configurations.",
+        adminUid: currentUser?.uid || "admin",
+        badge: "pill-tech",
+        timestamp: serverTimestamp(),
+      });
+
+      triggerToast("✓ Platform settings successfully saved!");
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to save settings:", err);
+      triggerToast("Error saving platform settings: " + err.message, "error");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════
+  // FILTERED LISTS
+  // ══════════════════════════════════════════════════════════════════
+  const filteredLearners = useMemo(() => {
+    return usersList.filter((u) => {
+      // Must not be admin (learners directory targets students)
+      if (u.role === "admin") return false;
+
+      // Status filter
+      if (learnerStatusFilter !== "all" && u.status?.toLowerCase() !== learnerStatusFilter.toLowerCase()) {
+        return false;
       }
-    }
-  }
 
-  // Certificate search
-  function handleCertLookup(e) {
-    e.preventDefault();
-    const queryId = certSearchId.trim().toUpperCase();
-    const matchedUser = usersList.find(u => (u.regId || "").toUpperCase() === queryId);
-    if (matchedUser) {
-      setCertResult({
-        name: matchedUser.name,
-        regId: matchedUser.regId,
-        course: matchedUser.enrolledCourses?.[0] || "AI Essentials & Automation",
-        issueDate: matchedUser.date || "Recent",
-        status: matchedUser.status,
-        type: matchedUser.type,
-        verified: true,
-      });
-    } else {
-      setCertResult({
-        name: "Samuel Asuquo",
-        regId: queryId || "AS1399",
-        course: "AI Essentials & Automation",
-        issueDate: "Verified",
-        status: "Active",
-        type: "Corper",
-        verified: true
-      });
-    }
-    triggerToast("Certificate verification complete.");
-  }
+      // Search filter
+      if (learnerSearch.trim()) {
+        const queryStr = learnerSearch.toLowerCase();
+        const matchName = u.name?.toLowerCase().includes(queryStr);
+        const matchEmail = u.email?.toLowerCase().includes(queryStr);
+        const matchReg = u.regId?.toLowerCase().includes(queryStr);
+        if (!matchName && !matchEmail && !matchReg) return false;
+      }
 
-  // Issue Certificate
-  function handleIssueCertificate(e) {
-    e.preventDefault();
-    setCertResult({
-      name: issueCertForm.studentName,
-      regId: issueCertForm.regId,
-      course: issueCertForm.course,
-      issueDate: "Today",
-      verified: true,
-      grade: issueCertForm.grade,
-      status: "Active"
+      return true;
+    }).sort((a, b) => {
+      if (learnerSortBy === "name") return (a.name || "").localeCompare(b.name || "");
+      if (learnerSortBy === "oldest") return (a.date || "").localeCompare(b.date || "");
+      // Default newest
+      return (b.date || "").localeCompare(a.date || "");
     });
-    setShowIssueCertModal(false);
-    setActiveTab("certificates");
-    triggerToast(`Certificate awarded to ${issueCertForm.studentName}!`);
-  }
+  }, [usersList, learnerStatusFilter, learnerSearch, learnerSortBy]);
 
-  // Filtered registrations
-  const filteredUsers = usersList.filter(user => {
-    const matchesFilter = filterType === "All" || user.type === filterType;
-    const searchLower = userSearch.toLowerCase();
-    const matchesSearch =
-      user.name.toLowerCase().includes(searchLower) ||
-      (user.regId && user.regId.toLowerCase().includes(searchLower)) ||
-      user.email.toLowerCase().includes(searchLower) ||
-      (user.nyscCode && user.nyscCode.toLowerCase().includes(searchLower));
-    return matchesFilter && matchesSearch;
-  });
+  const filteredApplications = useMemo(() => {
+    return applications.filter((app) => {
+      if (appFilter !== "all" && app.status !== appFilter) return false;
+      if (appSearch.trim()) {
+        const queryStr = appSearch.toLowerCase();
+        const matchName = app.fullName?.toLowerCase().includes(queryStr);
+        const matchEmail = app.email?.toLowerCase().includes(queryStr);
+        const matchCourse = app.courseTitle?.toLowerCase().includes(queryStr);
+        if (!matchName && !matchEmail && !matchCourse) return false;
+      }
+      return true;
+    });
+  }, [applications, appFilter, appSearch]);
 
-  // Filtered courses
-  const filteredCourses = adminCourses.filter(course => {
-    const matchesCategory = courseCategoryFilter === "All" || course.category === courseCategoryFilter;
-    const matchesSearch = course.title?.toLowerCase().includes(courseSearch.toLowerCase());
-    return matchesCategory && matchesSearch;
-  });
+  const filteredCourses = useMemo(() => {
+    return adminCourses.filter((c) => {
+      if (courseCategoryFilter !== "all" && c.category !== courseCategoryFilter) return false;
+      if (courseStatusFilter !== "all" && c.status?.toLowerCase() !== courseStatusFilter.toLowerCase()) return false;
+      if (courseSearch.trim()) {
+        const queryStr = courseSearch.toLowerCase();
+        const matchTitle = c.title?.toLowerCase().includes(queryStr);
+        const matchDesc = c.description?.toLowerCase().includes(queryStr);
+        if (!matchTitle && !matchDesc) return false;
+      }
+      return true;
+    });
+  }, [adminCourses, courseCategoryFilter, courseStatusFilter, courseSearch]);
 
-  // Filtered applications
-  const filteredApps = applications.filter(app => {
-    if (appFilter === "all") return true;
-    return app.status === appFilter;
-  });
+  const filteredAnnouncements = useMemo(() => {
+    return announcements.filter((a) => {
+      if (announcementFilter !== "all" && a.status !== announcementFilter) return false;
+      return true;
+    });
+  }, [announcements, announcementFilter]);
+
+  const filteredAuditLogs = useMemo(() => {
+    return auditLogs.filter((log) => {
+      if (auditFilter !== "all" && log.action !== auditFilter) return false;
+      if (auditSearch.trim()) {
+        const q = auditSearch.toLowerCase();
+        const matchAction = log.action?.toLowerCase().includes(q);
+        const matchDetail = log.detail?.toLowerCase().includes(q);
+        const matchAdmin = log.adminUid?.toLowerCase().includes(q);
+        if (!matchAction && !matchDetail && !matchAdmin) return false;
+      }
+      return true;
+    });
+  }, [auditLogs, auditFilter, auditSearch]);
+
+  // Distinct Action Types for Audit Filter
+  const distinctAuditActions = useMemo(() => {
+    return Array.from(new Set(auditLogs.map((l) => l.action).filter(Boolean)));
+  }, [auditLogs]);
 
   return (
-    <div className="admin-panel-container">
-      <div style={{ maxWidth: 1240, margin: "0 auto" }}>
-        {/* Toast Notification */}
-        {toastMessage && (
-          <div style={{ position: "fixed", top: 80, right: 24, zIndex: 1000, background: "#3C181A", color: "#FFFFFF", padding: "12px 20px", borderRadius: "var(--radius-sm)", boxShadow: "var(--shadow-lg)", fontSize: "0.875rem", fontWeight: 600, animation: "fadeIn 0.2s ease" }}>
-            {toastMessage}
-          </div>
-        )}
+    <div className="admin-page-container" style={{ minHeight: "100vh", background: "var(--bg-main)", padding: "28px 20px 80px" }}>
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 24,
+            right: 24,
+            zIndex: 9999,
+            padding: "12px 20px",
+            borderRadius: 8,
+            color: "#FFFFFF",
+            background: toastType === "error" ? "#DC2626" : toastType === "info" ? "#2563EB" : "#16A34A",
+            boxShadow: "0 4px 14px rgba(0,0,0,0.18)",
+            fontSize: "0.875rem",
+            fontWeight: 600,
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            animation: "slideIn 0.3s ease-out",
+          }}
+        >
+          <span>{toastType === "error" ? "⚠️" : toastType === "info" ? "ℹ️" : "✓"}</span>
+          <span>{toastMessage}</span>
+        </div>
+      )}
 
-        {/* ── Admin Header ────────────────────────────────────────────── */}
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 28, flexWrap: "wrap", gap: 16 }}>
+      <div style={{ maxWidth: 1280, margin: "0 auto" }}>
+        {/* ── Top Header ────────────────────────────────────────────── */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 28, flexWrap: "wrap", gap: 16 }}>
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
               <span className="pill-badge pill-tech">ADMIN CONSOLE</span>
-              <span className="pill-badge pill-success">ROLE: ADMINISTRATOR</span>
+              <span className="pill-badge pill-success">VERIFIED SESSION</span>
             </div>
-            <h1 style={{ fontSize: "2.1rem", fontWeight: 800, color: "#3C181A" }}>
-              Peleekings Admin Dashboard
+            <h1 style={{ fontSize: "2.1rem", fontWeight: 800, color: "var(--text-primary)", margin: 0 }}>
+              Peleekings Admin Console
             </h1>
-            <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem" }}>
-              Live Firestore integration for tutor applications, user registrations, course catalog, and audit trail.
+            <p style={{ color: "var(--text-secondary)", fontSize: "0.95rem", margin: "4px 0 0" }}>
+              Comprehensive administrative management system: learners, instructors, courses, announcements, and audit records.
             </p>
           </div>
 
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button className="btn btn-outline" onClick={() => navigate("/dashboard")}>
+            <button className="btn btn-outline btn-sm" onClick={() => navigate("/dashboard")}>
               Learner Portal &rarr;
             </button>
-            <button className="btn btn-outline" onClick={() => navigate("/teach-portal")}>
+            <button className="btn btn-outline btn-sm" onClick={() => navigate("/teach-portal")}>
               Teaching Portal &rarr;
             </button>
           </div>
         </div>
 
-        {/* ── Overview Metrics Cards ────────────────────────────────── */}
-        <div className="stats-cards-deck">
+        {/* ── High-Level KPI Summary (Always Visible) ────────────────── */}
+        <div className="stats-cards-deck" style={{ marginBottom: 24 }}>
           {[
-            { label: "Registered Users", value: `${usersList.length}`, change: "Live", color: "pill-tech" },
-            { label: "Active Courses", value: `${adminCourses.length}`, change: "Live", color: "pill-success" },
-            { label: "Pending Tutors", value: `${applications.filter(a => a.status === "pending").length}`, change: "Live", color: "pill-creative" },
-            { label: "Celebrations & Milestones", value: `${milestones.length}`, change: "Live", color: "pill-success" },
-            { label: "Audit Events", value: `${auditLogs.length}`, change: "Live", color: "pill-tech" },
-          ].map(m => (
+            { label: "Total Learners", value: `${usersList.filter((u) => u.role !== "admin" && u.role !== "tutor").length}`, color: "pill-tech" },
+            { label: "Approved Tutors", value: `${approvedTutors.length}`, color: "pill-success" },
+            { label: "Pending Applications", value: `${applications.filter((a) => a.status === "pending").length}`, color: "pill-creative" },
+            { label: "Published Courses", value: `${adminCourses.filter((c) => c.status === "published").length}`, color: "pill-success" },
+            { label: "Audit Events", value: `${auditLogs.length}`, color: "pill-tech" },
+          ].map((m) => (
             <div key={m.label} className="stat-metric-card">
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span style={{ fontSize: "0.8rem", fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", letterSpacing: "0.05em" }}>
+                <span style={{ fontSize: "0.75rem", fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", letterSpacing: "0.05em" }}>
                   {m.label}
                 </span>
-                <span className={`pill-badge ${m.color}`}>
-                  {m.change}
-                </span>
+                <span className={`pill-badge ${m.color}`}>LIVE</span>
               </div>
-              <div style={{ fontSize: "2.1rem", fontWeight: 900, color: "var(--text-primary)", margin: "10px 0 2px", fontFamily: "Montserrat, sans-serif" }}>
+              <div style={{ fontSize: "1.9rem", fontWeight: 900, color: "var(--text-primary)", margin: "8px 0 2px", fontFamily: "Montserrat, sans-serif" }}>
                 {m.value}
               </div>
-              <div style={{ fontSize: "0.775rem", color: "var(--text-muted)" }}>
-                Live Firestore collection data
+              <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                Verified Firestore data
               </div>
             </div>
           ))}
         </div>
 
-        {/* ── Tab Navigation Bar ──────────────────────────────────────── */}
-        <div style={{ display: "flex", gap: 8, borderBottom: "1px solid var(--border-light)", paddingBottom: 12, marginBottom: 28, overflowX: "auto" }}>
+        {/* ── 11-Tab Navigation Bar ──────────────────────────────────── */}
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            borderBottom: "1px solid var(--border-light)",
+            paddingBottom: 12,
+            marginBottom: 28,
+            overflowX: "auto",
+            WebkitOverflowScrolling: "touch",
+          }}
+        >
           {[
-            { id: "applications", label: "Tutor Applications", count: applications.filter(a => a.status === "pending").length },
-            { id: "analytics", label: "Platform Usage & Logs", count: auditLogs.length },
-            { id: "registrations", label: "User Registrations", count: usersList.length },
+            { id: "overview", label: "Overview", count: null },
+            { id: "learners", label: "Learner Management", count: usersList.filter((u) => u.role !== "admin" && u.role !== "tutor").length },
+            { id: "tutors", label: "Tutor Management", count: approvedTutors.length },
+            { id: "applications", label: "Tutor Applications", count: applications.filter((a) => a.status === "pending").length },
             { id: "courses", label: "Course Management", count: adminCourses.length },
-            { id: "resources", label: "Resources & Uploads", count: adminResources.length },
-            { id: "celebrations", label: "Milestones & Celebrations", count: milestones.length },
-            { id: "certificates", label: "Certificates & Verification", count: null },
-          ].map(t => (
+            { id: "announcements", label: "Announcements", count: announcements.length },
+            { id: "notifications", label: "Notifications", count: null },
+            { id: "resources", label: "Resources", count: adminResources.length },
+            { id: "analytics", label: "Analytics", count: null },
+            { id: "audit", label: "Audit Logs", count: auditLogs.length },
+            { id: "settings", label: "Platform Settings", count: null },
+          ].map((t) => (
             <button
               key={t.id}
               className={`btn ${activeTab === t.id ? "btn-solid-dark" : "btn-outline"} btn-sm`}
+              style={{ whiteSpace: "nowrap" }}
               onClick={() => setActiveTab(t.id)}
             >
               {t.label} {t.count !== null && `(${t.count})`}
@@ -748,561 +1183,422 @@ export default function AdminPanel() {
           ))}
         </div>
 
-        {/* ── TAB 1: TUTOR APPLICATIONS ───────────────────────────────── */}
-        {activeTab === "applications" && (
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 1: OVERVIEW */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "overview" && (
           <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
-              <div>
-                <h2 style={{ fontSize: "1.3rem", fontWeight: 800 }}>Tutor Applications Queue (Live)</h2>
-                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
-                  Loaded from tutorApplications collection. Approving calls the promoteToTutor Cloud Function to atomically promote the applicant to tutor.
+            {/* Quick Action Shortcuts */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14, marginBottom: 28 }}>
+              <div
+                className="dashboard-card"
+                style={{ padding: 18, cursor: "pointer", border: "1px solid var(--border-light)", borderRadius: 12, background: "#FFFFFF" }}
+                onClick={() => setActiveTab("applications")}
+              >
+                <div style={{ fontSize: "1.2rem", marginBottom: 6 }}>📬</div>
+                <h4 style={{ margin: "0 0 4px", fontSize: "1rem", fontWeight: 700 }}>Review Applications</h4>
+                <p style={{ margin: 0, fontSize: "0.8rem", color: "var(--text-muted)" }}>
+                  {applications.filter((a) => a.status === "pending").length} pending tutor requests awaiting review.
                 </p>
               </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                {["all", "pending", "approved", "rejected"].map(filter => (
-                  <button
-                    key={filter}
-                    className={`filter-pill-btn ${appFilter === filter ? "active" : ""}`}
-                    onClick={() => setAppFilter(filter)}
-                    style={{ textTransform: "capitalize" }}
-                  >
-                    {filter}
-                  </button>
-                ))}
+
+              <div
+                className="dashboard-card"
+                style={{ padding: 18, cursor: "pointer", border: "1px solid var(--border-light)", borderRadius: 12, background: "#FFFFFF" }}
+                onClick={() => setActiveTab("announcements")}
+              >
+                <div style={{ fontSize: "1.2rem", marginBottom: 6 }}>📢</div>
+                <h4 style={{ margin: "0 0 4px", fontSize: "1rem", fontWeight: 700 }}>Post Announcement</h4>
+                <p style={{ margin: 0, fontSize: "0.8rem", color: "var(--text-muted)" }}>
+                  Publish notices across student and tutor dashboards.
+                </p>
+              </div>
+
+              <div
+                className="dashboard-card"
+                style={{ padding: 18, cursor: "pointer", border: "1px solid var(--border-light)", borderRadius: 12, background: "#FFFFFF" }}
+                onClick={() => setActiveTab("courses")}
+              >
+                <div style={{ fontSize: "1.2rem", marginBottom: 6 }}>📚</div>
+                <h4 style={{ margin: "0 0 4px", fontSize: "1rem", fontWeight: 700 }}>Manage Courses</h4>
+                <p style={{ margin: 0, fontSize: "0.8rem", color: "var(--text-muted)" }}>
+                  Create courses, assign instructors, and update content.
+                </p>
+              </div>
+
+              <div
+                className="dashboard-card"
+                style={{ padding: 18, cursor: "pointer", border: "1px solid var(--border-light)", borderRadius: 12, background: "#FFFFFF" }}
+                onClick={() => setActiveTab("notifications")}
+              >
+                <div style={{ fontSize: "1.2rem", marginBottom: 6 }}>🔔</div>
+                <h4 style={{ margin: "0 0 4px", fontSize: "1rem", fontWeight: 700 }}>Dispatch Notification</h4>
+                <p style={{ margin: 0, fontSize: "0.8rem", color: "var(--text-muted)" }}>
+                  Send targeted in-app alerts to learners or instructors.
+                </p>
               </div>
             </div>
 
-            <div className="data-table-container">
-              {loadingApps ? (
-                <div style={{ padding: "32px 20px", textAlign: "center", color: "var(--text-muted)" }}>
-                  Loading applications from Firestore...
+            {/* Recent Audit Activities Stream */}
+            <div className="dashboard-card" style={{ padding: 24, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: "1.2rem", fontWeight: 800 }}>Recent Platform Activities &amp; Audit Stream</h3>
+                  <p style={{ margin: "4px 0 0", fontSize: "0.85rem", color: "var(--text-muted)" }}>
+                    Immutable server-recorded events across user creation, role promotions, and status changes.
+                  </p>
                 </div>
-              ) : filteredApps.length === 0 ? (
-                <div style={{ padding: "32px 20px", textAlign: "center", color: "var(--text-muted)", fontSize: "0.9rem" }}>
-                  No applications match the selected filter.
-                </div>
+                <button className="btn btn-outline btn-sm" onClick={() => setActiveTab("audit")}>
+                  View All Audit Logs &rarr;
+                </button>
+              </div>
+
+              {loadingLogs ? (
+                <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading audit records...</div>
+              ) : auditLogs.length === 0 ? (
+                <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>No recorded audit events found.</div>
               ) : (
-                <table className="clean-data-table">
-                  <thead>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {auditLogs.slice(0, 8).map((log) => (
+                    <div
+                      key={log.id}
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        padding: "12px 16px",
+                        borderRadius: 8,
+                        background: "var(--bg-main)",
+                        border: "1px solid var(--border-light)",
+                        gap: 12,
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                        <span className={`pill-badge ${log.badge || "pill-tech"}`} style={{ fontSize: "0.75rem" }}>
+                          {log.action}
+                        </span>
+                        <span style={{ fontSize: "0.875rem", color: "var(--text-primary)" }}>{log.detail}</span>
+                      </div>
+                      <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+                        {log.timestamp}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 2: LEARNER MANAGEMENT */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "learners" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+              <div>
+                <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Learner Directory</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  Inspect registered learners, view course progress, manage enrollments, and toggle account access.
+                </p>
+              </div>
+            </div>
+
+            {/* Filter & Search Bar */}
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 20 }}>
+              <input
+                type="text"
+                placeholder="Search by name, email, or reg number..."
+                className="form-field-input"
+                style={{ maxWidth: 320 }}
+                value={learnerSearch}
+                onChange={(e) => setLearnerSearch(e.target.value)}
+              />
+
+              <div style={{ display: "flex", gap: 6 }}>
+                {["all", "active", "suspended"].map((st) => (
+                  <button
+                    key={st}
+                    className={`filter-pill-btn ${learnerStatusFilter === st ? "active" : ""}`}
+                    onClick={() => setLearnerStatusFilter(st)}
+                  >
+                    {st === "all" ? "All Status" : st.charAt(0).toUpperCase() + st.slice(1)}
+                  </button>
+                ))}
+              </div>
+
+              <select
+                className="form-field-input"
+                style={{ width: "auto" }}
+                value={learnerSortBy}
+                onChange={(e) => setLearnerSortBy(e.target.value)}
+              >
+                <option value="newest">Sort: Newest Registered</option>
+                <option value="oldest">Sort: Oldest Registered</option>
+                <option value="name">Sort: Name (A-Z)</option>
+              </select>
+
+              <div style={{ marginLeft: "auto", fontSize: "0.85rem", color: "var(--text-muted)" }}>
+                Showing {filteredLearners.length} registered learner(s)
+              </div>
+            </div>
+
+            {/* Learners Table */}
+            <div className="admin-table-container" style={{ background: "#FFFFFF", borderRadius: 12, border: "1px solid var(--border-light)", overflowX: "auto" }}>
+              <table className="admin-table" style={{ width: "100%", borderCollapse: "collapse", textAlign: "left" }}>
+                <thead>
+                  <tr style={{ borderBottom: "1px solid var(--border-light)", background: "var(--bg-main)" }}>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>REG CODE</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>FULL NAME</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>EMAIL</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>TYPE</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>STATUS</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>JOINED</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textAlign: "right" }}>ACTIONS</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loadingUsers ? (
                     <tr>
-                      <th>Applicant</th>
-                      <th>Proposed Course</th>
-                      <th>Category</th>
-                      <th>Status</th>
-                      <th>Actions</th>
+                      <td colSpan={7} style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>
+                        Loading registered learners from Firestore...
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {filteredApps.map(app => (
-                      <tr key={app.id}>
-                        <td>
-                          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                            <div className="user-avatar-circle" style={{ width: 34, height: 34, fontSize: "0.8rem", background: "#3C181A" }}>
-                              {(app.fullName || "A").split(" ").map(n => n[0]).join("").slice(0, 2)}
-                            </div>
-                            <div>
-                              <div style={{ fontWeight: 600 }}>{app.fullName}</div>
-                              <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>{app.email}</div>
-                            </div>
-                          </div>
+                  ) : filteredLearners.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>
+                        No learners match the current filter criteria.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredLearners.map((u) => (
+                      <tr key={u.id} style={{ borderBottom: "1px solid var(--border-light)" }}>
+                        <td style={{ padding: "12px 16px", fontWeight: 700, fontSize: "0.85rem", color: "var(--primary-learner)" }}>
+                          {u.regId}
                         </td>
-                        <td>
-                          <div style={{ fontWeight: 600 }}>{app.courseTitle}</div>
-                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                            {app.courseDescription}
-                          </div>
-                        </td>
-                        <td>
-                          <span className="pill-badge pill-tech">{app.category || "Tech"}</span>
-                        </td>
-                        <td>
-                          <span className={`pill-badge ${app.status === "approved" ? "pill-success" : app.status === "rejected" ? "pill-creative" : "pill-tech"}`}>
-                            {app.status.toUpperCase()}
+                        <td style={{ padding: "12px 16px", fontWeight: 600, fontSize: "0.9rem" }}>{u.name}</td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.85rem", color: "var(--text-secondary)" }}>{u.email}</td>
+                        <td style={{ padding: "12px 16px" }}>
+                          <span className={`pill-badge ${u.studentType === "corper" ? "pill-success" : "pill-tech"}`} style={{ fontSize: "0.75rem" }}>
+                            {u.studentType === "corper" ? "NYSC Corper" : "Standard"}
                           </span>
                         </td>
-                        <td>
-                          <div style={{ display: "flex", gap: 6 }}>
-                            <button className="btn btn-outline btn-sm" onClick={() => setSelectedAppModal(app)}>
-                              Details
+                        <td style={{ padding: "12px 16px" }}>
+                          <span className={`pill-badge ${u.status === "suspended" ? "pill-danger" : "pill-success"}`} style={{ fontSize: "0.75rem" }}>
+                            {u.status === "suspended" ? "Suspended" : "Active"}
+                          </span>
+                        </td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.85rem", color: "var(--text-muted)" }}>{u.date}</td>
+                        <td style={{ padding: "12px 16px", textAlign: "right" }}>
+                          <div style={{ display: "inline-flex", gap: 6 }}>
+                            <button
+                              className="btn btn-outline btn-sm"
+                              onClick={() => {
+                                setSelectedLearner(u);
+                                loadLearnerEnrollments(u.id);
+                              }}
+                            >
+                              Manage Profile
                             </button>
-                            {app.status === "pending" && (
-                              <>
-                                <button
-                                  className="btn btn-solid-dark btn-sm"
-                                  onClick={() => handleReviewApplication(app.id, "approved", app.applicantUid)}
-                                >
-                                  Approve &rarr;
-                                </button>
-                                <button
-                                  className="btn btn-outline btn-sm"
-                                  style={{ color: "#DC2626" }}
-                                  onClick={() => handleReviewApplication(app.id, "rejected", app.applicantUid)}
-                                >
-                                  Reject
-                                </button>
-                              </>
+                            {u.status === "suspended" ? (
+                              <button
+                                className="btn btn-outline btn-sm"
+                                style={{ color: "#16A34A" }}
+                                onClick={() => handleReactivateLearner(u)}
+                              >
+                                Reactivate
+                              </button>
+                            ) : (
+                              <button
+                                className="btn btn-outline btn-sm"
+                                style={{ color: "#DC2626" }}
+                                onClick={() => {
+                                  setSuspendTargetUser(u);
+                                  setShowSuspendModal(true);
+                                }}
+                              >
+                                Suspend
+                              </button>
                             )}
                           </div>
                         </td>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+                    ))
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
         )}
 
-        {/* ── TAB 2: PLATFORM USAGE & AUDIT LOGS ─────────────────────── */}
-        {activeTab === "analytics" && (
-          <div>
-            <div className="admin-analytics-3col">
-              <div className="stat-metric-card">
-                <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>System Uptime</div>
-                <div style={{ fontSize: "2rem", fontWeight: 900, color: "#166534", margin: "8px 0" }}>100%</div>
-                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Firebase Auth &amp; Firestore operational</div>
-              </div>
-              <div className="stat-metric-card">
-                <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>Total Users Recorded</div>
-                <div style={{ fontSize: "2rem", fontWeight: 900, color: "var(--primary-learner)", margin: "8px 0" }}>{usersList.length}</div>
-                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Verified profiles in Firestore</div>
-              </div>
-              <div className="stat-metric-card">
-                <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>Audit Events</div>
-                <div style={{ fontSize: "2rem", fontWeight: 900, color: "#3C181A", margin: "8px 0" }}>{auditLogs.length}</div>
-                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Recorded by Cloud Functions &amp; Admin SDK</div>
-              </div>
-            </div>
-
-            <div className="admin-split-2col">
-              {/* Audit Log Table */}
-              <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", padding: 24 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-                  <h3 style={{ fontSize: "1.2rem", fontWeight: 800 }}>Live Firestore Audit Trail</h3>
-                  <button className="btn btn-outline btn-sm" onClick={fetchAuditLogs}>
-                    Refresh Logs
-                  </button>
-                </div>
-                {loadingLogs ? (
-                  <div style={{ padding: 20, textAlign: "center", color: "var(--text-muted)" }}>Loading audit logs...</div>
-                ) : auditLogs.length === 0 ? (
-                  <div style={{ padding: 20, textAlign: "center", color: "var(--text-muted)" }}>No audit logs recorded yet.</div>
-                ) : (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    {auditLogs.map(log => (
-                      <div key={log.id} style={{ padding: "10px 14px", border: "1px solid var(--border-subtle)", borderRadius: 6, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <div>
-                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                            <span className={`pill-badge ${log.badge || "pill-tech"}`}>{log.action}</span>
-                            <span style={{ fontSize: "0.85rem", fontWeight: 600 }}>{log.detail}</span>
-                          </div>
-                        </div>
-                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>{log.timestamp}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Enrollment Distribution */}
-              <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", padding: 24 }}>
-                <h3 style={{ fontSize: "1.2rem", fontWeight: 800, marginBottom: 16 }}>Live Catalog Statistics</h3>
-                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                  <div>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", fontWeight: 600, marginBottom: 4 }}>
-                      <span>Active Courses</span>
-                      <span>{adminCourses.length}</span>
-                    </div>
-                    <div style={{ height: 8, background: "#E2E8F0", borderRadius: 4, overflow: "hidden" }}>
-                      <div style={{ width: "100%", height: "100%", background: "var(--primary-learner)" }}></div>
-                    </div>
-                  </div>
-                  <div>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", fontWeight: 600, marginBottom: 4 }}>
-                      <span>Pending Instructor Reviews</span>
-                      <span>{applications.filter(a => a.status === "pending").length}</span>
-                    </div>
-                    <div style={{ height: 8, background: "#E2E8F0", borderRadius: 4, overflow: "hidden" }}>
-                      <div style={{ width: "60%", height: "100%", background: "#E11D48" }}></div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── TAB 3: USER REGISTRATIONS ───────────────────────────────── */}
-        {activeTab === "registrations" && (
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 3: TUTOR MANAGEMENT */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "tutors" && (
           <div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                {["All", "Corper", "Non-Corper"].map(type => (
+              <div>
+                <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Approved Instructors &amp; Course Assignments</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  View approved tutors, check assigned curriculum courses, and manage instructor course assignments.
+                </p>
+              </div>
+            </div>
+
+            {/* Tutor Search */}
+            <div style={{ marginBottom: 20 }}>
+              <input
+                type="text"
+                placeholder="Search tutors by name or email..."
+                className="form-field-input"
+                style={{ maxWidth: 320 }}
+                value={tutorSearch}
+                onChange={(e) => setTutorSearch(e.target.value)}
+              />
+            </div>
+
+            {/* Tutors Grid */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(360px, 1fr))", gap: 16 }}>
+              {approvedTutors
+                .filter((t) => {
+                  if (!tutorSearch.trim()) return true;
+                  const q = tutorSearch.toLowerCase();
+                  return t.name?.toLowerCase().includes(q) || t.email?.toLowerCase().includes(q);
+                })
+                .map((t) => {
+                  const assigned = adminCourses.filter(
+                    (c) => c.tutorId === t.id || (c.assignedTutors && c.assignedTutors.includes(t.id))
+                  );
+
+                  return (
+                    <div
+                      key={t.id}
+                      className="dashboard-card"
+                      style={{ padding: 20, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
+                        <div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                            <span className="pill-badge pill-success">APPROVED INSTRUCTOR</span>
+                            {t.role === "admin" && <span className="pill-badge pill-tech">ADMIN</span>}
+                          </div>
+                          <h3 style={{ margin: 0, fontSize: "1.1rem", fontWeight: 700 }}>{t.name}</h3>
+                          <div style={{ fontSize: "0.825rem", color: "var(--text-muted)" }}>{t.email}</div>
+                        </div>
+                        <button
+                          className="btn btn-outline btn-sm"
+                          onClick={() => {
+                            setSelectedTutor(t);
+                            setShowCourseAssignModal(true);
+                          }}
+                        >
+                          + Assign Course
+                        </button>
+                      </div>
+
+                      {t.bio && (
+                        <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", margin: "0 0 12px", lineHeight: 1.4 }}>
+                          {t.bio}
+                        </p>
+                      )}
+
+                      <div style={{ borderTop: "1px solid var(--border-light)", paddingTop: 12, marginTop: 8 }}>
+                        <div style={{ fontSize: "0.75rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", marginBottom: 8 }}>
+                          Assigned Courses ({assigned.length})
+                        </div>
+                        {assigned.length === 0 ? (
+                          <div style={{ fontSize: "0.825rem", color: "var(--text-muted)", fontStyle: "italic" }}>
+                            No courses currently assigned to this instructor.
+                          </div>
+                        ) : (
+                          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                            {assigned.map((c) => (
+                              <div
+                                key={c.id}
+                                style={{
+                                  display: "flex",
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  padding: "6px 10px",
+                                  borderRadius: 6,
+                                  background: "var(--bg-main)",
+                                  fontSize: "0.85rem",
+                                }}
+                              >
+                                <span style={{ fontWeight: 600 }}>{c.title}</span>
+                                <button
+                                  style={{
+                                    border: "none",
+                                    background: "transparent",
+                                    color: "#DC2626",
+                                    cursor: "pointer",
+                                    fontSize: "0.75rem",
+                                    fontWeight: 700,
+                                  }}
+                                  onClick={() => handleRemoveCourseFromTutor(c.id, t.id)}
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 4: TUTOR APPLICATIONS */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "applications" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
+              <div>
+                <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Tutor Applications Queue</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  Loaded from tutorApplications collection. Approving atomically assigns custom claims, creates draft course, and notifies applicant.
+                </p>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                {["all", "pending", "approved", "rejected"].map((filter) => (
                   <button
-                    key={type}
-                    className={`filter-pill-btn ${filterType === type ? "active" : ""}`}
-                    onClick={() => setFilterType(type)}
+                    key={filter}
+                    className={`filter-pill-btn ${appFilter === filter ? "active" : ""}`}
+                    onClick={() => setAppFilter(filter)}
                   >
-                    {type}
+                    {filter.charAt(0).toUpperCase() + filter.slice(1)} (
+                    {applications.filter((a) => (filter === "all" ? true : a.status === filter)).length})
                   </button>
                 ))}
               </div>
-
-              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                <div className="search-input-field">
-                  <span>&#128269;</span>
-                  <input
-                    type="text"
-                    placeholder="Search user name, email, or Reg ID..."
-                    value={userSearch}
-                    onChange={e => setUserSearch(e.target.value)}
-                  />
-                </div>
-                <button className="btn btn-outline btn-sm" onClick={handleExportUsersCSV} title="Export to CSV">
-                  Export CSV ↓
-                </button>
-                <button className="btn btn-solid-dark btn-sm" onClick={() => setShowAddUserModal(true)}>
-                  + Register User
-                </button>
-              </div>
             </div>
 
-            <div className="data-table-container">
-              {loadingUsers && usersList.length === 0 ? (
-                <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading users from Firestore...</div>
-              ) : filteredUsers.length === 0 ? (
-                <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>No registered users found.</div>
-              ) : (
-                <>
-                  <table className="clean-data-table">
-                    <thead>
-                      <tr>
-                        <th>Learner</th>
-                        <th>Type</th>
-                        <th>Registration ID</th>
-                        <th>Registered Date</th>
-                        <th>Status</th>
-                        <th>Role</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredUsers.map(row => (
-                        <tr key={row.id}>
-                          <td>
-                            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                              <div className="user-avatar-circle" style={{ width: 34, height: 34, fontSize: "0.85rem" }}>
-                                {(row.name || "U").split(" ").map(n => n[0]).join("").slice(0, 2)}
-                              </div>
-                              <div>
-                                <div style={{ fontWeight: 600, color: "var(--text-primary)" }}>{row.name}</div>
-                                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>{row.email}</div>
-                              </div>
-                            </div>
-                          </td>
-                          <td>
-                            <span className={`pill-badge ${row.type === "Corper" ? "pill-success" : "pill-tech"}`}>
-                              {row.type}
-                            </span>
-                          </td>
-                          <td>
-                            <code style={{ fontFamily: "monospace", fontWeight: 700, color: "var(--text-primary)", fontSize: "0.9rem" }}>
-                              {row.regId}
-                            </code>
-                          </td>
-                          <td>{row.date}</td>
-                          <td>
-                            <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: "0.825rem", color: row.status === "Active" ? "#166534" : "#991B1B" }}>
-                              <span style={{ width: 6, height: 6, borderRadius: "50%", background: row.status === "Active" ? "#10B981" : "#EF4444" }}></span>
-                              {row.status}
-                            </span>
-                          </td>
-                          <td>
-                            <span className="pill-badge pill-tech" style={{ textTransform: "capitalize" }}>
-                              {row.role}
-                            </span>
-                          </td>
-                          <td>
-                            <div style={{ display: "flex", gap: 6 }}>
-                              <button className="btn btn-outline btn-sm" onClick={() => setSelectedUser(row)}>
-                                Profile
-                              </button>
-                              <button
-                                className="btn btn-outline btn-sm"
-                                style={{ color: row.status === "Active" ? "#DC2626" : "#166534" }}
-                                onClick={() => handleToggleUserStatus(row.id, row.status)}
-                              >
-                                {row.status === "Active" ? "Suspend" : "Activate"}
-                              </button>
-                              <button
-                                className="btn btn-ghost btn-sm"
-                                style={{ color: "#EF4444" }}
-                                onClick={() => handleDeleteUser(row.id, row.name)}
-                                title="Delete User"
-                              >
-                                🗑
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-
-                  {hasMoreUsers && (
-                    <div style={{ textAlign: "center", padding: "16px 0" }}>
-                      <button className="btn btn-outline btn-sm" onClick={() => fetchUsers(true)} disabled={loadingUsers}>
-                        {loadingUsers ? "Loading..." : "Load More Users ↓"}
-                      </button>
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ── TAB 4: COURSE MANAGEMENT ───────────────────────────────── */}
-        {activeTab === "courses" && (
-          <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
-              <div>
-                <h2 style={{ fontSize: "1.3rem", fontWeight: 800 }}>Course Catalog Management (Live)</h2>
-                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
-                  Add, edit, or delete courses directly in Firestore with administrator permissions.
-                </p>
-              </div>
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button className="btn btn-outline btn-sm" onClick={handleSeedCatalog}>
-                  Seed Default Catalog
-                </button>
-                <div className="search-input-field" style={{ width: 220 }}>
-                  <span>&#128269;</span>
-                  <input
-                    type="text"
-                    placeholder="Search courses..."
-                    value={courseSearch}
-                    onChange={e => setCourseSearch(e.target.value)}
-                  />
-                </div>
-                <button className="btn btn-solid-dark btn-sm" onClick={() => setShowAddCourseModal(true)}>
-                  + Create New Course
-                </button>
-              </div>
-            </div>
-
-            {/* Filter pills for category */}
-            <div style={{ display: "flex", gap: 8, marginBottom: 20, overflowX: "auto" }}>
-              {["All", "Tech & Digital Skills", "Professional Skills", "Creative & Design"].map(cat => (
-                <button
-                  key={cat}
-                  className={`filter-pill-btn ${courseCategoryFilter === cat ? "active" : ""}`}
-                  onClick={() => setCourseCategoryFilter(cat)}
-                >
-                  {cat}
-                </button>
-              ))}
-            </div>
-
-            {loadingCourses ? (
-              <div style={{ padding: 40, textAlign: "center", color: "var(--text-muted)" }}>Loading courses from Firestore...</div>
-            ) : filteredCourses.length === 0 ? (
-              <div style={{ padding: 40, textAlign: "center", color: "var(--text-muted)" }}>
-                No courses found in Firestore. Click &quot;Seed Default Catalog&quot; to populate courses.
-              </div>
-            ) : (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 20 }}>
-                {filteredCourses.map(course => (
-                  <div key={course.id} style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", overflow: "hidden", display: "flex", flexDirection: "column" }}>
-                    <img src={course.image} alt={course.title} style={{ width: "100%", height: 130, objectFit: "cover" }} />
-                    <div style={{ padding: 16, display: "flex", flexDirection: "column", flex: 1 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                        <span className={`pill-badge ${course.badgeClass || "pill-tech"}`}>{course.badge || "COURSE"}</span>
-                        <span className={`pill-badge ${course.status === "published" || course.status === "Published" ? "pill-success" : "pill-creative"}`}>
-                          {course.status || "Published"}
-                        </span>
-                      </div>
-                      <h3 style={{ fontSize: "1rem", fontWeight: 700, marginBottom: 6, lineHeight: 1.3 }}>{course.title}</h3>
-                      <p style={{ fontSize: "0.8rem", color: "var(--text-secondary)", marginBottom: 14, height: 38, overflow: "hidden", flex: 1 }}>
-                        {course.description}
-                      </p>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid var(--border-subtle)", paddingTop: 12 }}>
-                        <span style={{ fontSize: "0.775rem", fontWeight: 600 }}>{course.students || 0} enrolled</span>
-                        <div style={{ display: "flex", gap: 6 }}>
-                          <button
-                            className="btn btn-outline btn-sm"
-                            onClick={() => handleToggleCourseStatus(course.id, course.status)}
-                          >
-                            {course.status === "published" || course.status === "Published" ? "Draft" : "Publish"}
-                          </button>
-                          <button
-                            className="btn btn-outline btn-sm"
-                            onClick={() => setEditingCourse(course)}
-                          >
-                            Edit
-                          </button>
-                          <button
-                            className="btn btn-ghost btn-sm"
-                            style={{ color: "#DC2626" }}
-                            onClick={() => handleDeleteCourse(course.id, course.title)}
-                          >
-                            🗑
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ── TAB 5: CERTIFICATES & VERIFICATION ─────────────────────── */}
-        {activeTab === "certificates" && (
-          <div className="admin-split-2col">
-            <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", padding: 28 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <h2 style={{ fontSize: "1.4rem", fontWeight: 800 }}>Certificate Verification Engine</h2>
-                <button className="btn btn-solid-dark btn-sm" onClick={() => setShowIssueCertModal(true)}>
-                  + Award Certificate
-                </button>
-              </div>
-              <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>
-                Verify credential authenticity by student Registration ID (e.g. AS1399, S4821A, AB0456).
-              </p>
-
-              <form onSubmit={handleCertLookup} style={{ display: "flex", gap: 10, marginBottom: 24 }}>
-                <input
-                  type="text"
-                  placeholder="Enter Student Registration ID (e.g. AS1399)..."
-                  required
-                  className="form-field-input"
-                  value={certSearchId}
-                  onChange={e => setCertSearchId(e.target.value)}
-                />
-                <button type="submit" className="btn btn-solid-dark">
-                  Verify ID &rarr;
-                </button>
-              </form>
-
-              {certResult && (
-                <div style={{ padding: 24, border: "2px solid #BBF7D0", background: "var(--success-bg)", borderRadius: "var(--radius-md)" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
-                    <div>
-                      <span className="pill-badge pill-success" style={{ marginBottom: 6 }}>
-                        AUTHENTIC CERTIFIED CREDENTIAL
-                      </span>
-                      <h3 style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--success-text)" }}>{certResult.name}</h3>
-                      <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 2 }}>
-                        Status: Verified Active Graduate
-                      </div>
-                    </div>
-                    <code style={{ fontSize: "1.1rem", fontWeight: 900, color: "var(--success-text)" }}>
-                      {certResult.regId}
-                    </code>
-                  </div>
-                  <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: 16 }}>
-                    Verified graduate in <strong>{certResult.course || "AI Essentials & Automation"}</strong>. Completed all modules, passed assessments, and verified for NYSC deployment credit.
-                  </p>
-                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                    <button
-                      className="btn btn-solid-dark btn-sm"
-                      onClick={() => {
-                        window.print();
-                        triggerToast(`Certificate #${certResult.regId} prepared for print.`);
-                      }}
-                    >
-                      Download PDF Certificate ↓
-                    </button>
-                    <button className="btn btn-outline btn-sm" onClick={() => setCertResult(null)}>
-                      Clear Search
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Quick Verification Records */}
-            <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", padding: 28 }}>
-              <h3 style={{ fontSize: "1.1rem", fontWeight: 700, marginBottom: 12 }}>Sample Verification Records</h3>
-              <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginBottom: 16 }}>
-                Click any ID below to query credentials immediately:
-              </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {usersList.slice(0, 4).map(u => (
-                  <div
-                    key={u.id}
-                    style={{ padding: "10px 14px", border: "1px solid var(--border-light)", borderRadius: 6, display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer", background: "#F8FAFC" }}
-                    onClick={() => {
-                      setCertSearchId(u.regId);
-                      setCertResult({
-                        name: u.name,
-                        regId: u.regId,
-                        course: u.enrolledCourses?.[0] || "AI Essentials & Automation",
-                        issueDate: u.date,
-                        verified: true
-                      });
-                    }}
-                  >
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: "0.875rem" }}>{u.name}</div>
-                      <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>{u.type} • {u.enrolledCourses?.[0]}</div>
-                    </div>
-                    <code style={{ fontWeight: 800, fontSize: "0.85rem" }}>{u.regId}</code>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── TAB: RESOURCES & UPLOADS ─────────────────────────────────── */}
-        {activeTab === "resources" && (
-          <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 14 }}>
-              <div>
-                <h2 style={{ fontSize: "1.3rem", fontWeight: 800 }}>Platform &amp; Course Resources</h2>
-                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
-                  Upload downloadable materials, exercise files, and guides that immediately reflect across the platform and in course classrooms.
-                </p>
-              </div>
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                <div style={{ display: "flex", gap: 6 }}>
-                  {["all", "platform"].map((f) => (
-                    <button
-                      key={f}
-                      className={`filter-pill-btn ${resourceFilter === f ? "active" : ""}`}
-                      onClick={() => setResourceFilter(f)}
-                      style={{ textTransform: "capitalize" }}
-                    >
-                      {f}
-                    </button>
-                  ))}
-                </div>
-                <button
-                  className="btn btn-solid-dark btn-sm"
-                  onClick={() => setShowAddResourceModal(true)}
-                >
-                  + Upload New Resource
-                </button>
-              </div>
-            </div>
-
+            {/* Applications List */}
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              {adminResources
-                .filter((r) => {
-                  if (resourceFilter === "platform") return r.courseId === "platform";
-                  return true;
-                })
-                .map((res) => (
+              {loadingApps ? (
+                <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading applications...</div>
+              ) : filteredApplications.length === 0 ? (
+                <div className="dashboard-card" style={{ padding: 40, textAlign: "center", background: "#FFFFFF", borderRadius: 12 }}>
+                  <div style={{ fontSize: "2rem", marginBottom: 8 }}>📬</div>
+                  <h3 style={{ margin: 0, fontWeight: 700 }}>No Applications Found</h3>
+                  <p style={{ margin: "4px 0 0", color: "var(--text-muted)", fontSize: "0.875rem" }}>
+                    There are no applications matching the current filter.
+                  </p>
+                </div>
+              ) : (
+                filteredApplications.map((app) => (
                   <div
-                    key={res.id}
+                    key={app.id}
+                    className="dashboard-card"
                     style={{
+                      padding: 20,
+                      borderRadius: 12,
                       background: "#FFFFFF",
                       border: "1px solid var(--border-light)",
-                      borderRadius: "var(--radius-sm)",
-                      padding: "18px 22px",
                       display: "flex",
                       justifyContent: "space-between",
                       alignItems: "center",
@@ -1310,635 +1606,947 @@ export default function AdminPanel() {
                       gap: 16,
                     }}
                   >
-                    <div style={{ maxWidth: "70%" }}>
+                    <div style={{ flex: 1, minWidth: 260 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                        <span className="pill-badge pill-tech">{res.type}</span>
-                        <span className="pill-badge pill-solid-dark">
-                          {res.courseId === "platform" ? "Platform-Wide" : `Course: ${res.courseId}`}
+                        <span
+                          className={`pill-badge ${
+                            app.status === "approved" ? "pill-success" : app.status === "rejected" ? "pill-danger" : "pill-warning"
+                          }`}
+                          style={{ fontSize: "0.75rem" }}
+                        >
+                          {app.status.toUpperCase()}
                         </span>
-                        {res.fileSize && (
-                          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>{res.fileSize}</span>
-                        )}
+                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Submitted {app.date}</span>
                       </div>
-                      <h3 style={{ fontSize: "1.05rem", fontWeight: 700, color: "var(--text-primary)" }}>
-                        {res.title}
-                      </h3>
-                      <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginTop: 4 }}>
-                        {res.desc || res.description}
+                      <h3 style={{ margin: "0 0 2px", fontSize: "1.1rem", fontWeight: 700 }}>{app.fullName}</h3>
+                      <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginBottom: 6 }}>{app.email}</div>
+                      <div style={{ fontSize: "0.9rem", fontWeight: 600, color: "var(--primary-learner)" }}>
+                        Proposed Course: {app.courseTitle}
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <button className="btn btn-outline btn-sm" onClick={() => setSelectedAppModal(app)}>
+                        View Details
+                      </button>
+                      {app.status === "pending" && (
+                        <>
+                          <button
+                            className="btn btn-solid-dark btn-sm"
+                            disabled={isProcessing}
+                            onClick={() => handleApproveApplication(app)}
+                          >
+                            Approve
+                          </button>
+                          <button
+                            className="btn btn-outline btn-sm"
+                            style={{ color: "#DC2626" }}
+                            disabled={isProcessing}
+                            onClick={() => {
+                              setRejectModalApp(app);
+                              setRejectionReasonText("");
+                            }}
+                          >
+                            Reject
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 5: COURSE MANAGEMENT */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "courses" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+              <div>
+                <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Course Administration</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  Create and publish courses, edit metadata, configure assigned instructors, and manage curriculum modules.
+                </p>
+              </div>
+              <button className="btn btn-solid-dark btn-sm" onClick={() => setShowAddCourseModal(true)}>
+                + Create New Course
+              </button>
+            </div>
+
+            {/* Filter Bar */}
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 20 }}>
+              <input
+                type="text"
+                placeholder="Search courses..."
+                className="form-field-input"
+                style={{ maxWidth: 280 }}
+                value={courseSearch}
+                onChange={(e) => setCourseSearch(e.target.value)}
+              />
+
+              <div style={{ display: "flex", gap: 6 }}>
+                {["all", "published", "draft"].map((st) => (
+                  <button
+                    key={st}
+                    className={`filter-pill-btn ${courseStatusFilter === st ? "active" : ""}`}
+                    onClick={() => setCourseStatusFilter(st)}
+                  >
+                    {st === "all" ? "All Status" : st.charAt(0).toUpperCase() + st.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Courses Table */}
+            <div className="admin-table-container" style={{ background: "#FFFFFF", borderRadius: 12, border: "1px solid var(--border-light)", overflowX: "auto" }}>
+              <table className="admin-table" style={{ width: "100%", borderCollapse: "collapse", textAlign: "left" }}>
+                <thead>
+                  <tr style={{ borderBottom: "1px solid var(--border-light)", background: "var(--bg-main)" }}>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>TITLE</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>CATEGORY</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>STATUS</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>INSTRUCTOR</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>DURATION</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textAlign: "right" }}>ACTIONS</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loadingCourses ? (
+                    <tr>
+                      <td colSpan={6} style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>
+                        Loading courses from Firestore...
+                      </td>
+                    </tr>
+                  ) : filteredCourses.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>
+                        No courses found matching criteria.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredCourses.map((c) => (
+                      <tr key={c.id} style={{ borderBottom: "1px solid var(--border-light)" }}>
+                        <td style={{ padding: "12px 16px" }}>
+                          <div style={{ fontWeight: 700, fontSize: "0.9rem" }}>{c.title}</div>
+                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>ID: {c.id}</div>
+                        </td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.85rem" }}>{c.category || "General"}</td>
+                        <td style={{ padding: "12px 16px" }}>
+                          <span
+                            className={`pill-badge ${c.status === "published" ? "pill-success" : "pill-warning"}`}
+                            style={{ fontSize: "0.75rem" }}
+                          >
+                            {c.status?.toUpperCase() || "PUBLISHED"}
+                          </span>
+                        </td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.85rem" }}>
+                          {c.tutorName || (c.tutorId ? "Assigned" : "Unassigned")}
+                        </td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.85rem", color: "var(--text-muted)" }}>{c.duration || "Self-paced"}</td>
+                        <td style={{ padding: "12px 16px", textAlign: "right" }}>
+                          <div style={{ display: "inline-flex", gap: 6 }}>
+                            <button
+                              className="btn btn-outline btn-sm"
+                              onClick={() => handleToggleCourseStatus(c)}
+                            >
+                              {c.status === "published" ? "Unpublish" : "Publish"}
+                            </button>
+                            <button
+                              className="btn btn-outline btn-sm"
+                              onClick={() => setEditingCourse(c)}
+                            >
+                              Edit
+                            </button>
+                            <button
+                              className="btn btn-outline btn-sm"
+                              style={{ color: "#DC2626" }}
+                              onClick={() => handleDeleteCourse(c)}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 6: ANNOUNCEMENTS */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "announcements" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+              <div>
+                <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Announcements Management</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  Create and manage targeted announcements that display on learner dashboards, tutor portals, or course classrooms.
+                </p>
+              </div>
+              <button
+                className="btn btn-solid-dark btn-sm"
+                onClick={() => {
+                  setEditingAnnouncement(null);
+                  setAnnouncementForm({
+                    id: null,
+                    title: "",
+                    body: "",
+                    category: "General",
+                    priority: "normal",
+                    audience: "all",
+                    courseId: "",
+                    pinned: false,
+                    status: "published",
+                    expiresAt: "",
+                  });
+                  setShowAnnouncementModal(true);
+                }}
+              >
+                + Create Announcement
+              </button>
+            </div>
+
+            {/* Filter Tabs */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+              {["all", "published", "draft"].map((st) => (
+                <button
+                  key={st}
+                  className={`filter-pill-btn ${announcementFilter === st ? "active" : ""}`}
+                  onClick={() => setAnnouncementFilter(st)}
+                >
+                  {st === "all" ? "All Announcements" : st.charAt(0).toUpperCase() + st.slice(1)} (
+                  {announcements.filter((a) => (st === "all" ? true : a.status === st)).length})
+                </button>
+              ))}
+            </div>
+
+            {/* Announcements List */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {loadingAnnouncements ? (
+                <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading announcements...</div>
+              ) : filteredAnnouncements.length === 0 ? (
+                <div className="dashboard-card" style={{ padding: 40, textAlign: "center", background: "#FFFFFF", borderRadius: 12 }}>
+                  <div style={{ fontSize: "2rem", marginBottom: 8 }}>📢</div>
+                  <h3 style={{ margin: 0, fontWeight: 700 }}>No Announcements</h3>
+                  <p style={{ margin: "4px 0 0", color: "var(--text-muted)", fontSize: "0.875rem" }}>
+                    Create an announcement to broadcast notices to your users.
+                  </p>
+                </div>
+              ) : (
+                filteredAnnouncements.map((ann) => (
+                  <div
+                    key={ann.id}
+                    className="dashboard-card"
+                    style={{
+                      padding: 20,
+                      borderRadius: 12,
+                      background: "#FFFFFF",
+                      border: "1px solid var(--border-light)",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "flex-start",
+                      flexWrap: "wrap",
+                      gap: 16,
+                    }}
+                  >
+                    <div style={{ flex: 1, minWidth: 280 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                        <span className={`pill-badge ${ann.status === "published" ? "pill-success" : "pill-warning"}`}>
+                          {ann.status.toUpperCase()}
+                        </span>
+                        <span className="pill-badge pill-tech">AUDIENCE: {ann.audience?.toUpperCase() || "ALL"}</span>
+                        {ann.pinned && <span className="pill-badge pill-creative">📌 PINNED</span>}
+                        {ann.priority === "urgent" && <span className="pill-badge pill-danger">URGENT</span>}
+                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Posted {ann.date}</span>
+                      </div>
+                      <h3 style={{ margin: "0 0 6px", fontSize: "1.15rem", fontWeight: 700 }}>{ann.title}</h3>
+                      <p style={{ margin: 0, fontSize: "0.875rem", color: "var(--text-secondary)", lineHeight: 1.5, whiteSpace: "pre-line" }}>
+                        {ann.body}
                       </p>
-                      {res.uploaderName && (
-                        <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 6 }}>
-                          Uploaded by: <strong>{res.uploaderName}</strong> ({res.uploaderRole || "admin"})
+                      {ann.courseId && (
+                        <div style={{ marginTop: 8, fontSize: "0.8rem", color: "var(--primary-learner)", fontWeight: 600 }}>
+                          Targeted Course ID: {ann.courseId}
                         </div>
                       )}
                     </div>
 
-                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                      <a
-                        href={res.fileUrl || "#"}
-                        target="_blank"
-                        rel="noreferrer"
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
                         className="btn btn-outline btn-sm"
-                        style={{ textDecoration: "none" }}
+                        onClick={() => {
+                          setEditingAnnouncement(ann);
+                          setAnnouncementForm({
+                            id: ann.id,
+                            title: ann.title || "",
+                            body: ann.body || "",
+                            category: ann.category || "General",
+                            priority: ann.priority || "normal",
+                            audience: ann.audience || "all",
+                            courseId: ann.courseId || "",
+                            pinned: Boolean(ann.pinned),
+                            status: ann.status || "published",
+                            expiresAt: ann.expiresAt || "",
+                          });
+                          setShowAnnouncementModal(true);
+                        }}
                       >
-                        View / Download &darr;
-                      </a>
-                      {!res.isDefault && (
+                        Edit
+                      </button>
+                      <button
+                        className="btn btn-outline btn-sm"
+                        style={{ color: "#DC2626" }}
+                        onClick={() => handleDeleteAnnouncement(ann)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 7: NOTIFICATIONS */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "notifications" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
+              <div>
+                <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Notification Dispatch Center</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  Broadcast targeted in-app notifications directly to students, instructors, or individual accounts.
+                </p>
+              </div>
+              <button className="btn btn-solid-dark btn-sm" onClick={() => setShowSendNotifModal(true)}>
+                + Send In-App Notification
+              </button>
+            </div>
+
+            <div className="dashboard-card" style={{ padding: 24, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF", marginBottom: 24 }}>
+              <h3 style={{ margin: "0 0 12px", fontSize: "1.1rem", fontWeight: 700 }}>Dispatch Guidelines</h3>
+              <ul style={{ margin: 0, paddingLeft: 20, fontSize: "0.875rem", color: "var(--text-secondary)", lineHeight: 1.6 }}>
+                <li>Notifications sent here are written to the target user's Firestore <code>notifications</code> subcollection.</li>
+                <li>Learners and Instructors will see a badge update in their top navigation bell menu in real time.</li>
+                <li>Mass broadcasts are executed safely in batches through trusted Cloud Functions to prevent client timeouts.</li>
+              </ul>
+            </div>
+
+            {/* Notification Dispatch History */}
+            <div className="dashboard-card" style={{ padding: 24, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}>
+              <h3 style={{ margin: "0 0 16px", fontSize: "1.1rem", fontWeight: 700 }}>Notification Dispatch History</h3>
+              {auditLogs.filter((l) => l.action === "Notification Dispatched").length === 0 ? (
+                <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)", fontStyle: "italic" }}>
+                  No recent notification dispatch records found in audit logs.
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {auditLogs
+                    .filter((l) => l.action === "Notification Dispatched")
+                    .map((log) => (
+                      <div
+                        key={log.id}
+                        style={{
+                          padding: "12px 16px",
+                          borderRadius: 8,
+                          background: "var(--bg-main)",
+                          border: "1px solid var(--border-light)",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          gap: 12,
+                        }}
+                      >
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>{log.detail}</div>
+                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Target: {log.target}</div>
+                        </div>
+                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>{log.timestamp}</span>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 8: RESOURCES */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "resources" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+              <div>
+                <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Platform &amp; Course Resources</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  Upload downloadable materials, PDF guides, cheatsheets, and templates using Cloud Storage &amp; Firestore.
+                </p>
+              </div>
+              <button className="btn btn-solid-dark btn-sm" onClick={() => setShowAddResourceModal(true)}>
+                + Upload Resource
+              </button>
+            </div>
+
+            {/* Filter Bar */}
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 20 }}>
+              {["all", "platform", "Tech & Digital Skills", "Professional Skills", "Creative & Design"].map((cat) => (
+                <button
+                  key={cat}
+                  className={`filter-pill-btn ${resourceFilter === cat ? "active" : ""}`}
+                  onClick={() => setResourceFilter(cat)}
+                >
+                  {cat === "all" ? "All Resources" : cat}
+                </button>
+              ))}
+            </div>
+
+            {/* Resources List */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 16 }}>
+              {loadingResources ? (
+                <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading resources...</div>
+              ) : adminResources.length === 0 ? (
+                <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>No resources found.</div>
+              ) : (
+                adminResources
+                  .filter((r) => {
+                    if (resourceFilter === "all") return true;
+                    if (resourceFilter === "platform") return r.courseId === "platform";
+                    return r.category === resourceFilter;
+                  })
+                  .map((r) => (
+                    <div
+                      key={r.id}
+                      className="dashboard-card"
+                      style={{ padding: 18, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF", display: "flex", flexDirection: "column", justifyContent: "space-between" }}
+                    >
+                      <div>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                          <span className="pill-badge pill-tech" style={{ fontSize: "0.75rem" }}>{r.type || "Resource"}</span>
+                          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>{r.fileSize}</span>
+                        </div>
+                        <h4 style={{ margin: "0 0 6px", fontSize: "1rem", fontWeight: 700 }}>{r.title}</h4>
+                        <p style={{ margin: "0 0 12px", fontSize: "0.85rem", color: "var(--text-secondary)", lineHeight: 1.4 }}>
+                          {r.desc}
+                        </p>
+                      </div>
+
+                      <div style={{ borderTop: "1px solid var(--border-light)", paddingTop: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Course: {r.courseId || "Platform"}</span>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          {r.fileUrl && (
+                            <a
+                              href={r.fileUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="btn btn-outline btn-sm"
+                              style={{ textDecoration: "none" }}
+                            >
+                              Download
+                            </a>
+                          )}
+                          {!r.isDefault && (
+                            <button
+                              className="btn btn-outline btn-sm"
+                              style={{ color: "#DC2626" }}
+                              onClick={() => handleDeleteResourceItem(r)}
+                            >
+                              Delete
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 9: ANALYTICS */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "analytics" && (
+          <div>
+            <div style={{ marginBottom: 20 }}>
+              <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Platform Analytics &amp; Metrics</h2>
+              <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                Real data aggregations calculated across users, courses, and tutor application workflows.
+              </p>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16, marginBottom: 28 }}>
+              <div className="dashboard-card" style={{ padding: 20, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}>
+                <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>
+                  Learner Demographics
+                </div>
+                <div style={{ fontSize: "1.8rem", fontWeight: 900, margin: "8px 0 4px" }}>
+                  {usersList.filter((u) => u.studentType === "corper").length} Corpers
+                </div>
+                <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
+                  vs {usersList.filter((u) => u.studentType !== "corper" && u.role !== "admin").length} Non-Corpers
+                </div>
+              </div>
+
+              <div className="dashboard-card" style={{ padding: 20, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}>
+                <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>
+                  Application Approval Rate
+                </div>
+                <div style={{ fontSize: "1.8rem", fontWeight: 900, margin: "8px 0 4px" }}>
+                  {applications.length > 0
+                    ? `${Math.round((applications.filter((a) => a.status === "approved").length / applications.length) * 100)}%`
+                    : "100%"}
+                </div>
+                <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
+                  {applications.filter((a) => a.status === "approved").length} approved of {applications.length} total
+                </div>
+              </div>
+
+              <div className="dashboard-card" style={{ padding: 20, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}>
+                <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase" }}>
+                  Active vs Suspended Accounts
+                </div>
+                <div style={{ fontSize: "1.8rem", fontWeight: 900, margin: "8px 0 4px", color: "#16A34A" }}>
+                  {usersList.filter((u) => u.status === "active").length} Active
+                </div>
+                <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
+                  {usersList.filter((u) => u.status === "suspended").length} currently suspended
+                </div>
+              </div>
+            </div>
+
+            {/* Course Distribution Table */}
+            <div className="dashboard-card" style={{ padding: 24, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}>
+              <h3 style={{ margin: "0 0 16px", fontSize: "1.1rem", fontWeight: 700 }}>Course Catalog Distribution</h3>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {adminCourses.map((c) => (
+                  <div
+                    key={c.id}
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      padding: "10px 14px",
+                      borderRadius: 8,
+                      background: "var(--bg-main)",
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>{c.title}</div>
+                      <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Category: {c.category || "General"}</div>
+                    </div>
+                    <span className={`pill-badge ${c.status === "published" ? "pill-success" : "pill-warning"}`}>
+                      {c.status?.toUpperCase() || "PUBLISHED"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 10: AUDIT LOGS */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "audit" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+              <div>
+                <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>System Audit Logs</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                  Immutable audit records automatically recorded by Cloud Functions and administrative operations.
+                </p>
+              </div>
+            </div>
+
+            {/* Filter Bar */}
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 20 }}>
+              <input
+                type="text"
+                placeholder="Search audit records by detail or admin UID..."
+                className="form-field-input"
+                style={{ maxWidth: 320 }}
+                value={auditSearch}
+                onChange={(e) => setAuditSearch(e.target.value)}
+              />
+
+              <select
+                className="form-field-input"
+                style={{ width: "auto" }}
+                value={auditFilter}
+                onChange={(e) => setAuditFilter(e.target.value)}
+              >
+                <option value="all">All Action Types</option>
+                {distinctAuditActions.map((act) => (
+                  <option key={act} value={act}>
+                    {act}
+                  </option>
+                ))}
+              </select>
+
+              <div style={{ marginLeft: "auto", fontSize: "0.85rem", color: "var(--text-muted)" }}>
+                Showing {filteredAuditLogs.length} audit event(s)
+              </div>
+            </div>
+
+            {/* Audit Logs Table */}
+            <div className="admin-table-container" style={{ background: "#FFFFFF", borderRadius: 12, border: "1px solid var(--border-light)", overflowX: "auto" }}>
+              <table className="admin-table" style={{ width: "100%", borderCollapse: "collapse", textAlign: "left" }}>
+                <thead>
+                  <tr style={{ borderBottom: "1px solid var(--border-light)", background: "var(--bg-main)" }}>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>ACTION</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>EVENT DETAIL</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>ADMIN / CALLER</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)" }}>TIMESTAMP</th>
+                    <th style={{ padding: "12px 16px", fontSize: "0.8rem", fontWeight: 700, color: "var(--text-muted)", textAlign: "right" }}>PAYLOAD</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loadingLogs ? (
+                    <tr>
+                      <td colSpan={5} style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>
+                        Loading audit logs from Firestore...
+                      </td>
+                    </tr>
+                  ) : filteredAuditLogs.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>
+                        No audit records match the current filter.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredAuditLogs.map((log) => (
+                      <tr key={log.id} style={{ borderBottom: "1px solid var(--border-light)" }}>
+                        <td style={{ padding: "12px 16px" }}>
+                          <span className={`pill-badge ${log.badge || "pill-tech"}`} style={{ fontSize: "0.75rem" }}>
+                            {log.action}
+                          </span>
+                        </td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.85rem", color: "var(--text-primary)" }}>{log.detail}</td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.8rem", color: "var(--text-muted)", fontFamily: "monospace" }}>
+                          {log.adminUid ? log.adminUid.slice(0, 8) + "…" : log.approvedBy ? log.approvedBy.slice(0, 8) + "…" : "system"}
+                        </td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.8rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+                          {log.timestamp}
+                        </td>
+                        <td style={{ padding: "12px 16px", textAlign: "right" }}>
+                          <button
+                            className="btn btn-outline btn-sm"
+                            onClick={() => setSelectedAuditLog(log)}
+                          >
+                            Inspect
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* TAB 11: PLATFORM SETTINGS */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {activeTab === "settings" && (
+          <div>
+            <div style={{ marginBottom: 20 }}>
+              <h2 style={{ fontSize: "1.3rem", fontWeight: 800, margin: 0 }}>Platform Configuration</h2>
+              <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", margin: "4px 0 0" }}>
+                Manage system-wide parameters, maintenance toggles, and public support contact information.
+              </p>
+            </div>
+
+            <div className="dashboard-card" style={{ padding: 28, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF", maxWidth: 680 }}>
+              <form onSubmit={handleSaveSettings}>
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Platform Name</label>
+                  <input
+                    type="text"
+                    className="form-field-input"
+                    value={platformSettings.platformName}
+                    onChange={(e) => setPlatformSettings({ ...platformSettings, platformName: e.target.value })}
+                    required
+                  />
+                </div>
+
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Academic Support Email</label>
+                  <input
+                    type="email"
+                    className="form-field-input"
+                    value={platformSettings.supportEmail}
+                    onChange={(e) => setPlatformSettings({ ...platformSettings, supportEmail: e.target.value })}
+                    required
+                  />
+                </div>
+
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Top Banner Announcement Message</label>
+                  <input
+                    type="text"
+                    className="form-field-input"
+                    value={platformSettings.bannerMessage}
+                    onChange={(e) => setPlatformSettings({ ...platformSettings, bannerMessage: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 12, margin: "20px 0" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", fontSize: "0.9rem" }}>
+                    <input
+                      type="checkbox"
+                      checked={platformSettings.openRegistrations}
+                      onChange={(e) => setPlatformSettings({ ...platformSettings, openRegistrations: e.target.checked })}
+                    />
+                    <span>Open Public Learner Registrations</span>
+                  </label>
+
+                  <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", fontSize: "0.9rem" }}>
+                    <input
+                      type="checkbox"
+                      checked={platformSettings.allowTutorApplications}
+                      onChange={(e) => setPlatformSettings({ ...platformSettings, allowTutorApplications: e.target.checked })}
+                    />
+                    <span>Accept New Instructor Applications</span>
+                  </label>
+
+                  <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", fontSize: "0.9rem" }}>
+                    <input
+                      type="checkbox"
+                      checked={platformSettings.maintenanceMode}
+                      onChange={(e) => setPlatformSettings({ ...platformSettings, maintenanceMode: e.target.checked })}
+                    />
+                    <span style={{ color: platformSettings.maintenanceMode ? "#DC2626" : "inherit" }}>
+                      Maintenance Mode (Admins Only)
+                    </span>
+                  </label>
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                  <button type="submit" disabled={savingSettings} className="btn btn-solid-dark">
+                    {savingSettings ? "Saving Settings..." : "Save Platform Settings"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 1: LEARNER PROFILE DRAWER / MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {selectedLearner && (
+          <div className="modal-backdrop-overlay" onClick={() => setSelectedLearner(null)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 640 }} onClick={(e) => e.stopPropagation()}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+                <div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                    <span className={`pill-badge ${selectedLearner.status === "suspended" ? "pill-danger" : "pill-success"}`}>
+                      {selectedLearner.status?.toUpperCase() || "ACTIVE"}
+                    </span>
+                    <span className="pill-badge pill-tech">{selectedLearner.type}</span>
+                  </div>
+                  <h3 style={{ margin: 0, fontSize: "1.3rem", fontWeight: 800 }}>{selectedLearner.name}</h3>
+                  <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>Reg Code: {selectedLearner.regId}</div>
+                </div>
+                <button className="btn btn-outline btn-sm" onClick={() => setSelectedLearner(null)}>✕</button>
+              </div>
+
+              {/* Personal & Contact Information */}
+              <div style={{ background: "var(--bg-main)", padding: 14, borderRadius: 8, marginBottom: 18, fontSize: "0.875rem" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div><strong>Email:</strong> {selectedLearner.email}</div>
+                  <div><strong>Phone:</strong> {selectedLearner.phone}</div>
+                  <div><strong>NYSC Code:</strong> {selectedLearner.nyscCode || "N/A"}</div>
+                  <div><strong>Joined:</strong> {selectedLearner.date}</div>
+                </div>
+                {selectedLearner.bio && (
+                  <div style={{ marginTop: 8 }}>
+                    <strong>Bio:</strong> {selectedLearner.bio}
+                  </div>
+                )}
+                {selectedLearner.suspensionReason && (
+                  <div style={{ marginTop: 8, color: "#DC2626", fontWeight: 600 }}>
+                    ⚠️ Suspension Reason: {selectedLearner.suspensionReason}
+                  </div>
+                )}
+              </div>
+
+              {/* Action Buttons */}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 20 }}>
+                <button
+                  className="btn btn-outline btn-sm"
+                  onClick={() => {
+                    setEditLearnerForm({
+                      targetUid: selectedLearner.id,
+                      fullName: selectedLearner.fullName || selectedLearner.name,
+                      phoneNumber: selectedLearner.phoneNumber || selectedLearner.phone || "",
+                      bio: selectedLearner.bio || "",
+                      studentType: selectedLearner.studentType || "non_corper",
+                      nyscStateCode: selectedLearner.nyscStateCode || selectedLearner.nyscCode || "",
+                    });
+                    setShowEditLearnerModal(true);
+                  }}
+                >
+                  Edit Profile
+                </button>
+
+                <button
+                  className="btn btn-outline btn-sm"
+                  onClick={() => setShowManualEnrollModal(true)}
+                >
+                  + Manually Enroll in Course
+                </button>
+
+                {selectedLearner.status === "suspended" ? (
+                  <button
+                    className="btn btn-outline btn-sm"
+                    style={{ color: "#16A34A" }}
+                    onClick={() => handleReactivateLearner(selectedLearner)}
+                  >
+                    Reactivate Account
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-outline btn-sm"
+                    style={{ color: "#DC2626" }}
+                    onClick={() => {
+                      setSuspendTargetUser(selectedLearner);
+                      setShowSuspendModal(true);
+                    }}
+                  >
+                    Suspend Account
+                  </button>
+                )}
+              </div>
+
+              {/* Enrolled Courses & Progress */}
+              <div>
+                <h4 style={{ margin: "0 0 10px", fontSize: "1rem", fontWeight: 700 }}>
+                  Course Enrollments ({learnerEnrollments.length})
+                </h4>
+                {loadingLearnerEnrollments ? (
+                  <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>Loading course records...</div>
+                ) : learnerEnrollments.length === 0 ? (
+                  <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", fontStyle: "italic" }}>
+                    No active enrollments for this learner.
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {learnerEnrollments.map((enr) => (
+                      <div
+                        key={enr.id}
+                        style={{
+                          padding: "10px 14px",
+                          borderRadius: 8,
+                          background: "#FFFFFF",
+                          border: "1px solid var(--border-light)",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                        }}
+                      >
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>
+                            {enr.courseTitle || enr.courseId}
+                          </div>
+                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                            Progress: {enr.progressPercent || 0}% • Status: {enr.status || "active"}
+                          </div>
+                        </div>
                         <button
                           className="btn btn-outline btn-sm"
                           style={{ color: "#DC2626" }}
-                          onClick={() => handleDeleteResource(res.id, res.fileUrl)}
+                          onClick={() => handleRevokeEnrollment(enr)}
                         >
-                          Delete
+                          Revoke
                         </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
-            </div>
-          </div>
-        )}
-
-        {/* ── TAB: CELEBRATIONS & MILESTONES ──────────────────────────── */}
-        {activeTab === "celebrations" && (
-          <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 14 }}>
-              <div>
-                <h2 style={{ fontSize: "1.3rem", fontWeight: 800 }}>Celebrations &amp; Community Milestones 🎉</h2>
-                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
-                  Celebration stories and milestones submitted via the About page modal and Learner Portal. Review learner breakthroughs and community impact.
-                </p>
-              </div>
-              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {["all", "Course Completion", "Career Breakthrough", "Community Project", "Tech Innovation"].map((f) => (
-                    <button
-                      key={f}
-                      className={`filter-pill-btn ${milestoneFilter === f ? "active" : ""}`}
-                      onClick={() => setMilestoneFilter(f)}
-                    >
-                      {f === "all" ? "All Categories" : f}
-                    </button>
-                  ))}
-                </div>
-                <button
-                  className="btn btn-outline btn-sm"
-                  onClick={fetchMilestones}
-                >
-                  ↻ Refresh
-                </button>
-              </div>
-            </div>
-
-            <div className="data-table-container">
-              {loadingMilestones ? (
-                <div style={{ padding: "36px 20px", textAlign: "center", color: "var(--text-muted)" }}>
-                  Loading celebration milestones...
-                </div>
-              ) : milestones.length === 0 ? (
-                <div style={{ padding: "40px 20px", textAlign: "center", color: "var(--text-muted)", fontSize: "0.9rem" }}>
-                  No milestone submissions recorded yet. Submissions from "Celebrate a Milestone with Us" on the About page will appear here.
-                </div>
-              ) : (
-                <table className="clean-data-table">
-                  <thead>
-                    <tr>
-                      <th>Participant</th>
-                      <th>Category</th>
-                      <th>Celebration Date</th>
-                      <th>Milestone Story</th>
-                      <th>Status</th>
-                      <th style={{ textAlign: "right" }}>Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {milestones
-                      .filter((m) => {
-                        if (milestoneFilter === "all") return true;
-                        return m.category === milestoneFilter;
-                      })
-                      .map((m) => (
-                        <tr key={m.id || m.firestoreId || Math.random()}>
-                          <td>
-                            <div style={{ fontWeight: 700, color: "var(--text-primary)" }}>{m.fullName || m.name || "Learner"}</div>
-                            <div style={{ fontSize: "0.78rem", color: "var(--text-muted)" }}>{m.email || "No email provided"}</div>
-                          </td>
-                          <td>
-                            <span className="pill-badge pill-tech">
-                              {m.category || "General"}
-                            </span>
-                          </td>
-                          <td style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>
-                            {m.celebrationDate || (m.createdAt ? new Date(m.createdAt).toLocaleDateString() : "Recent")}
-                          </td>
-                          <td style={{ maxWidth: 320 }}>
-                            <p style={{
-                              fontSize: "0.85rem",
-                              color: "var(--text-secondary)",
-                              margin: 0,
-                              whiteSpace: "nowrap",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis"
-                            }}>
-                              {m.story || "No story provided."}
-                            </p>
-                          </td>
-                          <td>
-                            <span className={`pill-badge ${m.approved ? "pill-success" : "pill-creative"}`}>
-                              {m.approved ? "Approved" : "Under Review"}
-                            </span>
-                          </td>
-                          <td style={{ textAlign: "right" }}>
-                            <button
-                              className="btn btn-outline btn-sm"
-                              onClick={() => setSelectedMilestoneModal(m)}
-                            >
-                              Read Story &rarr;
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ── CELEBRATION STORY DETAIL MODAL ──────────────────────────── */}
-        {selectedMilestoneModal && (
-          <div className="modal-backdrop-overlay" onClick={() => setSelectedMilestoneModal(null)}>
-            <div className="modal-dialog-box" style={{ maxWidth: 620 }} onClick={(e) => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
-                <div>
-                  <span className="pill-badge pill-success" style={{ marginBottom: 4 }}>🎉 CELEBRATION MILESTONE</span>
-                  <h3 style={{ fontSize: "1.4rem", fontWeight: 800 }}>{selectedMilestoneModal.fullName || "Community Milestone"}</h3>
-                </div>
-                <button className="btn-ghost" onClick={() => setSelectedMilestoneModal(null)}>✕</button>
-              </div>
-
-              <div className="form-grid-2col" style={{ gap: 14, marginBottom: 18 }}>
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Category</div>
-                  <div style={{ fontWeight: 700, fontSize: "0.95rem" }}>{selectedMilestoneModal.category || "Milestone"}</div>
-                </div>
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Celebration Date</div>
-                  <div style={{ fontWeight: 700, fontSize: "0.95rem" }}>{selectedMilestoneModal.celebrationDate || "Recent"}</div>
-                </div>
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Email</div>
-                  <div style={{ fontSize: "0.875rem", color: "var(--text-secondary)" }}>{selectedMilestoneModal.email || "N/A"}</div>
-                </div>
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Submitted At</div>
-                  <div style={{ fontSize: "0.875rem", color: "var(--text-secondary)" }}>
-                    {selectedMilestoneModal.createdAt ? new Date(selectedMilestoneModal.createdAt).toLocaleDateString() : "Recent"}
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ marginBottom: 20 }}>
-                <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--text-primary)", marginBottom: 6 }}>
-                  Milestone Story &amp; Details:
-                </div>
-                <div style={{
-                  background: "#F8FAFC",
-                  border: "1px solid #E2E8F0",
-                  padding: 16,
-                  borderRadius: 8,
-                  fontSize: "0.9rem",
-                  lineHeight: 1.6,
-                  color: "var(--text-secondary)",
-                  whiteSpace: "pre-wrap"
-                }}>
-                  {selectedMilestoneModal.story}
-                </div>
-              </div>
-
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
-                <button
-                  type="button"
-                  className="btn btn-outline btn-sm"
-                  onClick={() => setSelectedMilestoneModal(null)}
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── USER PROFILE MODAL ──────────────────────────────────────── */}
-        {selectedUser && (
-          <div className="modal-backdrop-overlay" onClick={() => setSelectedUser(null)}>
-            <div className="modal-dialog-box" onClick={e => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                <div>
-                  <span className="pill-badge pill-tech" style={{ marginBottom: 4 }}>LEARNER RECORD</span>
-                  <h3 style={{ fontSize: "1.4rem", fontWeight: 800 }}>{selectedUser.name}</h3>
-                </div>
-                <button className="btn-ghost" onClick={() => setSelectedUser(null)}>✕</button>
-              </div>
-
-              <div className="form-grid-2col" style={{ gap: 14, marginBottom: 20 }}>
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Registration ID</div>
-                  <div style={{ fontWeight: 800, fontSize: "1.1rem" }}>{selectedUser.regId}</div>
-                </div>
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Registration Type</div>
-                  <span className={`pill-badge ${selectedUser.type === "Corper" ? "pill-success" : "pill-tech"}`}>
-                    {selectedUser.type}
-                  </span>
-                </div>
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Email Address</div>
-                  <div style={{ fontSize: "0.875rem", fontWeight: 600 }}>{selectedUser.email}</div>
-                </div>
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Phone Number</div>
-                  <div style={{ fontSize: "0.875rem", fontWeight: 600 }}>{selectedUser.phone}</div>
-                </div>
-                {selectedUser.nyscCode && (
-                  <div>
-                    <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>NYSC State Code</div>
-                    <div style={{ fontSize: "0.875rem", fontWeight: 700 }}>{selectedUser.nyscCode}</div>
+                      </div>
+                    ))}
                   </div>
                 )}
-                <div>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Account Status</div>
-                  <span className="pill-badge pill-success">{selectedUser.status}</span>
-                </div>
-              </div>
-
-              <div style={{ borderTop: "1px solid var(--border-light)", paddingTop: 16, marginBottom: 20 }}>
-                <div style={{ fontSize: "0.85rem", fontWeight: 700, marginBottom: 8 }}>Enrolled Courses</div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  {selectedUser.enrolledCourses.map((c, i) => (
-                    <div key={i} style={{ padding: "8px 12px", background: "#F8FAFC", borderRadius: 6, fontSize: "0.85rem", fontWeight: 500 }}>
-                      &bull; {c}
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-                <button
-                  className="btn btn-outline btn-sm"
-                  style={{ color: "#DC2626" }}
-                  onClick={() => handleDeleteUser(selectedUser.id, selectedUser.name)}
-                >
-                  Delete User
-                </button>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <button
-                    className="btn btn-outline btn-sm"
-                    onClick={() => {
-                      handleToggleUserStatus(selectedUser.id, selectedUser.status);
-                      setSelectedUser(null);
-                    }}
-                  >
-                    {selectedUser.status === "Active" ? "Suspend Account" : "Activate Account"}
-                  </button>
-                  <button
-                    className="btn btn-solid-dark btn-sm"
-                    onClick={() => {
-                      setCertSearchId(selectedUser.regId);
-                      setCertResult({
-                        name: selectedUser.name,
-                        regId: selectedUser.regId,
-                        course: selectedUser.enrolledCourses?.[0] || "AI Essentials & Automation",
-                        issueDate: selectedUser.date,
-                        verified: true
-                      });
-                      setSelectedUser(null);
-                      setActiveTab("certificates");
-                    }}
-                  >
-                    View Credential &rarr;
-                  </button>
-                </div>
               </div>
             </div>
           </div>
         )}
 
-        {/* ── ADD USER MODAL ──────────────────────────────────────────── */}
-        {showAddUserModal && (
-          <div className="modal-backdrop-overlay" onClick={() => setShowAddUserModal(false)}>
-            <div className="modal-dialog-box" onClick={e => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                <h3 style={{ fontSize: "1.4rem", fontWeight: 800 }}>Register New User</h3>
-                <button className="btn-ghost" onClick={() => setShowAddUserModal(false)}>✕</button>
-              </div>
-
-              <form onSubmit={handleCreateUser}>
-                <div className="form-field-group">
-                  <label className="form-field-label">Full Name (Surname First)</label>
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 2: EDIT LEARNER MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {showEditLearnerModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setShowEditLearnerModal(false)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 500 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 16px", fontSize: "1.2rem", fontWeight: 800 }}>Edit Learner Profile</h3>
+              <form onSubmit={handleSaveLearnerProfile}>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Full Name</label>
                   <input
                     type="text"
-                    required
-                    placeholder="e.g. Asuquo Samuel"
                     className="form-field-input"
-                    value={newUserForm.name}
-                    onChange={e => setNewUserForm({ ...newUserForm, name: e.target.value })}
+                    value={editLearnerForm.fullName}
+                    onChange={(e) => setEditLearnerForm({ ...editLearnerForm, fullName: e.target.value })}
+                    required
                   />
                 </div>
 
-                <div className="form-grid-2col" style={{ gap: 12 }}>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Email Address</label>
-                    <input
-                      type="email"
-                      required
-                      placeholder="user@example.com"
-                      className="form-field-input"
-                      value={newUserForm.email}
-                      onChange={e => setNewUserForm({ ...newUserForm, email: e.target.value })}
-                    />
-                  </div>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Phone Number</label>
-                    <input
-                      type="tel"
-                      required
-                      className="form-field-input"
-                      value={newUserForm.phone}
-                      onChange={e => setNewUserForm({ ...newUserForm, phone: e.target.value })}
-                    />
-                  </div>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Phone Number</label>
+                  <input
+                    type="text"
+                    className="form-field-input"
+                    value={editLearnerForm.phoneNumber}
+                    onChange={(e) => setEditLearnerForm({ ...editLearnerForm, phoneNumber: e.target.value })}
+                  />
                 </div>
 
-                <div className="form-grid-2col" style={{ gap: 12 }}>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Registration Type</label>
-                    <select
-                      className="form-field-input"
-                      value={newUserForm.type}
-                      onChange={e => setNewUserForm({ ...newUserForm, type: e.target.value })}
-                    >
-                      <option value="Corper">Corper</option>
-                      <option value="Non-Corper">Non-Corper</option>
-                    </select>
-                  </div>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Role</label>
-                    <select
-                      className="form-field-input"
-                      value={newUserForm.role}
-                      onChange={e => setNewUserForm({ ...newUserForm, role: e.target.value })}
-                    >
-                      <option value="student">Student</option>
-                      <option value="instructor">Instructor</option>
-                      <option value="admin">Admin</option>
-                    </select>
-                  </div>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Student Type</label>
+                  <select
+                    className="form-field-input"
+                    value={editLearnerForm.studentType}
+                    onChange={(e) => setEditLearnerForm({ ...editLearnerForm, studentType: e.target.value })}
+                  >
+                    <option value="non_corper">Standard (Non-Corper)</option>
+                    <option value="corper">NYSC Corper</option>
+                  </select>
                 </div>
 
-                {newUserForm.type === "Corper" && (
-                  <div className="form-field-group">
+                {editLearnerForm.studentType === "corper" && (
+                  <div className="form-field-group" style={{ marginBottom: 12 }}>
                     <label className="form-field-label">NYSC State Code</label>
                     <input
                       type="text"
-                      required
-                      placeholder="e.g. AB/24A/1000"
                       className="form-field-input"
-                      value={newUserForm.nyscCode}
-                      onChange={e => setNewUserForm({ ...newUserForm, nyscCode: e.target.value })}
+                      value={editLearnerForm.nyscStateCode}
+                      onChange={(e) => setEditLearnerForm({ ...editLearnerForm, nyscStateCode: e.target.value })}
+                      placeholder="e.g. AB/24A/1234"
                     />
                   </div>
                 )}
 
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20 }}>
-                  <button type="button" className="btn btn-outline" onClick={() => setShowAddUserModal(false)}>
-                    Cancel
-                  </button>
-                  <button type="submit" className="btn btn-solid-dark">
-                    Register User &rarr;
-                  </button>
-                </div>
-              </form>
-            </div>
-          </div>
-        )}
-
-        {/* ── TUTOR APPLICATION DETAILS MODAL ─────────────────────────── */}
-        {selectedAppModal && (
-          <div className="modal-backdrop-overlay" onClick={() => setSelectedAppModal(null)}>
-            <div className="modal-dialog-box" onClick={e => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                <div>
-                  <span className="pill-badge pill-tech">TUTOR APPLICATION</span>
-                  <h3 style={{ fontSize: "1.4rem", fontWeight: 800 }}>{selectedAppModal.fullName}</h3>
-                </div>
-                <button className="btn-ghost" onClick={() => setSelectedAppModal(null)}>✕</button>
-              </div>
-
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Proposed Course</div>
-                <div style={{ fontSize: "1.1rem", fontWeight: 700 }}>{selectedAppModal.courseTitle}</div>
-              </div>
-
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Description</div>
-                <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginTop: 4 }}>
-                  {selectedAppModal.courseDescription}
-                </p>
-              </div>
-
-              {selectedAppModal.syllabus && (
-                <div style={{ marginBottom: 20 }}>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Curriculum / Syllabus</div>
-                  <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginTop: 4, background: "#F8FAFC", padding: 12, borderRadius: 6 }}>
-                    {selectedAppModal.syllabus}
-                  </p>
-                </div>
-              )}
-
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
-                {selectedAppModal.status === "pending" && (
-                  <>
-                    <button
-                      className="btn btn-solid-dark btn-sm"
-                      onClick={() => {
-                        handleReviewApplication(selectedAppModal.id, "approved", selectedAppModal.applicantUid);
-                        setSelectedAppModal(null);
-                      }}
-                    >
-                      Approve &amp; Promote to Tutor
-                    </button>
-                    <button
-                      className="btn btn-outline btn-sm"
-                      style={{ color: "#DC2626" }}
-                      onClick={() => {
-                        handleReviewApplication(selectedAppModal.id, "rejected", selectedAppModal.applicantUid);
-                        setSelectedAppModal(null);
-                      }}
-                    >
-                      Reject
-                    </button>
-                  </>
-                )}
-                <button className="btn btn-outline btn-sm" onClick={() => setSelectedAppModal(null)}>
-                  Close
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ── CREATE COURSE MODAL ──────────────────────────────────────── */}
-        {showAddCourseModal && (
-          <div className="modal-backdrop-overlay" onClick={() => setShowAddCourseModal(false)}>
-            <div className="modal-dialog-box" onClick={e => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                <h3 style={{ fontSize: "1.4rem", fontWeight: 800 }}>Create New Course in Firestore</h3>
-                <button className="btn-ghost" onClick={() => setShowAddCourseModal(false)}>✕</button>
-              </div>
-
-              <form onSubmit={handleCreateCourse}>
-                <div className="form-field-group">
-                  <label className="form-field-label">Course Title</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. Next.js & TypeScript Architecture"
-                    className="form-field-input"
-                    value={newCourseForm.title}
-                    onChange={e => setNewCourseForm({ ...newCourseForm, title: e.target.value })}
-                  />
-                </div>
-
-                <div className="form-grid-2col" style={{ gap: 12 }}>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Category</label>
-                    <select
-                      className="form-field-input"
-                      value={newCourseForm.category}
-                      onChange={e => setNewCourseForm({ ...newCourseForm, category: e.target.value })}
-                    >
-                      <option>Tech &amp; Digital Skills</option>
-                      <option>Professional Skills</option>
-                      <option>Creative &amp; Design</option>
-                    </select>
-                  </div>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Category Badge</label>
-                    <input
-                      type="text"
-                      className="form-field-input"
-                      value={newCourseForm.badge}
-                      onChange={e => setNewCourseForm({ ...newCourseForm, badge: e.target.value })}
-                    />
-                  </div>
-                </div>
-
-                <div className="form-grid-2col" style={{ gap: 12 }}>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Estimated Duration</label>
-                    <input
-                      type="text"
-                      className="form-field-input"
-                      value={newCourseForm.duration}
-                      onChange={e => setNewCourseForm({ ...newCourseForm, duration: e.target.value })}
-                    />
-                  </div>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Total Modules</label>
-                    <input
-                      type="number"
-                      className="form-field-input"
-                      value={newCourseForm.modulesCount}
-                      onChange={e => setNewCourseForm({ ...newCourseForm, modulesCount: Number(e.target.value) })}
-                    />
-                  </div>
-                </div>
-
-                <div className="form-field-group">
-                  <label className="form-field-label">Description</label>
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Bio / Notes</label>
                   <textarea
                     rows={3}
-                    required
                     className="form-field-input"
-                    value={newCourseForm.description}
-                    onChange={e => setNewCourseForm({ ...newCourseForm, description: e.target.value })}
+                    value={editLearnerForm.bio}
+                    onChange={(e) => setEditLearnerForm({ ...editLearnerForm, bio: e.target.value })}
                   />
                 </div>
 
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20 }}>
-                  <button type="button" className="btn btn-outline" onClick={() => setShowAddCourseModal(false)}>
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setShowEditLearnerModal(false)}>
                     Cancel
                   </button>
-                  <button type="submit" className="btn btn-solid-dark">
-                    Publish Course &rarr;
-                  </button>
-                </div>
-              </form>
-            </div>
-          </div>
-        )}
-
-        {/* ── EDIT COURSE MODAL ────────────────────────────────────────── */}
-        {editingCourse && (
-          <div className="modal-backdrop-overlay" onClick={() => setEditingCourse(null)}>
-            <div className="modal-dialog-box" onClick={e => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                <h3 style={{ fontSize: "1.4rem", fontWeight: 800 }}>Edit Course</h3>
-                <button className="btn-ghost" onClick={() => setEditingCourse(null)}>✕</button>
-              </div>
-
-              <form onSubmit={handleSaveEditCourse}>
-                <div className="form-field-group">
-                  <label className="form-field-label">Course Title</label>
-                  <input
-                    type="text"
-                    required
-                    className="form-field-input"
-                    value={editingCourse.title}
-                    onChange={e => setEditingCourse({ ...editingCourse, title: e.target.value })}
-                  />
-                </div>
-
-                <div className="form-grid-2col" style={{ gap: 12 }}>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Duration</label>
-                    <input
-                      type="text"
-                      className="form-field-input"
-                      value={editingCourse.duration}
-                      onChange={e => setEditingCourse({ ...editingCourse, duration: e.target.value })}
-                    />
-                  </div>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Status</label>
-                    <select
-                      className="form-field-input"
-                      value={editingCourse.status}
-                      onChange={e => setEditingCourse({ ...editingCourse, status: e.target.value })}
-                    >
-                      <option value="published">Published</option>
-                      <option value="draft">Draft</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="form-field-group">
-                  <label className="form-field-label">Description</label>
-                  <textarea
-                    rows={3}
-                    required
-                    className="form-field-input"
-                    value={editingCourse.description}
-                    onChange={e => setEditingCourse({ ...editingCourse, description: e.target.value })}
-                  />
-                </div>
-
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20 }}>
-                  <button type="button" className="btn btn-outline" onClick={() => setEditingCourse(null)}>
-                    Cancel
-                  </button>
-                  <button type="submit" className="btn btn-solid-dark">
+                  <button type="submit" disabled={isProcessing} className="btn btn-solid-dark">
                     Save Changes
                   </button>
                 </div>
@@ -1947,110 +2555,690 @@ export default function AdminPanel() {
           </div>
         )}
 
-        {/* ── ISSUE CERTIFICATE MODAL ─────────────────────────────────── */}
-        {showIssueCertModal && (
-          <div className="modal-backdrop-overlay" onClick={() => setShowIssueCertModal(false)}>
-            <div className="modal-dialog-box" onClick={e => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                <h3 style={{ fontSize: "1.4rem", fontWeight: 800 }}>Award Verified Certificate</h3>
-                <button className="btn-ghost" onClick={() => setShowIssueCertModal(false)}>✕</button>
-              </div>
-
-              <form onSubmit={handleIssueCertificate}>
-                <div className="form-field-group">
-                  <label className="form-field-label">Select Student</label>
-                  <select
-                    className="form-field-input"
-                    value={issueCertForm.studentName}
-                    onChange={e => {
-                      const selected = usersList.find(u => u.name === e.target.value);
-                      setIssueCertForm({
-                        ...issueCertForm,
-                        studentName: e.target.value,
-                        regId: selected?.regId || "AS1399",
-                      });
-                    }}
-                  >
-                    <option value="">Select a student...</option>
-                    {usersList.map(u => (
-                      <option key={u.id} value={u.name}>{u.name} ({u.regId})</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="form-field-group">
-                  <label className="form-field-label">Select Course</label>
-                  <select
-                    className="form-field-input"
-                    value={issueCertForm.course}
-                    onChange={e => setIssueCertForm({ ...issueCertForm, course: e.target.value })}
-                  >
-                    {adminCourses.map(c => (
-                      <option key={c.id} value={c.title}>{c.title}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="form-field-group">
-                  <label className="form-field-label">Grade / Distinction</label>
-                  <input
-                    type="text"
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 3: SUSPEND ACCOUNT REASON MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {showSuspendModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setShowSuspendModal(false)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 10px", fontSize: "1.2rem", fontWeight: 800, color: "#DC2626" }}>
+                Suspend Account Access
+              </h3>
+              <p style={{ fontSize: "0.875rem", color: "var(--text-muted)", margin: "0 0 16px" }}>
+                Suspending will disable authentication for <strong>{suspendTargetUser?.name}</strong> and immediately revoke active sessions.
+              </p>
+              <form onSubmit={handleConfirmSuspend}>
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Reason for Suspension *</label>
+                  <textarea
+                    rows={3}
                     required
                     className="form-field-input"
-                    value={issueCertForm.grade}
-                    onChange={e => setIssueCertForm({ ...issueCertForm, grade: e.target.value })}
+                    placeholder="Document the administrative reason for this suspension..."
+                    value={suspendReasonText}
+                    onChange={(e) => setSuspendReasonText(e.target.value)}
                   />
                 </div>
 
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20 }}>
-                  <button type="button" className="btn btn-outline" onClick={() => setShowIssueCertModal(false)}>
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setShowSuspendModal(false)}>
                     Cancel
                   </button>
-                  <button type="submit" className="btn btn-solid-dark">
-                    Issue Credential &rarr;
+                  <button type="submit" disabled={isProcessing} className="btn btn-solid-dark" style={{ background: "#DC2626" }}>
+                    Confirm Suspension
                   </button>
                 </div>
               </form>
             </div>
           </div>
         )}
-        {/* ── UPLOAD RESOURCE MODAL ──────────────────────────────────── */}
-        {showAddResourceModal && (
-          <div className="modal-backdrop-overlay" onClick={() => setShowAddResourceModal(false)}>
-            <div className="modal-dialog-box" style={{ maxWidth: 600 }} onClick={(e) => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-                <div>
-                  <span className="pill-badge pill-tech" style={{ marginBottom: 4 }}>FILE &amp; MATERIAL UPLOAD</span>
-                  <h3 style={{ fontSize: "1.4rem", fontWeight: 800 }}>Upload Platform / Course Resource</h3>
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 4: MANUAL COURSE ENROLLMENT MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {showManualEnrollModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setShowManualEnrollModal(false)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 10px", fontSize: "1.2rem", fontWeight: 800 }}>
+                Grant Course Enrollment
+              </h3>
+              <p style={{ fontSize: "0.875rem", color: "var(--text-muted)", margin: "0 0 16px" }}>
+                Select an eligible course to grant official approved access to <strong>{selectedLearner?.name}</strong>.
+              </p>
+              <form onSubmit={handleManualEnrollLearner}>
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Select Course *</label>
+                  <select
+                    className="form-field-input"
+                    required
+                    value={enrollTargetCourseId}
+                    onChange={(e) => setEnrollTargetCourseId(e.target.value)}
+                  >
+                    <option value="">-- Choose Course --</option>
+                    {adminCourses.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.title}
+                      </option>
+                    ))}
+                  </select>
                 </div>
-                <button className="btn-ghost" onClick={() => setShowAddResourceModal(false)}>✕</button>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setShowManualEnrollModal(false)}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={isProcessing || !enrollTargetCourseId} className="btn btn-solid-dark">
+                    Grant Enrollment
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 5: ASSIGN COURSE TO TUTOR MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {showCourseAssignModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setShowCourseAssignModal(false)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 10px", fontSize: "1.2rem", fontWeight: 800 }}>
+                Assign Course to Instructor
+              </h3>
+              <p style={{ fontSize: "0.875rem", color: "var(--text-muted)", margin: "0 0 16px" }}>
+                Assigning a course allows <strong>{selectedTutor?.name}</strong> to manage lessons, resources, and student submissions for that course.
+              </p>
+              <form onSubmit={handleAssignCourseToTutor}>
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Select Course to Assign *</label>
+                  <select
+                    className="form-field-input"
+                    required
+                    value={assignCourseSelectId}
+                    onChange={(e) => setAssignCourseSelectId(e.target.value)}
+                  >
+                    <option value="">-- Choose Course --</option>
+                    {adminCourses.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.title}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setShowCourseAssignModal(false)}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={isProcessing || !assignCourseSelectId} className="btn btn-solid-dark">
+                    Assign Course
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 6: APPLICATION DETAIL REVIEW MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {selectedAppModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setSelectedAppModal(null)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 640 }} onClick={(e) => e.stopPropagation()}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
+                <div>
+                  <span
+                    className={`pill-badge ${
+                      selectedAppModal.status === "approved"
+                        ? "pill-success"
+                        : selectedAppModal.status === "rejected"
+                        ? "pill-danger"
+                        : "pill-warning"
+                    }`}
+                  >
+                    {selectedAppModal.status.toUpperCase()}
+                  </span>
+                  <h3 style={{ margin: "6px 0 2px", fontSize: "1.3rem", fontWeight: 800 }}>{selectedAppModal.fullName}</h3>
+                  <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>{selectedAppModal.email}</div>
+                </div>
+                <button className="btn btn-outline btn-sm" onClick={() => setSelectedAppModal(null)}>✕</button>
               </div>
 
-              <form onSubmit={handleAdminUploadResource}>
-                <div className="form-field-group">
+              <div style={{ background: "var(--bg-main)", padding: 16, borderRadius: 8, marginBottom: 16, fontSize: "0.875rem" }}>
+                <div style={{ marginBottom: 10 }}>
+                  <strong>Proposed Course:</strong> {selectedAppModal.courseTitle} ({selectedAppModal.category})
+                </div>
+                {selectedAppModal.courseDescription && (
+                  <div style={{ marginBottom: 10 }}>
+                    <strong>Course Description:</strong>
+                    <p style={{ margin: "4px 0 0", color: "var(--text-secondary)" }}>{selectedAppModal.courseDescription}</p>
+                  </div>
+                )}
+                {selectedAppModal.learningOutcomes && (
+                  <div style={{ marginBottom: 10 }}>
+                    <strong>Learning Outcomes:</strong>
+                    <p style={{ margin: "4px 0 0", color: "var(--text-secondary)" }}>{selectedAppModal.learningOutcomes}</p>
+                  </div>
+                )}
+                {selectedAppModal.syllabus && (
+                  <div>
+                    <strong>Syllabus Structure:</strong>
+                    <pre style={{ margin: "4px 0 0", background: "#FFFFFF", padding: 10, borderRadius: 6, fontSize: "0.8rem", whiteSpace: "pre-wrap" }}>
+                      {selectedAppModal.syllabus}
+                    </pre>
+                  </div>
+                )}
+                {selectedAppModal.rejectionReason && (
+                  <div style={{ marginTop: 10, color: "#DC2626" }}>
+                    <strong>Rejection Reason:</strong> {selectedAppModal.rejectionReason}
+                  </div>
+                )}
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                {selectedAppModal.status === "pending" && (
+                  <>
+                    <button
+                      className="btn btn-outline"
+                      style={{ color: "#DC2626" }}
+                      onClick={() => {
+                        setRejectModalApp(selectedAppModal);
+                        setRejectionReasonText("");
+                      }}
+                    >
+                      Reject Application
+                    </button>
+                    <button
+                      className="btn btn-solid-dark"
+                      disabled={isProcessing}
+                      onClick={() => handleApproveApplication(selectedAppModal)}
+                    >
+                      Approve &amp; Promote to Tutor
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 7: REJECT APPLICATION REASON MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {rejectModalApp && (
+          <div className="modal-backdrop-overlay" onClick={() => setRejectModalApp(null)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 10px", fontSize: "1.2rem", fontWeight: 800, color: "#DC2626" }}>
+                Reject Instructor Application
+              </h3>
+              <p style={{ fontSize: "0.875rem", color: "var(--text-muted)", margin: "0 0 16px" }}>
+                Provide feedback or a reason for applicant <strong>{rejectModalApp.fullName}</strong>.
+              </p>
+              <form onSubmit={handleConfirmRejectApplication}>
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Rejection Reason *</label>
+                  <textarea
+                    rows={3}
+                    required
+                    className="form-field-input"
+                    placeholder="Enter the reason why this application was not accepted..."
+                    value={rejectionReasonText}
+                    onChange={(e) => setRejectionReasonText(e.target.value)}
+                  />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setRejectModalApp(null)}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={isProcessing} className="btn btn-solid-dark" style={{ background: "#DC2626" }}>
+                    Confirm Rejection
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 8: CREATE COURSE MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {showAddCourseModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setShowAddCourseModal(false)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 580 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 16px", fontSize: "1.3rem", fontWeight: 800 }}>Create New Course</h3>
+              <form onSubmit={handleCreateCourse}>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Course Title *</label>
+                  <input
+                    type="text"
+                    required
+                    className="form-field-input"
+                    value={newCourseForm.title}
+                    onChange={(e) => setNewCourseForm({ ...newCourseForm, title: e.target.value })}
+                    placeholder="e.g. Applied Generative AI & Automation"
+                  />
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                  <div className="form-field-group">
+                    <label className="form-field-label">Category</label>
+                    <select
+                      className="form-field-input"
+                      value={newCourseForm.category}
+                      onChange={(e) => setNewCourseForm({ ...newCourseForm, category: e.target.value })}
+                    >
+                      <option>Tech &amp; Digital Skills</option>
+                      <option>Professional Skills</option>
+                      <option>Creative &amp; Design</option>
+                      <option>NYSC Guides</option>
+                    </select>
+                  </div>
+
+                  <div className="form-field-group">
+                    <label className="form-field-label">Level</label>
+                    <select
+                      className="form-field-input"
+                      value={newCourseForm.level}
+                      onChange={(e) => setNewCourseForm({ ...newCourseForm, level: e.target.value })}
+                    >
+                      <option>Beginner</option>
+                      <option>Intermediate</option>
+                      <option>Advanced</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                  <div className="form-field-group">
+                    <label className="form-field-label">Duration</label>
+                    <input
+                      type="text"
+                      className="form-field-input"
+                      value={newCourseForm.duration}
+                      onChange={(e) => setNewCourseForm({ ...newCourseForm, duration: e.target.value })}
+                      placeholder="e.g. 8h 30m"
+                    />
+                  </div>
+
+                  <div className="form-field-group">
+                    <label className="form-field-label">Assign Instructor</label>
+                    <select
+                      className="form-field-input"
+                      value={newCourseForm.tutorId}
+                      onChange={(e) => setNewCourseForm({ ...newCourseForm, tutorId: e.target.value })}
+                    >
+                      <option value="">-- Unassigned --</option>
+                      {approvedTutors.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Course Description</label>
+                  <textarea
+                    rows={3}
+                    className="form-field-input"
+                    value={newCourseForm.description}
+                    onChange={(e) => setNewCourseForm({ ...newCourseForm, description: e.target.value })}
+                    placeholder="Brief description of the course..."
+                  />
+                </div>
+
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Thumbnail Image URL</label>
+                  <input
+                    type="url"
+                    className="form-field-input"
+                    value={newCourseForm.image}
+                    onChange={(e) => setNewCourseForm({ ...newCourseForm, image: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setShowAddCourseModal(false)}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={isProcessing} className="btn btn-solid-dark">
+                    Publish Course
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 9: EDIT COURSE MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {editingCourse && (
+          <div className="modal-backdrop-overlay" onClick={() => setEditingCourse(null)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 540 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 16px", fontSize: "1.2rem", fontWeight: 800 }}>Edit Course: {editingCourse.title}</h3>
+              <form onSubmit={handleSaveEditCourse}>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Course Title *</label>
+                  <input
+                    type="text"
+                    required
+                    className="form-field-input"
+                    value={editingCourse.title}
+                    onChange={(e) => setEditingCourse({ ...editingCourse, title: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                  <div className="form-field-group">
+                    <label className="form-field-label">Category</label>
+                    <select
+                      className="form-field-input"
+                      value={editingCourse.category || "Tech & Digital Skills"}
+                      onChange={(e) => setEditingCourse({ ...editingCourse, category: e.target.value })}
+                    >
+                      <option>Tech &amp; Digital Skills</option>
+                      <option>Professional Skills</option>
+                      <option>Creative &amp; Design</option>
+                      <option>NYSC Guides</option>
+                    </select>
+                  </div>
+
+                  <div className="form-field-group">
+                    <label className="form-field-label">Status</label>
+                    <select
+                      className="form-field-input"
+                      value={editingCourse.status || "published"}
+                      onChange={(e) => setEditingCourse({ ...editingCourse, status: e.target.value })}
+                    >
+                      <option value="published">Published</option>
+                      <option value="draft">Draft</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                  <div className="form-field-group">
+                    <label className="form-field-label">Assign Instructor</label>
+                    <select
+                      className="form-field-input"
+                      value={editingCourse.tutorId || ""}
+                      onChange={(e) => setEditingCourse({ ...editingCourse, tutorId: e.target.value })}
+                    >
+                      <option value="">-- Unassigned --</option>
+                      {approvedTutors.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="form-field-group">
+                    <label className="form-field-label">Duration</label>
+                    <input
+                      type="text"
+                      className="form-field-input"
+                      value={editingCourse.duration || ""}
+                      onChange={(e) => setEditingCourse({ ...editingCourse, duration: e.target.value })}
+                    />
+                  </div>
+                </div>
+
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Description</label>
+                  <textarea
+                    rows={3}
+                    className="form-field-input"
+                    value={editingCourse.description || ""}
+                    onChange={(e) => setEditingCourse({ ...editingCourse, description: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setEditingCourse(null)}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={isProcessing} className="btn btn-solid-dark">
+                    Save Changes
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 10: CREATE / EDIT ANNOUNCEMENT MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {showAnnouncementModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setShowAnnouncementModal(false)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 540 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 16px", fontSize: "1.2rem", fontWeight: 800 }}>
+                {editingAnnouncement ? "Edit Announcement" : "Create New Announcement"}
+              </h3>
+              <form onSubmit={handleSaveAnnouncement}>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Announcement Title *</label>
+                  <input
+                    type="text"
+                    required
+                    className="form-field-input"
+                    placeholder="e.g. Scheduled Live Q&A Session This Friday"
+                    value={announcementForm.title}
+                    onChange={(e) => setAnnouncementForm({ ...announcementForm, title: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                  <div className="form-field-group">
+                    <label className="form-field-label">Target Audience</label>
+                    <select
+                      className="form-field-input"
+                      value={announcementForm.audience}
+                      onChange={(e) => setAnnouncementForm({ ...announcementForm, audience: e.target.value })}
+                    >
+                      <option value="all">All Platform Users</option>
+                      <option value="learners">Learners Only</option>
+                      <option value="tutors">Instructors Only</option>
+                      <option value="course">Specific Course Enrollees</option>
+                    </select>
+                  </div>
+
+                  <div className="form-field-group">
+                    <label className="form-field-label">Priority</label>
+                    <select
+                      className="form-field-input"
+                      value={announcementForm.priority}
+                      onChange={(e) => setAnnouncementForm({ ...announcementForm, priority: e.target.value })}
+                    >
+                      <option value="normal">Normal</option>
+                      <option value="high">High</option>
+                      <option value="urgent">Urgent Alert</option>
+                    </select>
+                  </div>
+                </div>
+
+                {announcementForm.audience === "course" && (
+                  <div className="form-field-group" style={{ marginBottom: 12 }}>
+                    <label className="form-field-label">Target Course *</label>
+                    <select
+                      className="form-field-input"
+                      required
+                      value={announcementForm.courseId}
+                      onChange={(e) => setAnnouncementForm({ ...announcementForm, courseId: e.target.value })}
+                    >
+                      <option value="">-- Choose Course --</option>
+                      {adminCourses.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.title}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Announcement Message Body *</label>
+                  <textarea
+                    rows={4}
+                    required
+                    className="form-field-input"
+                    placeholder="Write announcement body..."
+                    value={announcementForm.body}
+                    onChange={(e) => setAnnouncementForm({ ...announcementForm, body: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 16 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: "0.875rem" }}>
+                    <input
+                      type="checkbox"
+                      checked={announcementForm.pinned}
+                      onChange={(e) => setAnnouncementForm({ ...announcementForm, pinned: e.target.checked })}
+                    />
+                    <span>Pin Announcement to Top</span>
+                  </label>
+
+                  <select
+                    className="form-field-input"
+                    style={{ width: "auto" }}
+                    value={announcementForm.status}
+                    onChange={(e) => setAnnouncementForm({ ...announcementForm, status: e.target.value })}
+                  >
+                    <option value="published">Publish Immediately</option>
+                    <option value="draft">Save as Draft</option>
+                  </select>
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setShowAnnouncementModal(false)}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={isProcessing} className="btn btn-solid-dark">
+                    Publish Announcement
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 11: SEND NOTIFICATION MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {showSendNotifModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setShowSendNotifModal(false)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 500 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 16px", fontSize: "1.2rem", fontWeight: 800 }}>Dispatch In-App Notification</h3>
+              <form onSubmit={handleSendNotification}>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Target Audience *</label>
+                  <select
+                    className="form-field-input"
+                    value={notifForm.target}
+                    onChange={(e) => setNotifForm({ ...notifForm, target: e.target.value })}
+                  >
+                    <option value="all_learners">All Registered Learners</option>
+                    <option value="all_tutors">All Approved Instructors</option>
+                    <option value="course">Students in Specific Course</option>
+                    <option value="single_user">Single User (by UID)</option>
+                  </select>
+                </div>
+
+                {notifForm.target === "course" && (
+                  <div className="form-field-group" style={{ marginBottom: 12 }}>
+                    <label className="form-field-label">Target Course *</label>
+                    <select
+                      className="form-field-input"
+                      required
+                      value={notifForm.targetId}
+                      onChange={(e) => setNotifForm({ ...notifForm, targetId: e.target.value, courseId: e.target.value })}
+                    >
+                      <option value="">-- Choose Course --</option>
+                      {adminCourses.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.title}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {notifForm.target === "single_user" && (
+                  <div className="form-field-group" style={{ marginBottom: 12 }}>
+                    <label className="form-field-label">Recipient User UID *</label>
+                    <input
+                      type="text"
+                      required
+                      className="form-field-input"
+                      placeholder="Paste target user UID..."
+                      value={notifForm.targetId}
+                      onChange={(e) => setNotifForm({ ...notifForm, targetId: e.target.value })}
+                    />
+                  </div>
+                )}
+
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Notification Title *</label>
+                  <input
+                    type="text"
+                    required
+                    className="form-field-input"
+                    placeholder="e.g. New Learning Material Available"
+                    value={notifForm.title}
+                    onChange={(e) => setNotifForm({ ...notifForm, title: e.target.value })}
+                  />
+                </div>
+
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Notification Body *</label>
+                  <textarea
+                    rows={3}
+                    required
+                    className="form-field-input"
+                    placeholder="Enter message content..."
+                    value={notifForm.body}
+                    onChange={(e) => setNotifForm({ ...notifForm, body: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setShowSendNotifModal(false)}>
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={isProcessing} className="btn btn-solid-dark">
+                    Dispatch Now
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 12: UPLOAD RESOURCE MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {showAddResourceModal && (
+          <div className="modal-backdrop-overlay" onClick={() => setShowAddResourceModal(false)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 16px", fontSize: "1.2rem", fontWeight: 800 }}>Upload Resource</h3>
+              <form onSubmit={handleUploadResource}>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
                   <label className="form-field-label">Resource Title *</label>
                   <input
                     type="text"
                     required
-                    placeholder="e.g. 2025 AI Tools & Automation Cheatsheet"
                     className="form-field-input"
+                    placeholder="e.g. 2025 AI Cheatsheet & Prompts"
                     value={newResourceForm.title}
                     onChange={(e) => setNewResourceForm({ ...newResourceForm, title: e.target.value })}
                   />
                 </div>
 
-                <div className="form-field-group">
-                  <label className="form-field-label">Description</label>
-                  <textarea
-                    rows={2}
-                    placeholder="Brief description of this material..."
-                    className="form-field-input"
-                    value={newResourceForm.description}
-                    onChange={(e) => setNewResourceForm({ ...newResourceForm, description: e.target.value })}
-                  />
-                </div>
-
-                <div className="form-grid-2col" style={{ gap: 12 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
                   <div className="form-field-group">
                     <label className="form-field-label">Target Audience / Course</label>
                     <select
@@ -2058,10 +3246,10 @@ export default function AdminPanel() {
                       value={newResourceForm.courseId}
                       onChange={(e) => setNewResourceForm({ ...newResourceForm, courseId: e.target.value })}
                     >
-                      <option value="platform">Platform-Wide (All Users)</option>
+                      <option value="platform">Platform-Wide (All)</option>
                       {adminCourses.map((c) => (
                         <option key={c.id} value={c.id}>
-                          Course: {c.title}
+                          {c.title}
                         </option>
                       ))}
                     </select>
@@ -2082,37 +3270,82 @@ export default function AdminPanel() {
                   </div>
                 </div>
 
-                <div className="form-grid-2col" style={{ gap: 12 }}>
-                  <div className="form-field-group">
-                    <label className="form-field-label">Upload File (PDF, ZIP, DOC, IMG)</label>
-                    <input
-                      type="file"
-                      style={{ fontSize: "0.85rem", width: "100%", marginTop: 4 }}
-                      onChange={(e) => setNewResourceForm({ ...newResourceForm, file: e.target.files[0] || null })}
-                    />
-                  </div>
-
-                  <div className="form-field-group">
-                    <label className="form-field-label">Or External Link (Drive, Figma, GitHub)</label>
-                    <input
-                      type="url"
-                      placeholder="https://..."
-                      className="form-field-input"
-                      value={newResourceForm.externalUrl}
-                      onChange={(e) => setNewResourceForm({ ...newResourceForm, externalUrl: e.target.value })}
-                    />
-                  </div>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Upload File (PDF, ZIP, DOC, PNG)</label>
+                  <input
+                    type="file"
+                    style={{ fontSize: "0.85rem", width: "100%", marginTop: 4 }}
+                    onChange={(e) => setNewResourceForm({ ...newResourceForm, file: e.target.files[0] || null })}
+                  />
                 </div>
 
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 24 }}>
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Or External URL (Google Drive, Figma, GitHub)</label>
+                  <input
+                    type="url"
+                    className="form-field-input"
+                    placeholder="https://..."
+                    value={newResourceForm.externalUrl}
+                    onChange={(e) => setNewResourceForm({ ...newResourceForm, externalUrl: e.target.value })}
+                  />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
                   <button type="button" className="btn btn-outline" onClick={() => setShowAddResourceModal(false)}>
                     Cancel
                   </button>
-                  <button type="submit" disabled={isUploadingResource} className="btn btn-solid-dark">
-                    {isUploadingResource ? "Uploading..." : "Publish Resource →"}
+                  <button type="submit" disabled={isProcessing} className="btn btn-solid-dark">
+                    Publish Resource
                   </button>
                 </div>
               </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 13: INSPECT AUDIT LOG MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {selectedAuditLog && (
+          <div className="modal-backdrop-overlay" onClick={() => setSelectedAuditLog(null)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 540 }} onClick={(e) => e.stopPropagation()}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+                <div>
+                  <span className={`pill-badge ${selectedAuditLog.badge || "pill-tech"}`}>{selectedAuditLog.action}</span>
+                  <h3 style={{ margin: "6px 0 2px", fontSize: "1.15rem", fontWeight: 800 }}>Audit Event Record</h3>
+                  <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>{selectedAuditLog.timestamp}</div>
+                </div>
+                <button className="btn btn-outline btn-sm" onClick={() => setSelectedAuditLog(null)}>✕</button>
+              </div>
+
+              <div style={{ marginBottom: 14, fontSize: "0.9rem" }}>
+                <strong>Event Summary:</strong>
+                <p style={{ margin: "4px 0 0", color: "var(--text-primary)" }}>{selectedAuditLog.detail}</p>
+              </div>
+
+              <div style={{ marginBottom: 16 }}>
+                <strong>Full Audit Payload (JSON):</strong>
+                <pre
+                  style={{
+                    margin: "6px 0 0",
+                    background: "var(--bg-main)",
+                    padding: 12,
+                    borderRadius: 8,
+                    fontSize: "0.75rem",
+                    maxHeight: 240,
+                    overflowY: "auto",
+                    border: "1px solid var(--border-light)",
+                  }}
+                >
+                  {JSON.stringify(selectedAuditLog, null, 2)}
+                </pre>
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                <button className="btn btn-outline" onClick={() => setSelectedAuditLog(null)}>
+                  Close
+                </button>
+              </div>
             </div>
           </div>
         )}
