@@ -19,6 +19,51 @@ import { httpsCallable } from "firebase/functions";
 import { db, functions } from "../firebase";
 import { COURSES_CATALOG } from "../data/courses";
 import { getResources, uploadResource, deleteResource } from "../contexts/resourcesService";
+import ErrorBoundary from "../components/ErrorBoundary";
+
+function withTimeout(promise, ms = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("FIRESTORE_REQUEST_TIMEOUT")), ms)
+    ),
+  ]);
+}
+
+function formatFirestoreDate(value, fallback = "Recent", includeTime = false) {
+  if (!value) return fallback;
+  try {
+    let dateObj = null;
+    if (typeof value.toDate === "function") {
+      dateObj = value.toDate();
+    } else if (typeof value === "object" && typeof value.seconds === "number") {
+      dateObj = new Date(value.seconds * 1000);
+    } else if (value instanceof Date) {
+      dateObj = value;
+    } else if (typeof value === "string" || typeof value === "number") {
+      const parsed = new Date(value);
+      if (!Number.isNaN(parsed.getTime())) {
+        dateObj = parsed;
+      } else if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+    if (dateObj && !Number.isNaN(dateObj.getTime())) {
+      return includeTime ? dateObj.toLocaleString() : dateObj.toLocaleDateString();
+    }
+  } catch {
+    // Fallback below
+  }
+  return fallback;
+}
+
+function getTimestampMillis(value) {
+  if (!value) return 0;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value === "object" && typeof value.seconds === "number") return value.seconds * 1000;
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
 
 export default function AdminPanel() {
   const { userProfile, currentUser } = useAuth();
@@ -38,8 +83,13 @@ export default function AdminPanel() {
     setTimeout(() => setToastMessage(""), 4000);
   }, []);
 
-  // ── Global Loading State ──────────────────────────────────────────
+  // ── Global Loading & Section Error State ──────────────────────────
   const [isProcessing, setIsProcessing] = useState(false);
+  const [sectionErrors, setSectionErrors] = useState({});
+
+  const setSectionError = useCallback((section, message) => {
+    setSectionErrors((prev) => ({ ...prev, [section]: message || null }));
+  }, []);
 
   // ══════════════════════════════════════════════════════════════════
   // 1. DATA STATE: TUTOR APPLICATIONS
@@ -54,43 +104,41 @@ export default function AdminPanel() {
 
   const fetchApplications = useCallback(async () => {
     setLoadingApps(true);
+    setSectionError("applications", null);
     try {
-      const snap = await getDocs(collection(db, "tutorApplications"));
+      const snap = await withTimeout(getDocs(collection(db, "tutorApplications")), 6000);
       const list = snap.docs.map((d) => {
-        const data = d.data();
-        let dateStr = "Recent";
-        if (data.submittedAt?.toDate) {
-          dateStr = data.submittedAt.toDate().toLocaleDateString();
-        } else if (data.createdAt?.toDate) {
-          dateStr = data.createdAt.toDate().toLocaleDateString();
-        } else if (data.submittedAt || data.createdAt) {
-          dateStr = new Date(data.submittedAt || data.createdAt).toLocaleDateString();
-        }
+        const data = d.data() || {};
+        const dateStr = formatFirestoreDate(
+          data.submittedAt || data.createdAt || data.date,
+          "Recent",
+          false
+        );
         return {
+          ...data,
           id: d.id,
-          applicantUid: data.applicantUid || data.uid,
-          fullName: data.fullName || data.name || "Instructor Applicant",
-          email: data.email || "",
-          courseTitle: data.courseTitle || "Proposed Course",
-          category: data.category || "Tech & Digital Skills",
-          courseDescription: data.courseDescription || data.description || "",
-          learningOutcomes: data.learningOutcomes || "",
-          syllabus: data.syllabus || "",
-          status: data.status || "pending",
+          applicantUid: data.applicantUid || data.uid || "",
+          fullName: String(data.fullName || data.name || "Instructor Applicant"),
+          email: String(data.email || ""),
+          courseTitle: String(data.courseTitle || "Proposed Course"),
+          category: String(data.category || "Tech & Digital Skills"),
+          courseDescription: String(data.courseDescription || data.description || ""),
+          learningOutcomes: String(data.learningOutcomes || ""),
+          syllabus: String(data.syllabus || ""),
+          status: String(data.status || "pending").toLowerCase(),
           date: dateStr,
           reviewedBy: data.reviewedBy || null,
-          rejectionReason: data.rejectionReason || null,
-          ...data,
+          rejectionReason: data.rejectionReason ? String(data.rejectionReason) : null,
         };
       });
       setApplications(list);
     } catch (err) {
       console.error("Failed to load tutor applications from Firestore:", err);
-      triggerToast("Failed to fetch tutor applications: " + err.message, "error");
+      setSectionError("applications", err.message || "Failed to load tutor applications.");
     } finally {
       setLoadingApps(false);
     }
-  }, [triggerToast]);
+  }, [setSectionError]);
 
   // ══════════════════════════════════════════════════════════════════
   // 2. DATA STATE: LEARNERS (STUDENTS) & TUTORS
@@ -125,50 +173,48 @@ export default function AdminPanel() {
 
   const fetchUsers = useCallback(async () => {
     setLoadingUsers(true);
+    setSectionError("users", null);
     try {
       const q = query(collection(db, "users"), limit(200));
-      const snap = await getDocs(q);
+      const snap = await withTimeout(getDocs(q), 6000);
       const docs = snap.docs.map((d) => {
-        const data = d.data();
-        const userName = data.fullName || data.displayName || data.email?.split("@")[0] || "User";
+        const data = d.data() || {};
+        const userName = String(
+          data.fullName || data.displayName || (typeof data.email === "string" ? data.email.split("@")[0] : "") || "User"
+        );
         const userType = data.studentType === "corper" ? "Corper" : "Non-Corper";
-        let dateStr = "Recent";
-        if (data.createdAt?.toDate) {
-          dateStr = data.createdAt.toDate().toLocaleDateString();
-        } else if (data.createdAt) {
-          dateStr = new Date(data.createdAt).toLocaleDateString();
-        }
+        const dateStr = formatFirestoreDate(data.createdAt || data.date, "Recent", false);
         return {
+          ...data,
           id: d.id,
           uid: d.id,
           name: userName,
-          fullName: data.fullName || userName,
-          email: data.email || "",
-          phone: data.phoneNumber || data.phone || "N/A",
-          phoneNumber: data.phoneNumber || data.phone || "",
+          fullName: String(data.fullName || userName),
+          email: String(data.email || ""),
+          phone: String(data.phoneNumber || data.phone || "N/A"),
+          phoneNumber: String(data.phoneNumber || data.phone || ""),
           type: userType,
-          studentType: data.studentType || "non_corper",
-          regId: data.regNumber || "Pending",
-          regNumber: data.regNumber || "Pending",
-          nyscCode: data.nyscStateCode || "",
-          nyscStateCode: data.nyscStateCode || "",
-          role: data.role || "student",
-          status: data.status || "active",
-          bio: data.bio || "",
+          studentType: String(data.studentType || "non_corper"),
+          regId: String(data.regNumber || "Pending"),
+          regNumber: String(data.regNumber || "Pending"),
+          nyscCode: String(data.nyscStateCode || ""),
+          nyscStateCode: String(data.nyscStateCode || ""),
+          role: String(data.role || "student").toLowerCase(),
+          status: String(data.status || "active").toLowerCase(),
+          bio: String(data.bio || ""),
           date: dateStr,
-          suspensionReason: data.suspensionReason || null,
+          suspensionReason: data.suspensionReason ? String(data.suspensionReason) : null,
           suspendedAt: data.suspendedAt || null,
-          ...data,
         };
       });
       setUsersList(docs);
     } catch (err) {
       console.error("Failed to load users from Firestore:", err);
-      triggerToast("Error loading users from database: " + err.message, "error");
+      setSectionError("users", err.message || "Failed to load users.");
     } finally {
       setLoadingUsers(false);
     }
-  }, [triggerToast]);
+  }, [setSectionError]);
 
   // Load individual learner's enrollments from Firestore
   const loadLearnerEnrollments = useCallback(async (uid) => {
@@ -176,8 +222,8 @@ export default function AdminPanel() {
     setLoadingLearnerEnrollments(true);
     try {
       const q = query(collection(db, "enrollments"), where("uid", "==", uid));
-      const snap = await getDocs(q);
-      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const snap = await withTimeout(getDocs(q), 5000);
+      const list = snap.docs.map((d) => ({ ...d.data(), id: d.id }));
       setLearnerEnrollments(list);
     } catch (err) {
       console.warn("Notice loading learner enrollments:", err);
@@ -225,10 +271,22 @@ export default function AdminPanel() {
 
   const fetchCourses = useCallback(async () => {
     setLoadingCourses(true);
+    setSectionError("courses", null);
     try {
-      const snap = await getDocs(collection(db, "courses"));
+      const snap = await withTimeout(getDocs(collection(db, "courses")), 6000);
       if (!snap.empty) {
-        const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        const list = snap.docs.map((d) => {
+          const data = d.data() || {};
+          return {
+            ...data,
+            id: d.id,
+            title: String(data.title || "Untitled Course"),
+            category: String(data.category || "Tech & Digital Skills"),
+            status: String(data.status || "published").toLowerCase(),
+            duration: String(data.duration || "Self-paced"),
+            description: String(data.description || ""),
+          };
+        });
         setAdminCourses(list);
       } else {
         // Fallback to catalog defaults if empty
@@ -236,11 +294,12 @@ export default function AdminPanel() {
       }
     } catch (err) {
       console.error("Failed to load courses from Firestore:", err);
-      triggerToast("Error loading courses: " + err.message, "error");
+      setSectionError("courses", err.message || "Failed to load courses.");
+      setAdminCourses((prev) => (prev.length > 0 ? prev : COURSES_CATALOG.map((c) => ({ ...c, status: "published" }))));
     } finally {
       setLoadingCourses(false);
     }
-  }, [triggerToast]);
+  }, [setSectionError]);
 
   // ══════════════════════════════════════════════════════════════════
   // 5. DATA STATE: ANNOUNCEMENTS
@@ -265,27 +324,41 @@ export default function AdminPanel() {
 
   const fetchAnnouncements = useCallback(async () => {
     setLoadingAnnouncements(true);
+    setSectionError("announcements", null);
     try {
-      const q = query(collection(db, "announcements"), orderBy("createdAt", "desc"));
-      const snap = await getDocs(q);
-      const list = snap.docs.map((d) => {
-        const data = d.data();
-        let dateStr = "Recent";
-        if (data.createdAt?.toDate) {
-          dateStr = data.createdAt.toDate().toLocaleDateString();
-        } else if (data.createdAt) {
-          dateStr = new Date(data.createdAt).toLocaleDateString();
-        }
-        return { id: d.id, ...data, date: dateStr };
-      });
+      let snap;
+      try {
+        const q = query(collection(db, "announcements"), orderBy("createdAt", "desc"));
+        snap = await withTimeout(getDocs(q), 5000);
+      } catch {
+        snap = await withTimeout(getDocs(collection(db, "announcements")), 5000);
+      }
+      const list = snap.docs
+        .map((d) => {
+          const data = d.data() || {};
+          const dateStr = formatFirestoreDate(data.createdAt || data.date, "Recent", false);
+          return {
+            ...data,
+            id: d.id,
+            title: String(data.title || "Announcement"),
+            body: String(data.body || ""),
+            status: String(data.status || "published").toLowerCase(),
+            audience: String(data.audience || "all"),
+            priority: String(data.priority || "normal"),
+            date: dateStr,
+            _sortTime: getTimestampMillis(data.createdAt),
+          };
+        })
+        .sort((a, b) => b._sortTime - a._sortTime);
       setAnnouncements(list);
     } catch (err) {
       console.warn("Notice fetching announcements:", err);
+      setSectionError("announcements", err.message || "Failed to load announcements.");
       setAnnouncements([]);
     } finally {
       setLoadingAnnouncements(false);
     }
-  }, []);
+  }, [setSectionError]);
 
   // ══════════════════════════════════════════════════════════════════
   // 6. DATA STATE: NOTIFICATIONS DISPATCH
@@ -319,8 +392,8 @@ export default function AdminPanel() {
   const fetchAdminResources = useCallback(async () => {
     setLoadingResources(true);
     try {
-      const res = await getResources("all");
-      setAdminResources(res || []);
+      const res = await withTimeout(getResources("all"), 6000);
+      setAdminResources(Array.isArray(res) ? res : []);
     } catch (err) {
       console.error("Failed to load admin resources:", err);
     } finally {
@@ -339,35 +412,42 @@ export default function AdminPanel() {
 
   const fetchAuditLogs = useCallback(async () => {
     setLoadingLogs(true);
+    setSectionError("audit", null);
     try {
-      const q = query(collection(db, "auditLogs"), orderBy("timestamp", "desc"), limit(100));
-      const snap = await getDocs(q);
-      const list = snap.docs.map((d) => {
-        const data = d.data();
-        let dateStr = "Just now";
-        if (data.timestamp?.toDate) {
-          dateStr = data.timestamp.toDate().toLocaleString();
-        } else if (data.timestamp) {
-          dateStr = new Date(data.timestamp).toLocaleString();
-        }
-        return {
-          id: d.id,
-          action: data.action || "System Event",
-          detail: data.detail || "",
-          badge: data.badge || "pill-tech",
-          timestamp: dateStr,
-          rawTimestamp: data.timestamp,
-          ...data,
-        };
-      });
+      let snap;
+      try {
+        const q = query(collection(db, "auditLogs"), orderBy("timestamp", "desc"), limit(100));
+        snap = await withTimeout(getDocs(q), 5000);
+      } catch {
+        const fallbackQ = query(collection(db, "auditLogs"), limit(100));
+        snap = await withTimeout(getDocs(fallbackQ), 5000);
+      }
+      const list = snap.docs
+        .map((d) => {
+          const data = d.data() || {};
+          const rawTs = data.timestamp || data.createdAt || null;
+          const dateStr = formatFirestoreDate(rawTs, "Just now", true);
+          return {
+            ...data,
+            id: d.id,
+            action: typeof data.action === "string" && data.action ? data.action : "System Event",
+            detail: typeof data.detail === "string" ? data.detail : "",
+            badge: typeof data.badge === "string" && data.badge ? data.badge : "pill-tech",
+            timestamp: dateStr,
+            rawTimestamp: rawTs,
+            _sortTime: getTimestampMillis(rawTs),
+          };
+        })
+        .sort((a, b) => b._sortTime - a._sortTime);
       setAuditLogs(list);
     } catch (err) {
       console.warn("Failed to load audit logs from Firestore:", err);
+      setSectionError("audit", err.message || "Failed to load audit logs.");
       setAuditLogs([]);
     } finally {
       setLoadingLogs(false);
     }
-  }, []);
+  }, [setSectionError]);
 
   // ══════════════════════════════════════════════════════════════════
   // 9. DATA STATE: PLATFORM SETTINGS
@@ -387,7 +467,7 @@ export default function AdminPanel() {
   const fetchPlatformSettings = useCallback(async () => {
     setLoadingSettings(true);
     try {
-      const docSnap = await getDoc(doc(db, "platformSettings", "general"));
+      const docSnap = await withTimeout(getDoc(doc(db, "platformSettings", "general")), 5000);
       if (docSnap.exists()) {
         setPlatformSettings((prev) => ({ ...prev, ...docSnap.data() }));
       }
@@ -1183,6 +1263,60 @@ export default function AdminPanel() {
           ))}
         </div>
 
+        {/* Non-blocking section error banner if a Firestore request for the current tab failed */}
+        {(() => {
+          const activeErrorMsg =
+            activeTab === "overview"
+              ? sectionErrors.audit
+              : activeTab === "learners" || activeTab === "tutors" || activeTab === "analytics"
+              ? sectionErrors.users
+              : sectionErrors[activeTab];
+          if (!activeErrorMsg) return null;
+          return (
+            <div
+              role="alert"
+              style={{
+                marginBottom: 20,
+                padding: "12px 16px",
+                borderRadius: 10,
+                background: "#FEF2F2",
+                border: "1px solid #FECACA",
+                color: "#991B1B",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+                fontSize: "0.875rem",
+              }}
+            >
+              <span>
+                <strong>Notice:</strong> {activeErrorMsg}
+              </span>
+              <button
+                type="button"
+                className="btn btn-outline btn-sm"
+                onClick={() => {
+                  if (activeTab === "applications") fetchApplications();
+                  else if (activeTab === "learners" || activeTab === "tutors" || activeTab === "analytics") fetchUsers();
+                  else if (activeTab === "courses") fetchCourses();
+                  else if (activeTab === "announcements") fetchAnnouncements();
+                  else if (activeTab === "resources") fetchResources();
+                  else fetchAuditLogs();
+                }}
+              >
+                Retry Request
+              </button>
+            </div>
+          );
+        })()}
+
+        <ErrorBoundary
+          inline
+          resetKeys={[activeTab]}
+          title="Unable to render this Admin Console tab"
+          message="An unexpected error occurred while displaying this tab. You can retry or switch to another tab."
+        >
         {/* ══════════════════════════════════════════════════════════════ */}
         {/* TAB 1: OVERVIEW */}
         {/* ══════════════════════════════════════════════════════════════ */}
@@ -1275,12 +1409,12 @@ export default function AdminPanel() {
                     >
                       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                         <span className={`pill-badge ${log.badge || "pill-tech"}`} style={{ fontSize: "0.75rem" }}>
-                          {log.action}
+                          {String(log.action || "System Event")}
                         </span>
-                        <span style={{ fontSize: "0.875rem", color: "var(--text-primary)" }}>{log.detail}</span>
+                        <span style={{ fontSize: "0.875rem", color: "var(--text-primary)" }}>{String(log.detail || "")}</span>
                       </div>
                       <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
-                        {log.timestamp}
+                        {typeof log.timestamp === "string" ? log.timestamp : formatFirestoreDate(log.timestamp, "Recent", true)}
                       </span>
                     </div>
                   ))}
@@ -1614,9 +1748,9 @@ export default function AdminPanel() {
                           }`}
                           style={{ fontSize: "0.75rem" }}
                         >
-                          {app.status.toUpperCase()}
+                          {(app.status || "pending").toUpperCase()}
                         </span>
-                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Submitted {app.date}</span>
+                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Submitted {String(app.date || "Recently")}</span>
                       </div>
                       <h3 style={{ margin: "0 0 2px", fontSize: "1.1rem", fontWeight: 700 }}>{app.fullName}</h3>
                       <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginBottom: 6 }}>{app.email}</div>
@@ -1859,12 +1993,12 @@ export default function AdminPanel() {
                     <div style={{ flex: 1, minWidth: 280 }}>
                       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
                         <span className={`pill-badge ${ann.status === "published" ? "pill-success" : "pill-warning"}`}>
-                          {ann.status.toUpperCase()}
+                          {(ann.status || "published").toUpperCase()}
                         </span>
-                        <span className="pill-badge pill-tech">AUDIENCE: {ann.audience?.toUpperCase() || "ALL"}</span>
+                        <span className="pill-badge pill-tech">AUDIENCE: {(ann.audience || "all").toUpperCase()}</span>
                         {ann.pinned && <span className="pill-badge pill-creative">📌 PINNED</span>}
                         {ann.priority === "urgent" && <span className="pill-badge pill-danger">URGENT</span>}
-                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Posted {ann.date}</span>
+                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Posted {String(ann.date || "Recently")}</span>
                       </div>
                       <h3 style={{ margin: "0 0 6px", fontSize: "1.15rem", fontWeight: 700 }}>{ann.title}</h3>
                       <p style={{ margin: 0, fontSize: "0.875rem", color: "var(--text-secondary)", lineHeight: 1.5, whiteSpace: "pre-line" }}>
@@ -1966,10 +2100,14 @@ export default function AdminPanel() {
                         }}
                       >
                         <div>
-                          <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>{log.detail}</div>
-                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Target: {log.target}</div>
+                          <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>{String(log.detail || "")}</div>
+                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                            Target: {typeof log.target === "string" ? log.target : "All"}
+                          </div>
                         </div>
-                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>{log.timestamp}</span>
+                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+                          {typeof log.timestamp === "string" ? log.timestamp : formatFirestoreDate(log.timestamp, "Recent", true)}
+                        </span>
                       </div>
                     ))}
                 </div>
@@ -2226,15 +2364,21 @@ export default function AdminPanel() {
                       <tr key={log.id} style={{ borderBottom: "1px solid var(--border-light)" }}>
                         <td style={{ padding: "12px 16px" }}>
                           <span className={`pill-badge ${log.badge || "pill-tech"}`} style={{ fontSize: "0.75rem" }}>
-                            {log.action}
+                            {String(log.action || "System Event")}
                           </span>
                         </td>
-                        <td style={{ padding: "12px 16px", fontSize: "0.85rem", color: "var(--text-primary)" }}>{log.detail}</td>
+                        <td style={{ padding: "12px 16px", fontSize: "0.85rem", color: "var(--text-primary)" }}>{String(log.detail || "")}</td>
                         <td style={{ padding: "12px 16px", fontSize: "0.8rem", color: "var(--text-muted)", fontFamily: "monospace" }}>
-                          {log.adminUid ? log.adminUid.slice(0, 8) + "…" : log.approvedBy ? log.approvedBy.slice(0, 8) + "…" : "system"}
+                          {typeof log.adminUid === "string" && log.adminUid
+                            ? log.adminUid.slice(0, 8) + "…"
+                            : typeof log.approvedBy === "string" && log.approvedBy
+                            ? log.approvedBy.slice(0, 8) + "…"
+                            : typeof log.uid === "string" && log.uid
+                            ? log.uid.slice(0, 8) + "…"
+                            : "system"}
                         </td>
                         <td style={{ padding: "12px 16px", fontSize: "0.8rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
-                          {log.timestamp}
+                          {typeof log.timestamp === "string" ? log.timestamp : formatFirestoreDate(log.timestamp, "Recent", true)}
                         </td>
                         <td style={{ padding: "12px 16px", textAlign: "right" }}>
                           <button
@@ -2696,7 +2840,7 @@ export default function AdminPanel() {
                         : "pill-warning"
                     }`}
                   >
-                    {selectedAppModal.status.toUpperCase()}
+                    {(selectedAppModal.status || "pending").toUpperCase()}
                   </span>
                   <h3 style={{ margin: "6px 0 2px", fontSize: "1.3rem", fontWeight: 800 }}>{selectedAppModal.fullName}</h3>
                   <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>{selectedAppModal.email}</div>
@@ -3311,16 +3455,22 @@ export default function AdminPanel() {
             <div className="modal-dialog-box" style={{ maxWidth: 540 }} onClick={(e) => e.stopPropagation()}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
                 <div>
-                  <span className={`pill-badge ${selectedAuditLog.badge || "pill-tech"}`}>{selectedAuditLog.action}</span>
+                  <span className={`pill-badge ${selectedAuditLog.badge || "pill-tech"}`}>
+                    {String(selectedAuditLog.action || "System Event")}
+                  </span>
                   <h3 style={{ margin: "6px 0 2px", fontSize: "1.15rem", fontWeight: 800 }}>Audit Event Record</h3>
-                  <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>{selectedAuditLog.timestamp}</div>
+                  <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
+                    {typeof selectedAuditLog.timestamp === "string"
+                      ? selectedAuditLog.timestamp
+                      : formatFirestoreDate(selectedAuditLog.timestamp, "Recent", true)}
+                  </div>
                 </div>
                 <button className="btn btn-outline btn-sm" onClick={() => setSelectedAuditLog(null)}>✕</button>
               </div>
 
               <div style={{ marginBottom: 14, fontSize: "0.9rem" }}>
                 <strong>Event Summary:</strong>
-                <p style={{ margin: "4px 0 0", color: "var(--text-primary)" }}>{selectedAuditLog.detail}</p>
+                <p style={{ margin: "4px 0 0", color: "var(--text-primary)" }}>{String(selectedAuditLog.detail || "")}</p>
               </div>
 
               <div style={{ marginBottom: 16 }}>
@@ -3349,6 +3499,7 @@ export default function AdminPanel() {
             </div>
           </div>
         )}
+        </ErrorBoundary>
       </div>
     </div>
   );

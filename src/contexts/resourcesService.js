@@ -204,9 +204,6 @@ export async function uploadResource({
 export async function deleteResource(resourceId, fileUrl = null) {
   if (!resourceId) return;
 
-  const existingLocal = getLocalCustomResources();
-  saveLocalCustomResources(existingLocal.filter((r) => r.id !== resourceId));
-
   try {
     await Promise.race([
       deleteDoc(doc(db, "resources", resourceId)),

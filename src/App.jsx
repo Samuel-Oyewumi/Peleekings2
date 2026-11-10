@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
 import { AuthProvider } from "./contexts/AuthContext";
 import Navbar from "./components/Navbar";
 import ProtectedRoute from "./components/ProtectedRoute";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Home from "./pages/Home";
 import "./index.css";
 
@@ -19,15 +20,35 @@ function ScrollToTop() {
   return null;
 }
 
+// Resilient lazy loader that retries once if a chunk import fails transiently
+function lazyWithRetry(importer) {
+  return lazy(async () => {
+    try {
+      const mod = await importer();
+      if (!mod || (!mod.default && typeof mod !== "function")) {
+        throw new Error("Loaded module does not export a valid React component.");
+      }
+      return mod;
+    } catch (firstErr) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const retryMod = await importer();
+      if (!retryMod || (!retryMod.default && typeof retryMod !== "function")) {
+        throw firstErr;
+      }
+      return retryMod;
+    }
+  });
+}
+
 // Lazy-loaded routes to eliminate initial bundle overhead
-const Auth = lazy(() => import("./pages/Auth"));
-const Dashboard = lazy(() => import("./pages/Dashboard"));
-const AdminPanel = lazy(() => import("./pages/AdminPanel"));
-const CoursePage = lazy(() => import("./pages/CoursePage"));
-const TeachingPortal = lazy(() => import("./pages/TeachingPortal"));
-const TeachMarketing = lazy(() => import("./pages/TeachMarketing"));
-const BecomeInstructor = lazy(() => import("./pages/BecomeInstructor"));
-const About = lazy(() => import("./pages/About"));
+const Auth = lazyWithRetry(() => import("./pages/Auth"));
+const Dashboard = lazyWithRetry(() => import("./pages/Dashboard"));
+const AdminPanel = lazyWithRetry(() => import("./pages/AdminPanel"));
+const CoursePage = lazyWithRetry(() => import("./pages/CoursePage"));
+const TeachingPortal = lazyWithRetry(() => import("./pages/TeachingPortal"));
+const TeachMarketing = lazyWithRetry(() => import("./pages/TeachMarketing"));
+const BecomeInstructor = lazyWithRetry(() => import("./pages/BecomeInstructor"));
+const About = lazyWithRetry(() => import("./pages/About"));
 
 function PageLoader() {
   return (
@@ -50,51 +71,73 @@ function WithNavbar({ children }) {
   );
 }
 
+function AppRoutes() {
+  const location = useLocation();
+
+  return (
+    <ErrorBoundary resetKeys={[location.pathname]}>
+      <Suspense fallback={<PageLoader />}>
+        <Routes>
+          {/* Auth page — standalone, no header */}
+          <Route path="/auth" element={<Auth />} />
+
+          {/* Public Marketing & Informational Routes */}
+          <Route path="/" element={<WithNavbar><Home /></WithNavbar>} />
+          <Route path="/about" element={<WithNavbar><About /></WithNavbar>} />
+          <Route path="/teach" element={<WithNavbar><TeachMarketing /></WithNavbar>} />
+
+          {/* Teaching Portal (Handles both Application form for students and Teaching Portal for tutors/admins) */}
+          <Route
+            path="/teach-portal"
+            element={<ProtectedRoute><TeachingPortal /></ProtectedRoute>}
+          />
+          <Route
+            path="/become-instructor"
+            element={<ProtectedRoute><WithNavbar><BecomeInstructor /></WithNavbar></ProtectedRoute>}
+          />
+
+          {/* Learner Portal Routes */}
+          <Route
+            path="/dashboard"
+            element={<ProtectedRoute><WithNavbar><Dashboard /></WithNavbar></ProtectedRoute>}
+          />
+          <Route
+            path="/course/:id"
+            element={<ProtectedRoute><WithNavbar><CoursePage /></WithNavbar></ProtectedRoute>}
+          />
+
+          {/* Administrator Console */}
+          <Route
+            path="/admin"
+            element={
+              <ProtectedRoute adminOnly>
+                <WithNavbar>
+                  <ErrorBoundary
+                    title="Admin Console Encountered an Error"
+                    titleBadge="ADMIN CONSOLE RECOVERY"
+                    resetKeys={[location.pathname]}
+                  >
+                    <AdminPanel />
+                  </ErrorBoundary>
+                </WithNavbar>
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Fallback route */}
+          <Route path="*" element={<WithNavbar><Home /></WithNavbar>} />
+        </Routes>
+      </Suspense>
+    </ErrorBoundary>
+  );
+}
+
 export default function App() {
   return (
     <AuthProvider>
       <BrowserRouter>
         <ScrollToTop />
-        <Suspense fallback={<PageLoader />}>
-          <Routes>
-            {/* Auth page — standalone, no header */}
-            <Route path="/auth" element={<Auth />} />
-
-            {/* Public Marketing & Informational Routes */}
-            <Route path="/" element={<WithNavbar><Home /></WithNavbar>} />
-            <Route path="/about" element={<WithNavbar><About /></WithNavbar>} />
-            <Route path="/teach" element={<WithNavbar><TeachMarketing /></WithNavbar>} />
-
-            {/* Teaching Portal (Handles both Application form for students and Teaching Portal for tutors/admins) */}
-            <Route
-              path="/teach-portal"
-              element={<ProtectedRoute><TeachingPortal /></ProtectedRoute>}
-            />
-            <Route
-              path="/become-instructor"
-              element={<ProtectedRoute><WithNavbar><BecomeInstructor /></WithNavbar></ProtectedRoute>}
-            />
-
-            {/* Learner Portal Routes */}
-            <Route
-              path="/dashboard"
-              element={<ProtectedRoute><WithNavbar><Dashboard /></WithNavbar></ProtectedRoute>}
-            />
-            <Route
-              path="/course/:id"
-              element={<ProtectedRoute><WithNavbar><CoursePage /></WithNavbar></ProtectedRoute>}
-            />
-
-            {/* Administrator Console */}
-            <Route
-              path="/admin"
-              element={<ProtectedRoute adminOnly><WithNavbar><AdminPanel /></WithNavbar></ProtectedRoute>}
-            />
-
-            {/* Fallback route */}
-            <Route path="*" element={<WithNavbar><Home /></WithNavbar>} />
-          </Routes>
-        </Suspense>
+        <AppRoutes />
       </BrowserRouter>
     </AuthProvider>
   );

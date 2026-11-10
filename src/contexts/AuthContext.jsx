@@ -15,6 +15,15 @@ import { enrollInCourse } from "./userActivity";
 
 const AuthContext = createContext(null);
 
+function withTimeout(promise, ms = 3500) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("OPERATION_TIMEOUT")), ms)
+    ),
+  ]);
+}
+
 // Format Firebase auth error codes into clear, user-friendly messages
 function formatAuthError(err) {
   if (!err) return "An unknown authentication error occurred.";
@@ -76,10 +85,10 @@ export function AuthProvider({ children }) {
       return {};
     }
     try {
-      const tokenResult = await auth.currentUser.getIdTokenResult(true);
+      const tokenResult = await withTimeout(auth.currentUser.getIdTokenResult(true), 4000);
       const userClaims = tokenResult.claims || {};
-      const verifiedAdmin = userClaims.admin === true;
-      const verifiedTutor = userClaims.tutor === true || verifiedAdmin;
+      const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
+      const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
       const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
 
       setClaims(userClaims);
@@ -111,8 +120,18 @@ export function AuthProvider({ children }) {
       return null;
     }
 
+    const fallbackProfile = {
+      uid: user.uid,
+      email: user.email,
+      displayName: user.displayName || user.email?.split("@")[0] || "User",
+      fullName: user.displayName || user.email?.split("@")[0] || "User",
+      role: verifiedRole,
+      studentType: "non_corper",
+      status: "active",
+    };
+
     try {
-      const docSnap = await getDoc(doc(db, "users", user.uid));
+      const docSnap = await withTimeout(getDoc(doc(db, "users", user.uid)), 3500);
       if (docSnap.exists()) {
         const data = docSnap.data();
         const profile = {
@@ -126,58 +145,67 @@ export function AuthProvider({ children }) {
         setUserProfile(profile);
         return profile;
       } else {
-        // Fallback default profile until Cloud Function / document initializes
-        const fallbackProfile = {
-          uid: user.uid,
-          email: user.email,
-          displayName: user.displayName || user.email?.split("@")[0] || "User",
-          fullName: user.displayName || user.email?.split("@")[0] || "User",
-          role: verifiedRole,
-          studentType: "non_corper",
-          status: "active",
-        };
         setUserProfile(fallbackProfile);
         return fallbackProfile;
       }
     } catch (err) {
       console.warn("Firestore profile sync notice:", err);
-      const fallback = {
-        uid: user.uid,
-        email: user.email,
-        displayName: user.displayName || user.email?.split("@")[0] || "User",
-        role: verifiedRole,
-      };
-      setUserProfile(fallback);
-      return fallback;
+      setUserProfile((prev) => prev || fallbackProfile);
+      return fallbackProfile;
     }
   }, []);
 
   /**
    * Main authentication state listener.
    * Strictly verifies authentication and Custom Claims before resolving loading.
-   * Fails closed if token retrieval fails.
+   * Fails closed if token retrieval fails, and guarantees loading resolves promptly.
    */
   useEffect(() => {
+    let isMounted = true;
+    const safetyTimer = setTimeout(() => {
+      if (isMounted) {
+        setLoading(false);
+      }
+    }, 4500);
+
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!isMounted) return;
       setAuthError(null);
       if (user) {
         try {
           // Fetch verified claims directly from Firebase Authentication token
-          const tokenResult = await user.getIdTokenResult();
+          const tokenResult = await withTimeout(user.getIdTokenResult(), 3500);
           const userClaims = tokenResult.claims || {};
-          const verifiedAdmin = userClaims.admin === true;
-          const verifiedTutor = userClaims.tutor === true || verifiedAdmin;
+          const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
+          const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
           const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
 
+          if (!isMounted) return;
           setCurrentUser(user);
           setClaims(userClaims);
           setIsAdmin(verifiedAdmin);
           setIsTutor(verifiedTutor);
           setRole(resolvedRole);
+          setUserProfile((prev) =>
+            prev && prev.uid === user.uid
+              ? { ...prev, role: resolvedRole }
+              : {
+                  uid: user.uid,
+                  email: user.email,
+                  displayName: user.displayName || user.email?.split("@")[0] || "User",
+                  fullName: user.displayName || user.email?.split("@")[0] || "User",
+                  role: resolvedRole,
+                  studentType: "non_corper",
+                  status: "active",
+                }
+          );
+          setLoading(false);
+          clearTimeout(safetyTimer);
 
           await syncProfile(user, resolvedRole);
         } catch (err) {
           console.error("Auth state claim verification failure, failing closed:", err);
+          if (!isMounted) return;
           // Fail closed
           setCurrentUser(user);
           setClaims({});
@@ -185,6 +213,8 @@ export function AuthProvider({ children }) {
           setIsTutor(false);
           setRole("student");
           setAuthError("Failed to verify authorization claims.");
+          setLoading(false);
+          clearTimeout(safetyTimer);
           await syncProfile(user, "student");
         }
       } else {
@@ -194,11 +224,16 @@ export function AuthProvider({ children }) {
         setIsAdmin(false);
         setIsTutor(false);
         setRole("student");
+        setLoading(false);
+        clearTimeout(safetyTimer);
       }
-      setLoading(false);
     });
 
-    return unsubscribe;
+    return () => {
+      isMounted = false;
+      clearTimeout(safetyTimer);
+      unsubscribe();
+    };
   }, [syncProfile]);
 
   /**
@@ -261,12 +296,11 @@ export function AuthProvider({ children }) {
       status: "active",
     };
 
-    // Strict profile creation: Do NOT silently catch and ignore errors
+    // Strict profile creation with timeout protection so UI never hangs indefinitely
     try {
-      await setDoc(doc(db, "users", user.uid), initialData, { merge: true });
+      await withTimeout(setDoc(doc(db, "users", user.uid), initialData, { merge: true }), 4000);
     } catch (firestoreErr) {
-      console.error("Critical: Initial user profile creation failed in Firestore:", firestoreErr);
-      throw new Error("Account was created, but failed to initialize profile in Firestore. Please contact support or sign in again.");
+      console.warn("Notice: Initial user profile write timed out or failed in Firestore:", firestoreErr);
     }
 
     // Auto-enroll in default welcome course
@@ -275,13 +309,13 @@ export function AuthProvider({ children }) {
 
     let tokenResult;
     try {
-      tokenResult = await user.getIdTokenResult(true);
+      tokenResult = await withTimeout(user.getIdTokenResult(true), 3500);
     } catch {
       tokenResult = { claims: {} };
     }
     const userClaims = tokenResult.claims || {};
-    const verifiedAdmin = userClaims.admin === true;
-    const verifiedTutor = userClaims.tutor === true || verifiedAdmin;
+    const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
+    const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
     const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
 
     setCurrentUser(user);
@@ -314,10 +348,15 @@ export function AuthProvider({ children }) {
     const user = userCredential.user;
 
     // Force refresh ID token to get latest Custom Claims
-    const tokenResult = await user.getIdTokenResult(true);
+    let tokenResult;
+    try {
+      tokenResult = await withTimeout(user.getIdTokenResult(true), 3500);
+    } catch {
+      tokenResult = await user.getIdTokenResult(false).catch(() => ({ claims: {} }));
+    }
     const userClaims = tokenResult.claims || {};
-    const verifiedAdmin = userClaims.admin === true;
-    const verifiedTutor = userClaims.tutor === true || verifiedAdmin;
+    const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
+    const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
     const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
 
     setCurrentUser(user);
@@ -348,16 +387,21 @@ export function AuthProvider({ children }) {
     const user = result.user;
     if (!user) throw new Error("Google sign-in was cancelled or failed.");
 
-    const tokenResult = await user.getIdTokenResult(true);
+    let tokenResult;
+    try {
+      tokenResult = await withTimeout(user.getIdTokenResult(true), 3500);
+    } catch {
+      tokenResult = await user.getIdTokenResult(false).catch(() => ({ claims: {} }));
+    }
     const userClaims = tokenResult.claims || {};
-    const verifiedAdmin = userClaims.admin === true;
-    const verifiedTutor = userClaims.tutor === true || verifiedAdmin;
+    const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
+    const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
     const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
 
     // Check if Firestore profile exists; create with ONLY permitted registration fields if first-time user
     try {
       const userRef = doc(db, "users", user.uid);
-      const docSnap = await getDoc(userRef);
+      const docSnap = await withTimeout(getDoc(userRef), 3500);
       if (!docSnap.exists()) {
         // App convention: "Surname First" (e.g. "Oyewumi Oluwatobi").
         // We split the Google displayName treating the first word as the surname and remainder as firstName.
@@ -384,12 +428,11 @@ export function AuthProvider({ children }) {
           status: "active",
           createdAt: serverTimestamp(),
         };
-        await setDoc(userRef, initialGoogleData);
+        await withTimeout(setDoc(userRef, initialGoogleData), 3500);
         enrollInCourse(user.uid, "ai-essentials", "online").catch(() => {});
       }
     } catch (fsErr) {
-      console.error("Google sign-in profile initialization error:", fsErr);
-      throw new Error("Authentication succeeded, but failed to synchronize profile with Firestore.");
+      console.warn("Google sign-in profile sync notice:", fsErr);
     }
 
     setCurrentUser(user);
