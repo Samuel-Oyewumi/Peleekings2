@@ -14,8 +14,10 @@ import {
   submitTest,
   getTestSubmission,
   incrementDailyActivity,
+  isEnrollmentAuthorized,
 } from "../contexts/userActivity";
 import { getResources, uploadResource } from "../contexts/resourcesService";
+import { useBodyScrollLock } from "../utils/scrollLock";
 
 function getYouTubeEmbedUrl(url) {
   if (!url) return null;
@@ -80,6 +82,15 @@ export default function CoursePage() {
   const [enrollment, setEnrollment] = useState(null);
   const [isEnrolled, setIsEnrolled] = useState(false);
   const [loadingEnrollment, setLoadingEnrollment] = useState(true);
+  const isCourseStaff = Boolean(
+    isAdmin ||
+      (isTutor &&
+        currentUser?.uid &&
+        (courseData.tutorId === currentUser.uid ||
+          (Array.isArray(courseData.assignedTutors) && courseData.assignedTutors.includes(currentUser.uid))))
+  );
+  const hasClassroomAccess = Boolean(isEnrolled || isCourseStaff);
+  const isPendingEnrollment = Boolean(enrollment && enrollment.status === "pending" && !hasClassroomAccess);
 
   const [viewMode, setViewMode] = useState(location.state?.classroom ? "classroom" : "detail");
   const [selectedExperience, setSelectedExperience] = useState("online"); // "online" or "hands-on"
@@ -93,6 +104,18 @@ export default function CoursePage() {
   const [isMuted, setIsMuted] = useState(false);
   const [toastMessage, setToastMessage] = useState("");
   const [showMobileCurriculum, setShowMobileCurriculum] = useState(false);
+
+  useBodyScrollLock(showMobileCurriculum, { mobileOnly: true, breakpoint: 1024 });
+
+  useEffect(() => {
+    function handleResize() {
+      if (window.innerWidth > 1024) {
+        setShowMobileCurriculum(false);
+      }
+    }
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   // Assignment & Test submission state
   const [assignmentContent, setAssignmentContent] = useState("");
@@ -131,6 +154,7 @@ export default function CoursePage() {
     setCurrentTestSubmission(null);
 
     async function loadDynamicCurriculum() {
+      if (!hasClassroomAccess) return;
       try {
         const modSnap = await getDocs(
           query(collection(db, "courses", courseData.id, "modules"), orderBy("order", "asc"))
@@ -217,10 +241,14 @@ export default function CoursePage() {
 
     loadDynamicCurriculum();
     return () => { isMounted = false; };
-  }, [courseData.id, courseData.tutorId]);
+  }, [courseData.id, courseData.tutorId, hasClassroomAccess]);
 
   useEffect(() => {
     async function loadAnnouncements() {
+      if (!hasClassroomAccess) {
+        setAnnouncements([]);
+        return;
+      }
       try {
         const snap = await getDocs(
           query(collection(db, "courses", courseData.id, "announcements"), orderBy("createdAt", "desc"))
@@ -228,42 +256,24 @@ export default function CoursePage() {
         if (!snap.empty) {
           setAnnouncements(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
         } else {
-          setAnnouncements([
-            {
-              id: "a1",
-              title: `Welcome to ${courseData.title}!`,
-              body: "We are thrilled to have you here. Please review the course syllabus and download lecture notes from the Resources tab.",
-              postedBy: "Peleekings Academic Team",
-              createdAt: { seconds: Date.now() / 1000 - 86400 },
-            },
-            {
-              id: "a2",
-              title: "Weekly Office Hours & Live Q&A",
-              body: "Join us this Thursday at 4 PM GMT for a live walkthrough of the capstone project requirements and assignment deliverables.",
-              postedBy: "Lead Instructor",
-              createdAt: { seconds: Date.now() / 1000 - 172800 },
-            },
-          ]);
+          setAnnouncements([]);
         }
       } catch (e) {
-        setAnnouncements([
-          {
-            id: "a1",
-            title: `Welcome to ${courseData.title}!`,
-            body: "We are thrilled to have you here. Please review the course syllabus and download lecture notes from the Resources tab.",
-            postedBy: "Peleekings Academic Team",
-            createdAt: { seconds: Date.now() / 1000 - 86400 },
-          },
-        ]);
+        console.warn("Could not load course announcements:", e);
+        setAnnouncements([]);
       }
     }
     loadAnnouncements();
-  }, [courseData.id]);
+  }, [courseData.id, hasClassroomAccess]);
 
   // Load comments from Firestore
   useEffect(() => {
     let isMounted = true;
     async function loadComments() {
+      if (!hasClassroomAccess) {
+        if (isMounted) setComments([]);
+        return;
+      }
       try {
         const snap = await getDocs(
           query(collection(db, "courses", courseData.id, "comments"), orderBy("createdAt", "desc"))
@@ -271,24 +281,18 @@ export default function CoursePage() {
         if (isMounted && !snap.empty) {
           setComments(snap.docs.map(d => ({ id: d.id, ...d.data() })));
         } else if (isMounted) {
-          // Seed with default sample comments so the UI is never empty
-          setComments([
-            { id: "c_default_1", author: "Esther James", time: "1h ago", text: "The breakdown of few-shot prompt chaining was exceptionally clear. Loved the Zapier connector pattern!" },
-            { id: "c_default_2", author: "David Okafor", time: "3h ago", text: "Are the exercise files compatible with both Windows and Mac?" },
-          ]);
+          setComments([]);
         }
       } catch (err) {
         console.warn("Could not load comments:", err);
         if (isMounted) {
-          setComments([
-            { id: "c_default_1", author: "Esther James", time: "1h ago", text: "The breakdown of few-shot prompt chaining was exceptionally clear!" },
-          ]);
+          setComments([]);
         }
       }
     }
     loadComments();
     return () => { isMounted = false; };
-  }, [courseData.id]);
+  }, [courseData.id, hasClassroomAccess]);
 
   // Query Firestore for user's enrollment
   useEffect(() => {
@@ -304,19 +308,22 @@ export default function CoursePage() {
       try {
         const enr = await getCourseEnrollment(currentUser.uid, courseData.id);
         if (isMounted) {
-          if (enr && enr.status === "active") {
+          if (enr) {
             setEnrollment(enr);
-            setIsEnrolled(true);
-            const completedSet = new Set(enr.completedItemIds || []);
-            setModules(prev =>
-              prev.map(mod => ({
-                ...mod,
-                lessons: mod.lessons.map(les => ({
-                  ...les,
-                  completed: completedSet.has(les.id)
+            const authorized = isEnrollmentAuthorized(enr);
+            setIsEnrolled(authorized);
+            if (authorized) {
+              const completedSet = new Set(enr.completedItemIds || []);
+              setModules(prev =>
+                prev.map(mod => ({
+                  ...mod,
+                  lessons: mod.lessons.map(les => ({
+                    ...les,
+                    completed: completedSet.has(les.id)
+                  }))
                 }))
-              }))
-            );
+              );
+            }
           } else {
             setEnrollment(null);
             setIsEnrolled(false);
@@ -334,10 +341,10 @@ export default function CoursePage() {
 
   // Enter classroom mode automatically if navigated from Dashboard with classroom state
   useEffect(() => {
-    if (location.state?.classroom && isEnrolled) {
+    if (location.state?.classroom && hasClassroomAccess) {
       setViewMode("classroom");
     }
-  }, [location.state?.classroom, isEnrolled]);
+  }, [location.state?.classroom, hasClassroomAccess]);
 
   // Track active study time while in classroom mode — 1 minute increments to Firestore
   useEffect(() => {
@@ -385,14 +392,16 @@ export default function CoursePage() {
   const [isUploadingResource, setIsUploadingResource] = useState(false);
 
   useEffect(() => {
-    if (courseData?.id) {
+    if (courseData?.id && hasClassroomAccess) {
       getResources(courseData.id)
         .then((res) => {
           if (res) setCourseResources(res);
         })
         .catch((err) => console.warn("Failed to load course resources:", err));
+    } else {
+      setCourseResources([]);
     }
-  }, [courseData?.id, activeTab]);
+  }, [courseData?.id, activeTab, hasClassroomAccess]);
 
   async function handleUploadCourseResource(e) {
     e.preventDefault();
@@ -493,40 +502,42 @@ export default function CoursePage() {
 
     setSelectedExperience(experienceType);
 
-    // If already enrolled in this exact format, immediately enter classroom!
-    if (isEnrolled && enrollment?.experienceType === experienceType) {
+    // If user is course staff or already has an active/approved enrollment, enter classroom
+    if (hasClassroomAccess) {
       setViewMode("classroom");
       return;
     }
 
+    if (isPendingEnrollment) {
+      triggerToast("⏳ Your enrollment request is already pending approval by an administrator or instructor.");
+      return;
+    }
+
     setIsEnrolling(true);
-
-    const enrollmentId = `${currentUser.uid}_${courseData.id}`;
-    const optimisticEnr = {
-      id: enrollmentId,
-      uid: currentUser.uid,
-      courseId: courseData.id,
-      courseTitle: courseData.title,
-      status: "active",
-      experienceType,
-      completedItemIds: enrollment?.completedItemIds || [],
-      progressPercent: enrollment?.progressPercent || 0,
-      totalLessons: modules.flatMap((m) => m.lessons).length || 8,
-      currentModule: enrollment?.currentModule || "Module 1",
-    };
-
-    setEnrollment(optimisticEnr);
-    setIsEnrolled(true);
-
-    triggerToast(`🎉 ${isEnrolled ? "Track switched to" : "Enrolled in"} ${experienceType === "online" ? "Online Classes" : "Hands-on Training"}! Entering classroom...`);
-
-    // Switch to classroom view immediately — zero lag
-    setViewMode("classroom");
-
-    // Sync in background without blocking the UI
-    enrollInCourse(currentUser.uid, courseData.id, experienceType, optimisticEnr.totalLessons)
-      .catch((err) => console.warn("Background enrollment notice:", err))
-      .finally(() => setIsEnrolling(false));
+    try {
+      const totalLessonsCount = modules.flatMap((m) => m.lessons).length || 8;
+      const createdRequest = await enrollInCourse(
+        currentUser.uid,
+        courseData.id,
+        experienceType,
+        totalLessonsCount
+      );
+      setEnrollment(createdRequest);
+      const authorizedNow = isEnrollmentAuthorized(createdRequest);
+      setIsEnrolled(authorizedNow);
+      if (authorizedNow) {
+        triggerToast("✓ Enrolled! You now have active access to the classroom.");
+      } else {
+        triggerToast(
+          "⏳ Enrollment request submitted! Your request is pending approval by an administrator or instructor."
+        );
+      }
+    } catch (err) {
+      console.warn("Enrollment request failed:", err);
+      triggerToast(err?.message || "Failed to submit enrollment request. Please try again.");
+    } finally {
+      setIsEnrolling(false);
+    }
   }
 
   async function handleAssignmentSubmit(e) {
@@ -712,7 +723,10 @@ export default function CoursePage() {
         {/* Classroom Split Layout */}
         <div className="classroom-split-layout">
           {/* Left: Collapsible Curriculum Sidebar */}
-          <aside className={`classroom-curriculum-sidebar ${showMobileCurriculum ? "mobile-open" : ""}`}>
+          <aside
+            className={`classroom-curriculum-sidebar ${showMobileCurriculum ? "mobile-open" : ""}`}
+            data-scroll-lock-scrollable="true"
+          >
             <div className="classroom-sidebar-mobile-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 20px 14px" }}>
               <span style={{ fontWeight: 800, fontSize: "0.95rem", color: "var(--text-primary)" }}>
                 Course Curriculum
@@ -727,55 +741,61 @@ export default function CoursePage() {
               </button>
             </div>
 
-            {modules.map((mod) => (
-              <div key={mod.id} className="curriculum-module-group">
-                <div className="module-header-title">
-                  {mod.title}
-                </div>
-                <div>
-                  {mod.lessons.map(lesson => {
-                    const isActive = lesson.id === activeLessonId;
-                    return (
-                      <div
-                        key={lesson.id}
-                        className={`lesson-curriculum-row ${isActive ? "active" : ""}`}
-                        onClick={() => {
-                          setActiveLessonId(lesson.id);
-                          setShowMobileCurriculum(false);
-                        }}
-                      >
-                        <div
-                          className={`lesson-check-icon ${lesson.completed ? "completed" : ""}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleLessonComplete(lesson.id);
-                          }}
-                          title={lesson.completed ? "Mark incomplete" : "Mark complete"}
-                        >
-                          &#10003;
-                        </div>
-                        <div style={{ flex: 1 }}>
-                          <div style={{ fontSize: "0.85rem", lineHeight: 1.3 }}>
-                            {lesson.title}
-                          </div>
-                          <div style={{ fontSize: "0.725rem", color: "var(--text-muted)", marginTop: 2 }}>
-                            {lesson.duration} &bull; {lesson.type}
-                          </div>
-                        </div>
-                        {isActive && (
-                          <span style={{ fontSize: "0.8rem", color: "var(--primary-learner)" }}>▶</span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
+            {modules.length === 0 ? (
+              <div style={{ padding: "24px 20px", fontSize: "0.85rem", color: "var(--text-muted)", lineHeight: 1.5 }}>
+                No modules have been published to this course yet.
               </div>
-            ))}
+            ) : (
+              modules.map((mod) => (
+                <div key={mod.id} className="curriculum-module-group">
+                  <div className="module-header-title">
+                    {mod.title}
+                  </div>
+                  <div>
+                    {mod.lessons.map(lesson => {
+                      const isActive = lesson.id === activeLessonId;
+                      return (
+                        <div
+                          key={lesson.id}
+                          className={`lesson-curriculum-row ${isActive ? "active" : ""}`}
+                          onClick={() => {
+                            setActiveLessonId(lesson.id);
+                            setShowMobileCurriculum(false);
+                          }}
+                        >
+                          <div
+                            className={`lesson-check-icon ${lesson.completed ? "completed" : ""}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleLessonComplete(lesson.id);
+                            }}
+                            title={lesson.completed ? "Mark incomplete" : "Mark complete"}
+                          >
+                            &#10003;
+                          </div>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: "0.85rem", lineHeight: 1.3 }}>
+                              {lesson.title}
+                            </div>
+                            <div style={{ fontSize: "0.725rem", color: "var(--text-muted)", marginTop: 2 }}>
+                              {lesson.duration} &bull; {lesson.type}
+                            </div>
+                          </div>
+                          {isActive && (
+                            <span style={{ fontSize: "0.8rem", color: "var(--primary-learner)" }}>▶</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))
+            )}
           </aside>
 
           {/* Right: Main Video Player & Lesson Content (Strictly Gated by Firestore Enrollment) */}
           <main className="classroom-video-main">
-            {!isEnrolled ? (
+            {!hasClassroomAccess ? (
               <div
                 style={{
                   background: "#FFFFFF",
@@ -788,28 +808,44 @@ export default function CoursePage() {
                   boxShadow: "var(--shadow-sm)",
                 }}
               >
-                <div style={{ fontSize: "3rem", marginBottom: 16 }}>🔒</div>
+                <div style={{ fontSize: "3rem", marginBottom: 16 }}>{isPendingEnrollment ? "⏳" : "🔒"}</div>
                 <h2 style={{ fontSize: "1.6rem", fontWeight: 800, marginBottom: 10, color: "var(--text-primary)" }}>
-                  Enrollment Required
+                  {isPendingEnrollment ? "Enrollment Pending Approval" : "Enrollment Required"}
                 </h2>
                 <p style={{ fontSize: "0.95rem", color: "var(--text-secondary)", lineHeight: 1.6, marginBottom: 24 }}>
-                  You are viewing the course curriculum outline. Lesson videos, downloadable exercise materials, interactive assignments, and quizzes require an active enrollment record in Firestore.
+                  {isPendingEnrollment
+                    ? "Your enrollment request has been received and is awaiting approval by a course instructor or administrator. Protected lessons, assignments, and resources will unlock once your enrollment is approved."
+                    : "You are viewing the course curriculum outline. Lesson videos, downloadable exercise materials, interactive assignments, and quizzes require an approved enrollment record."}
                 </p>
                 <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
-                  <button
-                    className="btn btn-solid-dark btn-lg"
-                    onClick={() => handleEnroll("online")}
-                    style={{ padding: "12px 28px", fontWeight: 700 }}
-                  >
-                    Enroll in Online Classes &rarr;
-                  </button>
-                  <button
-                    className="btn btn-outline btn-lg"
-                    onClick={() => handleEnroll("hands-on")}
-                    style={{ padding: "12px 28px", fontWeight: 700 }}
-                  >
-                    Enroll in Hands-on Training
-                  </button>
+                  {isPendingEnrollment ? (
+                    <button
+                      className="btn btn-outline btn-lg"
+                      onClick={() => setViewMode("detail")}
+                      style={{ padding: "12px 28px", fontWeight: 700 }}
+                    >
+                      &larr; Back to Course Overview
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        className="btn btn-solid-dark btn-lg"
+                        disabled={isEnrolling}
+                        onClick={() => handleEnroll("online")}
+                        style={{ padding: "12px 28px", fontWeight: 700 }}
+                      >
+                        {isEnrolling ? "Submitting Request..." : "Request Online Enrollment \u2192"}
+                      </button>
+                      <button
+                        className="btn btn-outline btn-lg"
+                        disabled={isEnrolling}
+                        onClick={() => handleEnroll("hands-on")}
+                        style={{ padding: "12px 28px", fontWeight: 700 }}
+                      >
+                        Request Hands-on Training
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             ) : (
@@ -1184,7 +1220,7 @@ export default function CoursePage() {
                   {activeTab === "Resources" && (
                     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                       {/* Admin & Assigned Tutor Upload Bar */}
-                      {(isAdmin || isTutor) && (
+                      {isCourseStaff && (
                         <div style={{ background: "#F8FAFC", border: "1px solid var(--border-light)", borderRadius: "var(--radius-sm)", padding: 16 }}>
                           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                             <div>
@@ -1331,7 +1367,7 @@ export default function CoursePage() {
                   {activeTab === "Announcements" && (
                     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                       {/* Tutor / Admin Post Announcement Bar */}
-                      {(isAdmin || isTutor) && (
+                      {isCourseStaff && (
                         <div style={{ background: "#F8FAFC", border: "1px solid var(--border-light)", borderRadius: "var(--radius-sm)", padding: 16 }}>
                           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                             <div>
@@ -1510,12 +1546,20 @@ export default function CoursePage() {
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-            {isEnrolled ? (
+            {hasClassroomAccess ? (
               <button
                 className="btn btn-solid-dark btn-lg"
                 onClick={() => setViewMode("classroom")}
               >
                 Enter Classroom &rarr;
+              </button>
+            ) : isPendingEnrollment ? (
+              <button
+                className="btn btn-outline btn-lg"
+                disabled
+                style={{ cursor: "default", opacity: 0.9 }}
+              >
+                ⏳ Enrollment Pending Approval
               </button>
             ) : (
               <button
@@ -1523,7 +1567,7 @@ export default function CoursePage() {
                 disabled={isEnrolling}
                 onClick={() => handleEnroll("online")}
               >
-                {isEnrolling ? "Enrolling..." : "Enroll Now"}
+                {isEnrolling ? "Submitting Request..." : "Enroll Now"}
               </button>
             )}
           </div>
@@ -1589,18 +1633,22 @@ export default function CoursePage() {
             <button
               className="btn btn-solid-dark btn-lg"
               style={{ marginTop: "auto", width: "100%" }}
-              disabled={isEnrolling}
+              disabled={isEnrolling || isPendingEnrollment}
               onClick={(e) => {
                 e.stopPropagation();
                 handleEnroll("online");
               }}
             >
-              {isEnrolled && (enrollment?.experienceType === "online" || selectedExperience === "online")
+              {hasClassroomAccess && (enrollment?.experienceType === "online" || selectedExperience === "online")
                 ? "✓ Enrolled • Enter Classroom →"
+                : isPendingEnrollment && (enrollment?.experienceType === "online" || selectedExperience === "online")
+                ? "⏳ Pending Approval (Online)"
+                : isPendingEnrollment
+                ? "⏳ Enrollment Pending Approval"
                 : isEnrolling && selectedExperience === "online"
-                ? "Enrolling..."
-                : isEnrolled
-                ? "Switch to Online →"
+                ? "Submitting Request..."
+                : hasClassroomAccess
+                ? "Enter Classroom →"
                 : "Choose Online →"}
             </button>
           </div>
@@ -1609,7 +1657,7 @@ export default function CoursePage() {
           <div
             className="experience-card"
             style={{
-              border: (isEnrolled && (enrollment?.experienceType === "hands-on" || selectedExperience === "hands-on"))
+              border: (hasClassroomAccess && (enrollment?.experienceType === "hands-on" || selectedExperience === "hands-on"))
                 ? "2px solid var(--primary-learner)"
                 : selectedExperience === "hands-on"
                 ? "2px solid #3C181A"
@@ -1646,18 +1694,22 @@ export default function CoursePage() {
             <button
               className="btn btn-solid-dark btn-lg"
               style={{ marginTop: "auto", width: "100%" }}
-              disabled={isEnrolling}
+              disabled={isEnrolling || isPendingEnrollment}
               onClick={(e) => {
                 e.stopPropagation();
                 handleEnroll("hands-on");
               }}
             >
-              {isEnrolled && (enrollment?.experienceType === "hands-on" || selectedExperience === "hands-on")
+              {hasClassroomAccess && (enrollment?.experienceType === "hands-on" || selectedExperience === "hands-on")
                 ? "✓ Enrolled • Enter Classroom →"
+                : isPendingEnrollment && (enrollment?.experienceType === "hands-on" || selectedExperience === "hands-on")
+                ? "⏳ Pending Approval (Hands-on)"
+                : isPendingEnrollment
+                ? "⏳ Enrollment Pending Approval"
                 : isEnrolling && selectedExperience === "hands-on"
-                ? "Enrolling..."
-                : isEnrolled
-                ? "Switch to Hands-on →"
+                ? "Submitting Request..."
+                : hasClassroomAccess
+                ? "Enter Classroom →"
                 : "Choose Hands-on →"}
             </button>
           </div>

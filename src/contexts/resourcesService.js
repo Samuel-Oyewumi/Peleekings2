@@ -5,6 +5,7 @@ import {
   collection,
   doc,
   addDoc,
+  getDoc,
   getDocs,
   deleteDoc,
   query,
@@ -13,64 +14,34 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
-import { db, storage } from "../firebase";
+import { httpsCallable } from "firebase/functions";
+import { db, storage, functions } from "../firebase";
 
-export const DEFAULT_RESOURCES = [
-  {
-    id: "default-1",
-    title: "2025 AI Tools & Automation Cheatsheet",
-    desc: "Top 50 prompt frameworks, API patterns, and no-code connectors.",
-    category: "Tech & Digital Skills",
-    courseId: "ai-essentials",
-    type: "PDF",
-    fileSize: "2.4 MB",
-    fileUrl: "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=600",
-    uploaderName: "Peleekings Academic Team",
-    isDefault: true,
-  },
-  {
-    id: "default-2",
-    title: "NYSC Tech Skill Acceleration Guide",
-    desc: "How corps members can build a freelance and remote career during service year.",
-    category: "Professional Skills",
-    courseId: "platform",
-    type: "PDF",
-    fileSize: "1.8 MB",
-    fileUrl: "https://images.unsplash.com/photo-1517694712202-14dd9538aa97?w=600",
-    uploaderName: "Samuel Asuquo (Admin)",
-    isDefault: true,
-  },
-  {
-    id: "default-3",
-    title: "Figma UI/UX Starter Kit & Templates",
-    desc: "Clean component library, typography scale, and color tokens.",
-    category: "Creative & Design",
-    courseId: "graphic-design",
-    type: "Design File",
-    fileSize: "8.1 MB",
-    fileUrl: "https://images.unsplash.com/photo-1581291518655-9523c932edcf?w=600",
-    uploaderName: "Lead Designer",
-    isDefault: true,
-  },
-  {
-    id: "default-4",
-    title: "Computer Basics & Shortcuts Quick Reference",
-    desc: "Master key shortcuts for Windows, file operations, and terminal basics.",
-    category: "Tech & Digital Skills",
-    courseId: "computer-basics",
-    type: "PDF",
-    fileSize: "1.2 MB",
-    fileUrl: "https://images.unsplash.com/photo-1516035069371-29a1b244cc32?w=600",
-    uploaderName: "Peleekings Instructors",
-    isDefault: true,
-  },
-];
+// Deprecated static fallback removed from live queries so empty collections or Firestore errors
+// never masquerade as published database records.
+export const DEFAULT_RESOURCES = [];
+
+/**
+ * Helper to determine if a URL or storagePath refers to a Firebase Storage object.
+ */
+export function isFirebaseStorageResource(fileUrl, storagePath) {
+  if (storagePath && typeof storagePath === "string" && storagePath.trim().length > 0) {
+    return true;
+  }
+  if (!fileUrl || typeof fileUrl !== "string") return false;
+  return (
+    fileUrl.includes("firebasestorage.googleapis.com") ||
+    fileUrl.includes(".firebasestorage.app") ||
+    fileUrl.startsWith("gs://")
+  );
+}
 
 /**
  * Fetch resources from Firestore.
- * Optionally filter by courseId ("platform", specific courseId, or "all").
+ * Returns genuine Firestore documents only (empty array when collection is empty).
+ * Throws on Firestore errors when throwOnError is true (default false for non-admin, or callers can catch).
  */
-export async function getResources(courseId = null) {
+export async function getResources(courseId = null, { throwOnError = false } = {}) {
   try {
     const resourcesCol = collection(db, "resources");
     let q;
@@ -87,34 +58,42 @@ export async function getResources(courseId = null) {
     }
 
     const snap = await getDocs(q);
-    const firestoreItems = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-    // Filter defaults matching the request
-    let filteredDefaults = DEFAULT_RESOURCES;
-    if (courseId && courseId !== "all") {
-      filteredDefaults = DEFAULT_RESOURCES.filter(
-        (r) => r.courseId === courseId || r.courseId === "platform"
-      );
-    }
-
-    const combined = [
-      ...firestoreItems,
-      ...filteredDefaults.filter((def) => !firestoreItems.some((f) => f.title === def.title)),
-    ];
-
-    return combined;
+    return snap.docs.map((d) => {
+      const data = d.data() || {};
+      let createdAtStr = "";
+      if (data.createdAt && typeof data.createdAt.toDate === "function") {
+        createdAtStr = data.createdAt.toDate().toISOString();
+      } else if (data.createdAt && typeof data.createdAt.seconds === "number") {
+        createdAtStr = new Date(data.createdAt.seconds * 1000).toISOString();
+      } else if (typeof data.createdAt === "string") {
+        createdAtStr = data.createdAt;
+      }
+      return {
+        ...data,
+        id: d.id,
+        title: typeof data.title === "string" && data.title ? data.title : "Untitled Resource",
+        desc: typeof data.desc === "string" ? data.desc : (typeof data.description === "string" ? data.description : ""),
+        category: typeof data.category === "string" && data.category ? data.category : "Tech & Digital Skills",
+        courseId: typeof data.courseId === "string" && data.courseId ? data.courseId : "platform",
+        type: typeof data.type === "string" && data.type ? data.type : "Document",
+        fileSize: typeof data.fileSize === "string" ? data.fileSize : "",
+        fileUrl: typeof data.fileUrl === "string" ? data.fileUrl : "",
+        storagePath: typeof data.storagePath === "string" ? data.storagePath : null,
+        createdAt: createdAtStr,
+      };
+    });
   } catch (err) {
-    console.warn("Notice: querying Firestore resources:", err);
-    if (courseId && courseId !== "all") {
-      return DEFAULT_RESOURCES.filter((r) => r.courseId === courseId || r.courseId === "platform");
+    console.warn("Error querying Firestore resources:", err);
+    if (throwOnError) {
+      throw err;
     }
-    return DEFAULT_RESOURCES;
+    return [];
   }
 }
 
 /**
- * Upload a resource to Firebase Storage & Firestore (with 3.5s timeout fallback).
- * Accessible to Admins and Tutors.
+ * Upload a resource to Firebase Storage & Firestore.
+ * Accessible to Admins and assigned course Tutors.
  */
 export async function uploadResource({
   file = null,
@@ -133,6 +112,7 @@ export async function uploadResource({
   let fileName = file ? file.name : title;
   let fileSize = "";
   let resourceType = "Document";
+  let uploadedStoragePath = null;
 
   if (file) {
     // Format file size
@@ -153,10 +133,10 @@ export async function uploadResource({
 
     // Firebase Storage upload
     const safeName = file.name.replace(/[^a-zA-Z0-9.-]/g, "_");
-    const storagePath = courseId && courseId !== "platform"
+    uploadedStoragePath = courseId && courseId !== "platform"
       ? `courses/${courseId}/resources/${Date.now()}_${safeName}`
       : `resources/${Date.now()}_${safeName}`;
-    const storageRef = ref(storage, storagePath);
+    const storageRef = ref(storage, uploadedStoragePath);
 
     try {
       const uploadSnapshot = await uploadBytes(storageRef, file);
@@ -176,6 +156,7 @@ export async function uploadResource({
     category: category || "General",
     courseId: courseId || "platform",
     fileUrl: downloadUrl,
+    storagePath: uploadedStoragePath,
     fileName,
     fileSize,
     type: resourceType,
@@ -187,41 +168,111 @@ export async function uploadResource({
 
   try {
     const docRef = await addDoc(collection(db, "resources"), payload);
+
+    // Record server-side audit log non-blockingly
+    try {
+      const logFn = httpsCallable(functions, "adminLogResourceAction");
+      logFn({
+        action: "uploaded",
+        resourceId: docRef.id,
+        title: payload.title,
+        courseId: payload.courseId,
+      }).catch(() => {});
+    } catch {
+      // Ignore if functions emulator not attached
+    }
+
     return {
       ...payload,
       id: docRef.id,
       createdAt: new Date().toISOString(),
     };
   } catch (fsErr) {
+    // Roll back Storage upload if Firestore metadata creation failed
+    if (uploadedStoragePath) {
+      try {
+        await deleteObject(ref(storage, uploadedStoragePath));
+      } catch (rollbackErr) {
+        console.warn("Could not roll back uploaded file after Firestore error:", rollbackErr);
+      }
+    }
     console.error("Firestore resource addDoc error:", fsErr);
     throw new Error(`Failed to save resource metadata to Firestore: ${fsErr.message}`);
   }
 }
 
 /**
- * Delete a resource from Firestore, Storage, and local cache.
+ * Reliably delete a resource from Firebase Storage and Firestore.
+ * - Inspects both storagePath and fileUrl to determine if a Storage object exists.
+ * - Preserves external links (which have no Storage object) and deletes their Firestore record cleanly.
+ * - Deletes the Storage object first; if Storage deletion fails (other than object-not-found), throws
+ *   an error before deleting the Firestore document so partial failures are never hidden.
+ * - Deletes the Firestore metadata document and throws on any Firestore error.
  */
-export async function deleteResource(resourceId, fileUrl = null) {
-  if (!resourceId) return;
-
-  try {
-    await Promise.race([
-      deleteDoc(doc(db, "resources", resourceId)),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("FIRESTORE_TIMEOUT")), 3000)),
-    ]);
-  } catch (err) {
-    console.warn("Firestore resource delete notice:", err);
+export async function deleteResource(resourceId, fileUrl = null, storagePath = null) {
+  if (!resourceId || typeof resourceId !== "string") {
+    throw new Error("A valid resourceId is required to delete a resource.");
   }
 
-  if (fileUrl && fileUrl.includes("firebasestorage.googleapis.com")) {
+  const resourceRef = doc(db, "resources", resourceId);
+  let resolvedFileUrl = fileUrl;
+  let resolvedStoragePath = storagePath;
+  let resourceTitle = resourceId;
+  let resourceCourseId = "platform";
+
+  // Fetch metadata from Firestore if storagePath/fileUrl were not supplied
+  try {
+    const snap = await getDoc(resourceRef);
+    if (snap.exists()) {
+      const data = snap.data() || {};
+      resolvedFileUrl = resolvedFileUrl || data.fileUrl || null;
+      resolvedStoragePath = resolvedStoragePath || data.storagePath || null;
+      resourceTitle = data.title || resourceId;
+      resourceCourseId = data.courseId || "platform";
+    }
+  } catch (readErr) {
+    console.warn("Could not pre-read resource document before deletion:", readErr);
+  }
+
+  // 1. Delete Storage file if this resource is backed by Firebase Storage
+  const hasStorageObject = isFirebaseStorageResource(resolvedFileUrl, resolvedStoragePath);
+  if (hasStorageObject) {
+    const targetRefPath = resolvedStoragePath || resolvedFileUrl;
     try {
-      const fileRef = ref(storage, fileUrl);
-      await Promise.race([
-        deleteObject(fileRef),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("STORAGE_TIMEOUT")), 2500)),
-      ]);
-    } catch (sErr) {
-      console.warn("Storage deletion notice:", sErr);
+      const fileRef = ref(storage, targetRefPath);
+      await deleteObject(fileRef);
+    } catch (storageErr) {
+      const code = storageErr?.code || "";
+      // If object was already deleted from Storage, proceed to clean up Firestore doc
+      if (code !== "storage/object-not-found") {
+        console.error("Storage file deletion failed:", storageErr);
+        throw new Error(
+          `Failed to delete file from Cloud Storage (${code || storageErr.message || "Storage error"}). Metadata was kept so you can retry.`
+        );
+      }
     }
   }
+
+  // 2. Delete Firestore metadata document (never swallow errors)
+  try {
+    await deleteDoc(resourceRef);
+  } catch (fsErr) {
+    console.error("Firestore resource deletion failed:", fsErr);
+    throw new Error(`Failed to delete resource record from Firestore: ${fsErr.message || "Permission or network error"}`);
+  }
+
+  // 3. Record server-controlled audit log
+  try {
+    const logFn = httpsCallable(functions, "adminLogResourceAction");
+    logFn({
+      action: "deleted",
+      resourceId,
+      title: resourceTitle,
+      courseId: resourceCourseId,
+    }).catch(() => {});
+  } catch {
+    // Ignore if functions unreachable
+  }
+
+  return { success: true, resourceId, deletedStorageObject: hasStorageObject };
 }

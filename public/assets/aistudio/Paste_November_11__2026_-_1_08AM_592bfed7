@@ -1,0 +1,810 @@
+# PELEEKINGS LMS — PHASE 2 SECURITY, BACKEND & WORKFLOW REMEDIATION
+
+## ROLE AND OBJECTIVE
+
+Act as a senior full-stack software architect and Firebase security engineer working on the Peleekings Learning Management System.
+
+Your task is to conduct an independent review of the existing codebase and implement the Phase 2 security, backend, and workflow remediations described below.
+
+This is an existing production-oriented LMS, not a demo application.
+
+**Important instructions:**
+- Do not redesign the existing UI or change the established visual identity.
+- Preserve existing working features and user workflows.
+- Do not introduce fake, mock, placeholder, or demo data to compensate for missing backend functionality.
+- Do not create unnecessary duplicate services, functions, or components.
+- Reuse and refactor existing implementations where appropriate.
+- Remove obsolete or insecure code instead of layering patches over it.
+- Maintain consistency across Firestore rules, Storage rules, Cloud Functions, services, and frontend authorization.
+- Inspect the existing implementation before making changes. Do not assume that a function or feature is missing simply because it is not mentioned here.
+- Do not deploy to production, modify production data, or execute destructive production operations.
+- Do not expose secrets, service account credentials, API keys, or privileged configuration in frontend code.
+
+The goal is to produce a secure, functional, maintainable LMS with server-authoritative permissions and consistent workflows.
+
+---
+
+# PART 1: FIREBASE STORAGE SECURITY RULES
+
+Review and update `storage.rules`.
+
+### 1.1 Enrollment verification
+
+Update `isEnrolledStudent(courseId, uid)` so that it:
+
+- Checks whether the corresponding enrollment document exists.
+- Verifies that the enrollment status is either `active` or `approved`.
+- Does not grant access based solely on the existence of an enrollment document.
+- Rejects pending, rejected, revoked, suspended, or otherwise unauthorized enrollments.
+
+### 1.2 Separate create, update, and delete permissions
+
+Review the following Storage paths:
+
+- `/users/{uid}/portrait/**`
+- `/courses/{courseId}/submissions/{uid}/**`
+- `/courses/{courseId}/resources/**`
+- `/resources/**`
+
+Separate create/update rules from delete rules.
+
+This is essential because `request.resource` is null during deletion.
+
+For create and update:
+- Validate file size.
+- Validate allowed content types.
+- Verify the user's identity and authorization.
+- Apply course-specific permissions where applicable.
+
+For delete:
+- Do not reference `request.resource`.
+- Check only the user's identity and appropriate administrative or course-specific role.
+- Prevent unauthorized users from deleting files.
+
+### 1.3 Tutor module uploads
+
+Add or correct the missing tutor module upload rule for:
+
+`/courses/{courseId}/{moduleId}/{fileName}`
+
+Permissions:
+
+**Read:**
+- Signed-in, actively enrolled students.
+- Tutors assigned to the course.
+- Administrators.
+
+**Create/update:**
+- Administrators.
+- Tutors explicitly assigned to the course.
+- Enforce file size and allowed content-type restrictions.
+
+**Delete:**
+- Administrators.
+- Tutors explicitly assigned to the course.
+
+An unassigned tutor must never gain access to another tutor's course content.
+
+Ensure the rules do not create unintended overlaps or broader access through wildcard matches.
+
+---
+
+# PART 2: FIRESTORE SECURITY RULES
+
+Review and update `firestore.rules`.
+
+### 2.1 Course visibility
+
+- Published courses may be publicly readable where appropriate.
+- Draft and unpublished courses must only be accessible to administrators and tutors assigned to those courses.
+- Students must not access unpublished course content.
+- Tutors must not read or modify courses they are not assigned to.
+
+### 2.2 Tighten `canReadCourse(courseId)`
+
+Remove any permissive condition that grants access simply because a course document does not exist.
+
+In particular, remove logic equivalent to:
+
+`!exists(coursePath)`
+
+A missing course document must not automatically authorize access.
+
+If the application still depends on legacy static catalog IDs, explicitly identify and handle those IDs without granting access to arbitrary nonexistent courses.
+
+Prefer migrating legitimate catalog courses into Firestore rather than maintaining broad missing-document exceptions.
+
+### 2.3 Enrollment creation and authorization
+
+Implement a secure hybrid enrollment workflow.
+
+The preferred architecture is **server-authoritative enrollment creation**.
+
+The frontend should call a dedicated Cloud Function, such as `requestCourseEnrollment`, rather than independently deciding whether a user qualifies for active enrollment.
+
+The Cloud Function must:
+
+1. Authenticate the requesting user.
+2. Verify that the user has an eligible learner role.
+3. Fetch the actual course document from Firestore.
+4. Reject enrollment if the course does not exist.
+5. Check whether the user is already enrolled.
+6. Determine the correct enrollment status based on the actual course configuration and experience type.
+7. Create the enrollment using a deterministic document ID:
+   `uid_courseId`
+8. Prevent duplicate enrollments and concurrent duplicate requests.
+9. Initialize progress to zero and `completedItemIds` to an empty array.
+10. Prevent users from setting privileged enrollment fields.
+
+Enrollment policy:
+
+- Hands-on enrollment requests must begin as `pending`.
+- Courses requiring approval must begin as `pending`.
+- Eligible online courses that do not require approval may begin as `active`.
+- The actual course document must exist before any enrollment can be created.
+- A missing course document must never qualify a user for automatic active enrollment.
+
+Block users from supplying or modifying privileged fields such as:
+- `role`
+- `userRole`
+- `isAdmin`
+- `isTutor`
+- `approvedBy`
+- `approvedAt`
+- `rejectedBy`
+- `rejectedAt`
+- `status` where status transitions require administrative approval
+- Any other server-managed authorization or approval fields.
+
+If a direct Firestore enrollment-create path is retained for compatibility, it must enforce the same restrictions and must not create a security gap. Do not maintain two competing enrollment authorization systems.
+
+### 2.4 Enrollment updates
+
+Remove direct enrollment status updates by assigned tutors through Firestore client writes.
+
+Enrollment status transitions must go through authorized Cloud Functions, including:
+
+- `manageEnrollmentStatus`
+- `adminManageEnrollment`
+
+Only authorized administrators or explicitly assigned tutors should be allowed to perform the actions permitted by the application's enrollment policy.
+
+Validate the target enrollment and its course assignment on the server.
+
+Students must never approve themselves, reactivate revoked access, or alter their enrollment privileges.
+
+---
+
+# PART 3: CLOUD FUNCTIONS SECURITY AND WORKFLOWS
+
+Review and update `functions/index.js` and any related Cloud Functions files.
+
+All privileged operations must be validated server-side.
+
+### 3.1 `adminLogResourceAction`
+
+Strengthen authorization.
+
+- Administrators may log authorized platform-level and course-level resource actions.
+- If the requester is a tutor rather than an administrator, require a valid `courseId`.
+- Tutors must not log platform-level resource actions.
+- Verify that the tutor is explicitly assigned to the specified course.
+- For an `uploaded` action, verify that the corresponding resource document exists at `resources/{resourceId}`.
+- Validate the resource ID, course ID, action type, and relevant metadata.
+- Do not allow users to forge the actor identity or administrative status.
+
+### 3.2 `adminSendNotification`
+
+When a notification targets a particular course:
+
+- Retrieve eligible recipients from the course's enrollment records.
+- Only send to users with `active` or `approved` enrollment status.
+- Exclude pending, rejected, revoked, and suspended enrollments.
+- Do not trust recipient IDs supplied by the frontend without validating their eligibility.
+- Prevent notification delivery to users who are not authorized to access the course.
+
+### 3.3 `adminManageCourse` — update operations
+
+When updating an existing course:
+
+- Fetch the existing course document.
+- Preserve existing fields that were not explicitly supplied for modification.
+- Do not accidentally erase important course information when a partial update is submitted.
+
+Preserve fields such as:
+
+- `tutorId`
+- `tutorName`
+- `assignedTutors`
+- `learningOutcomes`
+- `syllabus`
+- `image`
+
+If a field is explicitly included in `courseData`, validate and process it according to the relevant authorization policy.
+
+Do not let an update silently remove assigned tutors or overwrite course information with undefined or empty values.
+
+### 3.4 `adminManageCourse` — deletion operations
+
+Implement safe course deletion.
+
+Deleting a Firestore parent document does not automatically delete its subcollections.
+
+Before deleting a course, account for the following subcollections:
+
+- `modules`
+- `lessons`
+- `notes`
+- `assignments`
+- `tests`
+- `announcements`
+- `comments`
+- `resources`
+
+Also inspect the actual codebase for other course-related nested collections that may exist.
+
+Requirements:
+
+- Use recursive or explicitly controlled deletion.
+- Handle nested subcollections, not only direct children.
+- Use pagination or bounded batches for large collections.
+- Do not assume all course data fits into one Firestore batch.
+- Ensure associated Storage objects are handled where applicable.
+- Prevent partial deletion from being reported as a complete success.
+- Handle failures and retries safely.
+- Record the operation in the server-side audit log.
+- Restrict deletion to authorized administrators.
+
+Do not run this destructive operation against production data during development or testing.
+
+### 3.5 `adminAssignCourseTutor`
+
+Before assigning a tutor:
+
+- Verify that the target user exists.
+- Verify that the user has a valid tutor role or administrator role.
+- Check the user's Firestore role and, where applicable, Firebase Auth Custom Claims.
+- Reject assignment if the user is not authorized to act as a tutor.
+- Do not trust a role or tutor ID supplied by the frontend.
+- Ensure the assignment updates the course's authoritative tutor fields consistently.
+
+### 3.6 Course analytics — Stage 8
+
+Implement the Stage 8 analytics trigger:
+
+`onEnrollmentOrSubmissionWrite`
+
+Use the project specification in `peleekings-rebuild-v2.md` as the reference for course analytics.
+
+The trigger should recompute:
+
+`courses/{courseId}/analytics/summary`
+
+Required fields:
+
+- `enrollmentCount`
+- `avgTestScore`
+- `assignmentSubmissionRate`
+- `lastUpdated`
+
+Define the metrics precisely:
+
+**Enrollment count**
+- Count only active or approved enrollments.
+- Exclude pending, rejected, revoked, and suspended enrollments.
+
+**Average test score**
+- Calculate from valid, graded test submissions.
+- Exclude ungraded, invalid, or incomplete submissions according to the existing assessment model.
+- Use a consistent percentage or score scale.
+
+**Assignment submission rate**
+- Calculate submitted eligible assignment opportunities divided by eligible assignment opportunities.
+- Define how deleted assignments, withdrawn enrollments, and unavailable assignments are treated.
+- Do not use an arbitrary count of all submissions as the denominator.
+
+Trigger requirements:
+
+- Handle enrollment creation, updates, status changes, and deletion.
+- Handle test and assignment submission creation, updates, and deletion.
+- Handle duplicate event delivery safely.
+- Be idempotent.
+- Avoid double-counting.
+- Recompute from authoritative Firestore records rather than blindly incrementing counters.
+- Use server timestamps for `lastUpdated`.
+- Handle empty datasets without producing `NaN` or invalid values.
+- Avoid unbounded reads or writes where possible.
+
+If analytics collections or fields already exist, inspect and reuse the established structure instead of creating conflicting schemas.
+
+---
+
+# PART 4: SERVICE LAYER REMEDIATION
+
+Review the relevant files in `src/services/`.
+
+### 4.1 `enrollInCourse()`
+
+Review and update:
+
+`enrollInCourse(uid, courseId, experienceType, totalLessons)`
+
+The frontend service must use the server-authoritative enrollment workflow described above.
+
+Requirements:
+
+- Verify the user is authenticated.
+- Call the enrollment Cloud Function.
+- Do not independently trust frontend course configuration.
+- The Cloud Function must fetch the actual course document.
+- Hands-on courses must result in pending enrollment.
+- Courses requiring approval must result in pending enrollment.
+- Eligible online courses that do not require approval may result in active enrollment.
+- Reject nonexistent courses.
+- Prevent duplicate enrollments.
+- Do not grant course access before the enrollment is authorized.
+
+Keep the function's existing callers compatible or update all callers consistently.
+
+### 4.2 `toggleLessonCompletion()`
+
+Review progress calculation.
+
+Calculate the actual number of unique curriculum items across:
+
+- Lessons
+- Notes
+- Assignments
+- Tests
+
+Requirements:
+
+- Use canonical unique curriculum item IDs.
+- Avoid double-counting an item referenced in multiple modules or collections.
+- Ensure completed items belong to the relevant course.
+- Prevent students from marking unrelated or nonexistent course items as completed.
+- Ensure progress cannot exceed 100%.
+- Handle deleted or unavailable curriculum items consistently.
+
+Only use:
+
+`enrollmentData.totalLessons || fallbackTotalLessons`
+
+as a fallback when actual curriculum subcollections contain no records.
+
+Do not allow a stale fallback count to override an available, authoritative curriculum count.
+
+### 4.3 `submitAssignment()` and `submitTest()`
+
+Remove any `"general"` course bypass or equivalent authorization exception.
+
+Both functions must:
+
+- Require a valid `courseId`.
+- Require a valid assignment or test ID.
+- Verify that the relevant course and assessment exist.
+- Verify that the user is authenticated.
+- Verify that the user has an active or approved enrollment.
+- Reject pending, revoked, rejected, or suspended enrollments.
+- Verify that the assessment belongs to the specified course.
+- Validate submission ownership and required fields.
+- Prevent unauthorized uploads or writes.
+- Apply appropriate file restrictions for assignment uploads.
+- Use secure Storage paths and prevent cross-user submission access.
+
+Do not upload files before validating the user's enrollment and authorization.
+
+### 4.4 `getCurriculumForCourse(courseId)`
+
+If `courseId` is not present in `COURSE_CURRICULA`:
+
+- Return an empty curriculum structure.
+- Do not silently substitute `ai-essentials`.
+- Do not display another course's curriculum.
+- Do not introduce fake lesson content.
+
+The empty state should be handled gracefully by the existing UI.
+
+---
+
+# PART 5: FRONTEND PORTAL REMEDIATION
+
+Preserve the current interface and visual design.
+
+## 5.1 AdminPanel.jsx
+
+Review the administrator dashboard.
+
+### Course management
+- Course creation must use the appropriate server-side Cloud Function.
+- Course updates must use the appropriate server-side Cloud Function.
+- Course status changes must use authorized server-side operations.
+- Course deletion must use the safe deletion workflow.
+- Do not allow direct client writes to privileged course fields.
+
+### Announcements
+- Announcement deletion must use an authorized server-side Cloud Function.
+- Ensure unauthorized users cannot delete announcements.
+
+### Platform settings
+- Save platform settings through the authorized server-side function.
+- Validate settings on the server.
+- Do not expose privileged configuration through unrestricted client writes.
+
+### Audit logs
+- Never write audit logs directly from the administrator client.
+- Audit log creation must happen through trusted Cloud Functions.
+- Keep audit logs read-only to frontend clients where appropriate.
+- Do not permit client-side audit log updates or deletion.
+
+### Learner drawer — enrollment management
+- Display pending enrollments for each learner.
+- Add an Approve action for pending enrollments.
+- The Approve action must call:
+  `manageEnrollmentStatus({ enrollmentId, status: "active" })`
+- Keep the existing Revoke action.
+- Ensure approval and revocation update the UI only after successful server confirmation.
+- Handle errors and prevent repeated submissions while an operation is pending.
+
+### Course loading and catalog seeding
+- Remove fake catalog fallbacks from `fetchCourses`.
+- Do not automatically display static demo courses when Firestore is empty.
+- Display a proper empty state when no courses exist.
+
+Add a **Seed Default Catalog Courses** button for authorized administrators.
+
+This button must:
+- Call the authorized `adminManageCourse` Cloud Function.
+- Seed only the legitimate default catalog courses defined by the existing project.
+- Avoid duplicate course creation.
+- Never overwrite existing courses unintentionally.
+- Show a clear success or error result.
+
+## 5.2 TeachingPortal.jsx
+
+### Tutor course loading
+Update `loadTutorCourses` to:
+
+- Query courses using `tutorId`.
+- Query courses using `assignedTutors`.
+- Merge the results.
+- Deduplicate by course ID.
+- Avoid showing courses the tutor is not actually assigned to.
+- Handle missing or malformed assignment fields safely.
+
+### Course overview and publishing
+- Display the actual course status from Firestore.
+- Add a Publish/Unpublish control where authorized.
+- Do not allow a tutor to publish or unpublish a course simply because the tutor can edit course content.
+- Define the authorization policy explicitly.
+
+Recommended policy:
+- Administrators may publish and unpublish courses.
+- Assigned tutors may edit permitted course content.
+- Tutors must not change privileged publishing status unless the project has a deliberate, separately authorized publishing workflow.
+
+All publishing changes must use a server-authoritative Cloud Function and be audit logged.
+
+Do not implement direct Firestore publishing writes from the tutor client.
+
+### Content notifications
+- Ensure course notifications are sent only to active or approved enrollees.
+- Use the authorized notification Cloud Function.
+- Do not trust a manually supplied recipient list.
+
+### Enrollment management
+Add an enrollment section or subpanel that allows authorized tutors to:
+
+- View enrollments for their assigned courses.
+- Identify pending enrollments.
+- Approve eligible pending enrollments through `manageEnrollmentStatus`.
+- View current enrollment statuses.
+
+A tutor must not manage enrollments for a course they are not assigned to.
+
+### Tutor portrait upload
+Update the portrait upload helper text to clearly state:
+
+**Maximum file size: 5MB.**
+
+Ensure Storage rules enforce the same limit.
+
+## 5.3 Dashboard.jsx
+
+### Assignments
+- Remove hardcoded `DEFAULT_ASSIGNMENTS`.
+- Do not display fake assignment records.
+- Load real assignments from courses in which the student has active or approved enrollment.
+- Ensure each assignment is associated with its actual course.
+
+When submitting an assignment, pass both:
+
+- `courseId`
+- `assignmentId`
+
+to `submitAssignment()`.
+
+Do not rely on a general or course-independent submission path.
+
+### Enrollment status
+Clearly distinguish:
+
+- Pending enrollment
+- Active enrollment
+- Approved enrollment
+- Rejected enrollment
+- Revoked or suspended enrollment
+
+Students with pending enrollment must not be treated as active learners.
+
+Students must not gain access to course materials, assignments, tests, or resources until their enrollment is authorized.
+
+## 5.4 CoursePage.jsx
+
+Review course-level content access and management.
+
+- Show resource upload forms only to `isCourseStaff`.
+- Show announcement creation forms only to `isCourseStaff`.
+- `isCourseStaff` must resolve to an administrator or a tutor explicitly assigned to the current course.
+- An unassigned tutor must not see or use course management controls.
+- Do not rely on hiding frontend buttons as the only security mechanism.
+- Ensure corresponding Firestore and Storage rules enforce the same permissions.
+- Students may only access course content when their enrollment is active or approved.
+- Pending students must not be able to bypass course access by directly navigating to the course URL.
+
+---
+
+# PART 6: ARCHITECTURAL CONSISTENCY AND SECURITY REQUIREMENTS
+
+Before considering the work complete, verify consistency across all layers.
+
+### 6.1 One authorization source of truth
+
+Ensure that:
+
+- Firebase Auth establishes the authenticated identity.
+- Custom Claims establish privileged administrator/tutor authorization where applicable.
+- Firestore data provides course assignment and enrollment information.
+- Cloud Functions perform privileged operations after validating all relevant conditions.
+- Firestore and Storage rules enforce client access boundaries.
+- Frontend role checks are used for presentation, not as the security boundary.
+
+Do not trust localStorage, cached profiles, frontend role hints, or user-supplied role fields for authorization.
+
+### 6.2 Course assignment consistency
+
+Ensure every tutor-specific operation checks actual course assignment.
+
+This applies to:
+
+- Course content access.
+- Module uploads.
+- Resource management.
+- Announcement management.
+- Enrollment approval.
+- Notifications.
+- Course analytics access.
+- Tutor course listing.
+
+An unassigned tutor must never gain access through a general tutor role.
+
+### 6.3 Enrollment consistency
+
+Use consistent status interpretation across:
+
+- Cloud Functions.
+- Firestore rules.
+- Storage rules.
+- Service functions.
+- Course pages.
+- Student dashboards.
+- Tutor portals.
+- Administrator dashboards.
+
+Only `active` and `approved` should grant learner course access.
+
+Pending enrollment must never grant course access.
+
+### 6.4 Error handling
+
+- Do not silently swallow authorization failures.
+- Do not report successful operations when backend operations fail.
+- Avoid returning misleading success messages after partial failures.
+- Use clear error messages without exposing sensitive internal details.
+- Ensure loading states and disabled controls behave correctly.
+- Do not create partial enrollment, resource, or submission records when a required operation fails.
+
+### 6.5 Existing code quality
+
+- Avoid duplicate Cloud Functions.
+- Avoid duplicate enrollment services.
+- Remove obsolete insecure fallbacks.
+- Remove unused imports and dead code.
+- Preserve established naming conventions.
+- Keep functions small and maintainable.
+- Use transactions or other appropriate concurrency controls for critical operations.
+- Validate all callable function inputs.
+- Ensure privileged functions enforce authentication and authorization independently of the frontend.
+
+---
+
+# PART 7: REGRESSION TESTING AND VERIFICATION
+
+Do not rely solely on code inspection or mocked tests.
+
+Use the Firebase Emulator Suite where practical, especially for Firestore and Storage security rules.
+
+If emulator tests cannot be run, explicitly state why and distinguish implemented tests from unverified behavior.
+
+## 7.1 Enrollment tests
+
+Verify:
+
+1. An eligible learner enrolling in an online course that does not require approval receives active enrollment.
+2. A learner enrolling in a course requiring approval receives pending enrollment.
+3. A hands-on enrollment request receives pending enrollment.
+4. A nonexistent course ID is rejected.
+5. A user with pending enrollment cannot access course resources.
+6. A rejected user cannot access course resources.
+7. A revoked user cannot access course resources.
+8. A suspended user cannot access course resources.
+9. An active or approved learner can access authorized course materials.
+10. Duplicate enrollment requests do not create duplicate enrollment records.
+11. Users cannot set their own privileged enrollment status or approval fields.
+12. Failed enrollment requests do not leave partially authorized records.
+
+## 7.2 Tutor authorization tests
+
+Verify:
+
+1. An assigned tutor can access their assigned course.
+2. An unassigned tutor cannot access another tutor's course.
+3. An assigned tutor can perform only the course operations permitted by policy.
+4. An unassigned tutor cannot approve enrollments.
+5. An assigned tutor can approve eligible pending enrollments where permitted.
+6. A tutor cannot publish or unpublish a course if publishing is administrator-only.
+7. A tutor cannot assign themselves to another course.
+8. A non-tutor user cannot be assigned as a tutor.
+9. A tutor cannot create platform-level resource audit actions.
+10. A tutor cannot upload or delete files in another tutor's course.
+
+## 7.3 Storage security tests
+
+Verify:
+
+1. Unauthorized users cannot upload course resources.
+2. Unauthorized users cannot delete course resources.
+3. Active or approved students can read permitted resources.
+4. Pending students cannot read course resources.
+5. Assigned tutors can upload permitted module content.
+6. Unassigned tutors cannot upload module content.
+7. Invalid file types are rejected.
+8. Oversized files are rejected.
+9. Delete operations work without relying on `request.resource`.
+10. Users cannot access another user's private submission files.
+
+## 7.4 Course management tests
+
+Verify:
+
+1. Authorized administrators can create courses.
+2. Authorized administrators can update courses.
+3. Partial updates preserve fields not explicitly changed.
+4. Existing tutor assignments are not accidentally erased.
+5. Unauthorized users cannot modify course publishing status.
+6. Course deletion removes all intended nested Firestore data.
+7. Course deletion handles nested collections and associated Storage files.
+8. Partial deletion failures are reported correctly.
+9. Course deletion is not falsely reported as successful when child records remain.
+
+## 7.5 Submission tests
+
+Verify:
+
+1. An active learner can submit an assignment belonging to their course.
+2. An approved learner can submit an assignment belonging to their course.
+3. A pending learner cannot submit an assignment.
+4. A learner cannot submit to another course.
+5. A nonexistent assignment ID is rejected.
+6. A nonexistent course ID is rejected.
+7. A learner cannot submit a test without authorized enrollment.
+8. Invalid uploads are rejected before Storage writes occur.
+
+## 7.6 Analytics tests
+
+Verify:
+
+1. Creating an active enrollment updates enrollment count.
+2. Creating a pending enrollment does not increase enrollment count.
+3. Approving an enrollment updates enrollment count.
+4. Revoking an enrollment updates enrollment count.
+5. Valid graded test submissions update average test score.
+6. Updating or deleting a test submission recalculates the average correctly.
+7. Assignment submissions update submission rate correctly.
+8. Updating or deleting an assignment submission recalculates the rate correctly.
+9. Duplicate trigger delivery does not double-count.
+10. Empty analytics datasets produce valid zero or null values according to the chosen schema.
+
+## 7.7 Build and syntax verification
+
+Run the following commands in the appropriate project directories:
+
+```bash
+node -c functions/index.js
+npm run lint
+npm run build
+```
+
+If the project uses additional Cloud Functions files or scripts, check their syntax as well.
+
+Run relevant automated tests and Firebase Emulator Suite tests.
+
+Do not claim tests passed unless they were actually executed and passed.
+
+---
+
+# PART 8: FINAL IMPLEMENTATION REPORT
+
+After implementation, provide a clear report containing:
+
+### 1. Summary
+Explain the major security, backend, and workflow improvements implemented.
+
+### 2. Modified files
+List every file modified, grouped by:
+- Firestore rules
+- Storage rules
+- Cloud Functions
+- Services
+- Frontend components/pages
+- Tests and configuration
+
+### 3. New functions
+List any new Cloud Functions or service functions introduced and explain their responsibilities.
+
+### 4. Security improvements
+Explain how enrollment, tutor assignment, course access, submissions, resources, and audit logs are now protected.
+
+### 5. Testing results
+Separate the results into:
+- Syntax checks
+- Lint
+- Production build
+- Unit tests
+- Firebase Emulator Suite tests
+- Any tests not run
+
+Include actual results. Do not fabricate successful test outcomes.
+
+### 6. Outstanding issues
+List any remaining defects, limitations, or decisions requiring clarification.
+
+### 7. Production readiness
+State whether the implementation is ready for staging verification or whether additional work remains.
+
+**Do not deploy the application or modify production Firebase data.**
+
+---
+
+# FINAL INSTRUCTION
+
+Work systematically.
+
+First inspect the existing project structure, relevant source files, Firestore rules, Storage rules, Cloud Functions, and `peleekings-rebuild-v2.md`.
+
+Identify existing implementations and dependencies before editing.
+
+Then implement the changes in a consistent order:
+
+1. Firestore and Storage security.
+2. Cloud Functions and server-side authorization.
+3. Service-layer workflows.
+4. Admin, tutor, and student frontend integration.
+5. Analytics.
+6. Regression tests and verification.
+
+Do not merely generate a report or recommendations. Implement the changes in the existing codebase.
+
+Do not redesign the interface, remove working features, invent data, or weaken security to make a feature work.
+
+The final result must be a coherent, secure, maintainable implementation that preserves the existing Peleekings LMS functionality.

@@ -4,7 +4,6 @@
 import {
   collection,
   doc,
-  addDoc,
   updateDoc,
   onSnapshot,
   query,
@@ -13,7 +12,8 @@ import {
   serverTimestamp,
   writeBatch,
 } from "firebase/firestore";
-import { db } from "../firebase";
+import { httpsCallable } from "firebase/functions";
+import { db, functions } from "../firebase";
 
 /**
  * Subscribe to real-time notifications for a specific user.
@@ -42,6 +42,7 @@ export function subscribeToNotifications(userId, callback) {
 
 /**
  * Mark a single notification as read.
+ * Strictly updates only allowed fields ('read', 'readAt').
  */
 export async function markNotificationAsRead(userId, notificationId) {
   if (!userId || !notificationId) return;
@@ -50,11 +51,13 @@ export async function markNotificationAsRead(userId, notificationId) {
     await updateDoc(notifRef, { read: true, readAt: serverTimestamp() });
   } catch (err) {
     console.error("Failed to mark notification as read:", err);
+    throw err;
   }
 }
 
 /**
  * Mark all notifications as read for a user.
+ * Strictly updates only allowed fields ('read', 'readAt').
  */
 export async function markAllNotificationsAsRead(userId, notifications = []) {
   if (!userId || !notifications.length) return;
@@ -69,26 +72,29 @@ export async function markAllNotificationsAsRead(userId, notifications = []) {
     await batch.commit();
   } catch (err) {
     console.error("Failed to mark all notifications as read:", err);
+    throw err;
   }
 }
 
 /**
- * Send a notification to a specific user.
+ * Send a notification to a specific user via trusted server-side Cloud Function.
+ * Direct client writes to users/{uid}/notifications are blocked by Firestore security rules.
  * Types: 'announcement' | 'grade' | 'application_status' | 'new_content'
  */
 export async function createNotification(targetUid, { type = "announcement", title, body, courseId = null }) {
-  if (!targetUid || !title) return;
+  if (!targetUid || !title || !body) return null;
   try {
-    const notifCol = collection(db, "users", targetUid, "notifications");
-    await addDoc(notifCol, {
+    const sendFn = httpsCallable(functions, "sendCourseNotification");
+    const res = await sendFn({
+      targetUid,
+      courseId,
       type,
       title,
       body,
-      courseId,
-      read: false,
-      createdAt: serverTimestamp(),
     });
+    return res.data;
   } catch (err) {
-    console.error("Failed to create notification:", err);
+    console.error("Failed to dispatch notification via Cloud Function:", err);
+    throw err;
   }
 }

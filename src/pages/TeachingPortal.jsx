@@ -1,9 +1,10 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import {
   collection,
   doc,
+  getDoc,
   addDoc,
   setDoc,
   getDocs,
@@ -14,9 +15,13 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { db, storage } from "../firebase";
+import { httpsCallable } from "firebase/functions";
+import { db, storage, functions } from "../firebase";
 import { getResources, uploadResource } from "../contexts/resourcesService";
 import { createNotification } from "../contexts/notificationsService";
+import { useBodyScrollLock } from "../utils/scrollLock";
+
+const MAX_PORTRAIT_BYTES = 5 * 1024 * 1024; // 5MB matching storage.rules
 
 export default function TeachingPortal() {
   const { currentUser, userProfile, isAdmin, isTutor } = useAuth();
@@ -48,6 +53,21 @@ export default function TeachingPortal() {
   const [moduleItemsMap, setModuleItemsMap] = useState({});
   const [newModuleTitle, setNewModuleTitle] = useState("");
   const [isCreatingModule, setIsCreatingModule] = useState(false);
+
+  const isAssignedTutor = Boolean(
+    currentUser?.uid &&
+      selectedCourse &&
+      (selectedCourse.tutorId === currentUser.uid ||
+        selectedCourse.tutorUid === currentUser.uid ||
+        selectedCourse.instructorId === currentUser.uid ||
+        (Array.isArray(selectedCourse.assignedTutors) &&
+          selectedCourse.assignedTutors.includes(currentUser.uid)))
+  );
+
+  // ── Course Enrollments State (for Assigned Tutors & Admins) ──────────
+  const [courseEnrollments, setCourseEnrollments] = useState([]);
+  const [loadingEnrollments, setLoadingEnrollments] = useState(false);
+  const [approvingEnrollmentId, setApprovingEnrollmentId] = useState(null);
 
   // ── Submissions & Grading State ──────────────────────────────────────
   const [submissions, setSubmissions] = useState([]);
@@ -84,6 +104,8 @@ export default function TeachingPortal() {
   // ── Create Course Modal State ─────────────────────────────────────────
   const [showCreateCourseModal, setShowCreateCourseModal] = useState(false);
   const [isCreatingCourse, setIsCreatingCourse] = useState(false);
+
+  useBodyScrollLock(showAddContentModal || showCreateCourseModal);
   const [newCourseForm, setNewCourseForm] = useState({
     title: "",
     category: "Tech & Digital Skills",
@@ -107,16 +129,25 @@ export default function TeachingPortal() {
     setTimeout(() => setToastMessage(""), 3500);
   }
 
-  // Load Tutor Courses (Firestore-only: Tutors see their courses, Admins see all)
+  // Load Tutor Courses (Firestore-only: Tutors see courses where tutorId == uid OR assignedTutors contains uid; Admins see all)
   useEffect(() => {
     async function loadTutorCourses() {
       if (!currentUser?.uid) return;
       try {
-        const q = isAdmin
-          ? collection(db, "courses")
-          : query(collection(db, "courses"), where("tutorId", "==", currentUser.uid));
-        const snap = await getDocs(q);
-        const fsList = !snap.empty ? snap.docs.map((d) => ({ id: d.id, ...d.data() })) : [];
+        let fsList = [];
+        if (isAdmin) {
+          const snap = await getDocs(collection(db, "courses"));
+          fsList = !snap.empty ? snap.docs.map((d) => ({ id: d.id, ...d.data() })) : [];
+        } else {
+          const [primarySnap, assignedSnap] = await Promise.all([
+            getDocs(query(collection(db, "courses"), where("tutorId", "==", currentUser.uid))).catch(() => ({ docs: [] })),
+            getDocs(query(collection(db, "courses"), where("assignedTutors", "array-contains", currentUser.uid))).catch(() => ({ docs: [] })),
+          ]);
+          const mergedMap = new Map();
+          (primarySnap.docs || []).forEach((d) => mergedMap.set(d.id, { id: d.id, ...d.data() }));
+          (assignedSnap.docs || []).forEach((d) => mergedMap.set(d.id, { id: d.id, ...d.data() }));
+          fsList = Array.from(mergedMap.values());
+        }
         setCourses(fsList);
         setSelectedCourse((prev) => fsList.find((c) => c.id === prev?.id) || fsList[0] || null);
       } catch (err) {
@@ -129,6 +160,34 @@ export default function TeachingPortal() {
       loadTutorCourses();
     }
   }, [currentUser?.uid, isTutor, isAdmin]);
+
+  // Load Enrollments for selectedCourse
+  const loadCourseEnrollments = useCallback(async (targetCourseId) => {
+    const cid = targetCourseId || selectedCourse?.id;
+    if (!cid || !isTutor) {
+      setCourseEnrollments([]);
+      return;
+    }
+    setLoadingEnrollments(true);
+    try {
+      const snap = await getDocs(query(collection(db, "enrollments"), where("courseId", "==", cid)));
+      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setCourseEnrollments(list);
+    } catch (err) {
+      console.warn("Could not load course enrollments:", err);
+      setCourseEnrollments([]);
+    } finally {
+      setLoadingEnrollments(false);
+    }
+  }, [selectedCourse?.id, isTutor]);
+
+  useEffect(() => {
+    if (isTutor && selectedCourse?.id) {
+      loadCourseEnrollments(selectedCourse.id);
+    } else {
+      setCourseEnrollments([]);
+    }
+  }, [isTutor, selectedCourse?.id, activeTab, loadCourseEnrollments]);
 
   // Load Modules & Items for selected course (Firestore-only)
   useEffect(() => {
@@ -207,7 +266,7 @@ export default function TeachingPortal() {
     }
   }, [isTutor, isAdmin, activeTab, selectedCourse?.id]);
 
-  // ── Load Live Analytics from Firestore (Zero fake numbers) ───────────
+  // ── Load Live Analytics from Firestore (Stage 8 summary + active enrollments) ──
   useEffect(() => {
     async function loadAnalytics() {
       if (!selectedCourse?.id) {
@@ -222,58 +281,99 @@ export default function TeachingPortal() {
       }
       setLoadingAnalytics(true);
       try {
-        const enrollSnap = await getDocs(
-          query(collection(db, "enrollments"), where("courseId", "==", selectedCourse.id))
+        const [summarySnap, enrollSnap, asnCourseSnap] = await Promise.all([
+          getDoc(doc(db, "courses", selectedCourse.id, "analytics", "summary")).catch(() => null),
+          getDocs(query(collection(db, "enrollments"), where("courseId", "==", selectedCourse.id))),
+          getDocs(collection(db, "courses", selectedCourse.id, "assignments")).catch(() => ({ size: 0, docs: [] })),
+        ]);
+
+        const activeEnrollDocs = enrollSnap.docs.filter((d) =>
+          ["active", "approved"].includes(d.data()?.status)
         );
-        const enrolledCount = enrollSnap.size;
+        const activeUids = new Set(activeEnrollDocs.map((d) => d.data()?.uid).filter(Boolean));
+        const activeEnrolledCount = activeEnrollDocs.length;
 
         const now = Date.now();
         const weekMs = 7 * 24 * 60 * 60 * 1000;
         const trendBuckets = [0, 0, 0, 0, 0, 0, 0];
-        enrollSnap.docs.forEach((d) => {
+        activeEnrollDocs.forEach((d) => {
           const enrolledAt = d.data().enrolledAt?.toDate?.()?.getTime?.() || now;
           const weeksAgo = Math.floor((now - enrolledAt) / weekMs);
           if (weeksAgo >= 0 && weeksAgo < 7) {
             trendBuckets[6 - weeksAgo] += 1;
           }
         });
-        const cumulativeTrend = enrolledCount > 0
+        const cumulativeTrend = activeEnrolledCount > 0
           ? trendBuckets.reduce((acc, val, idx) => {
               acc.push((acc[idx - 1] || 0) + val);
               return acc;
             }, [])
           : [];
 
-        const asnSnap = await getDocs(
-          query(collection(db, "assignmentSubmissions"), where("courseId", "==", selectedCourse.id))
-        );
-        const totalSubs = asnSnap.size;
-        const submissionRate = enrolledCount > 0
-          ? `${Math.min(100, Math.round((totalSubs / enrolledCount) * 100))}%`
-          : null;
+        if (summarySnap && summarySnap.exists()) {
+          const sumData = summarySnap.data() || {};
+          const summaryEnrolled =
+            typeof sumData.enrollmentCount === "number" ? sumData.enrollmentCount : activeEnrolledCount;
+          const summaryAvg =
+            typeof sumData.avgTestScore === "number" && Number.isFinite(sumData.avgTestScore)
+              ? `${Math.round(sumData.avgTestScore)}%`
+              : null;
+          const summaryRate =
+            typeof sumData.assignmentSubmissionRate === "number" && Number.isFinite(sumData.assignmentSubmissionRate)
+              ? `${Math.min(100, Math.round(sumData.assignmentSubmissionRate))}%`
+              : null;
 
-        // Graded test submissions for avgScore
-        const testSnap = await getDocs(
-          query(collection(db, "testSubmissions"), where("courseId", "==", selectedCourse.id))
-        );
-        let totalScore = 0;
-        let gradedCount = 0;
-        testSnap.docs.forEach((d) => {
-          const sData = d.data();
-          if (typeof sData.score === "number") {
-            totalScore += sData.score;
-            gradedCount++;
+          setAnalytics({
+            enrolledCount: summaryEnrolled,
+            avgScore: summaryAvg,
+            submissionRate: summaryRate,
+            moduleCount: modules.length,
+            trend: cumulativeTrend,
+          });
+        } else {
+          const asnSnap = await getDocs(
+            query(collection(db, "assignmentSubmissions"), where("courseId", "==", selectedCourse.id))
+          );
+          const totalCourseAssignments = asnCourseSnap.size || 0;
+          const validAssignmentIds = new Set((asnCourseSnap.docs || []).map((d) => d.id));
+          const denominator = activeEnrolledCount * totalCourseAssignments;
+          let submissionRate = null;
+          if (denominator > 0) {
+            const uniquePairs = new Set();
+            asnSnap.docs.forEach((d) => {
+              const sData = d.data() || {};
+              if (activeUids.has(sData.uid) && validAssignmentIds.has(sData.assignmentId)) {
+                uniquePairs.add(`${sData.uid}_${sData.assignmentId}`);
+              }
+            });
+            submissionRate = `${Math.min(100, Math.round((uniquePairs.size / denominator) * 100))}%`;
+          } else if (activeEnrolledCount > 0) {
+            submissionRate = "0%";
           }
-        });
-        const avgScore = gradedCount > 0 ? `${Math.round(totalScore / gradedCount)}%` : null;
 
-        setAnalytics({
-          enrolledCount,
-          avgScore,
-          submissionRate,
-          moduleCount: modules.length,
-          trend: cumulativeTrend,
-        });
+          // Graded test submissions for avgScore
+          const testSnap = await getDocs(
+            query(collection(db, "testSubmissions"), where("courseId", "==", selectedCourse.id))
+          );
+          let totalScore = 0;
+          let gradedCount = 0;
+          testSnap.docs.forEach((d) => {
+            const sData = d.data() || {};
+            if (activeUids.has(sData.uid) && typeof sData.score === "number" && Number.isFinite(sData.score)) {
+              totalScore += sData.score;
+              gradedCount++;
+            }
+          });
+          const avgScore = gradedCount > 0 ? `${Math.round(totalScore / gradedCount)}%` : (activeEnrolledCount > 0 ? "0%" : null);
+
+          setAnalytics({
+            enrolledCount: activeEnrolledCount,
+            avgScore,
+            submissionRate,
+            moduleCount: modules.length,
+            trend: cumulativeTrend,
+          });
+        }
       } catch (err) {
         console.error("Analytics fetch error:", err);
         setAnalytics({
@@ -361,6 +461,12 @@ export default function TeachingPortal() {
     try {
       let portraitUrl = portraitPreview || null;
       if (portraitFile) {
+        if (portraitFile.size > 5 * 1024 * 1024) {
+          throw new Error("Portrait image exceeds the 5MB maximum file size limit.");
+        }
+        if (!["image/jpeg", "image/png", "image/webp"].includes(portraitFile.type)) {
+          throw new Error("Portrait image must be a JPEG, PNG, or WebP file.");
+        }
         const safeName = portraitFile.name.replace(/[^a-zA-Z0-9.-]/g, "_");
         const portraitRef = ref(storage, `users/${currentUser.uid}/portrait/${Date.now()}_${safeName}`);
         const uploadRes = await uploadBytes(portraitRef, portraitFile);
@@ -390,6 +496,52 @@ export default function TeachingPortal() {
       setApplyError(err.message || "Failed to submit tutor application.");
     } finally {
       setSubmittingApply(false);
+    }
+  }
+
+  // ── Handle Approve Course Enrollment (Server-Authoritative) ──────────
+  async function handleApproveEnrollment(enr) {
+    if (!enr?.id) return;
+    setApprovingEnrollmentId(enr.id);
+    try {
+      const manageFn = httpsCallable(functions, "manageEnrollmentStatus");
+      await manageFn({
+        enrollmentId: enr.id,
+        status: "active",
+      });
+      setCourseEnrollments((prev) =>
+        prev.map((item) => (item.id === enr.id ? { ...item, status: "active" } : item))
+      );
+      triggerToast("✓ Enrollment approved and activated!");
+    } catch (err) {
+      console.error("Approve enrollment error:", err);
+      triggerToast("Failed to approve enrollment: " + (err.message || "Permission denied"));
+    } finally {
+      setApprovingEnrollmentId(null);
+    }
+  }
+
+  // ── Handle Admin Course Publish/Unpublish Toggle ─────────────────────
+  async function handleToggleCourseStatus(course) {
+    if (!course) return;
+    const nextStatus = course.status === "published" ? "draft" : "published";
+    try {
+      const manageCourseFn = httpsCallable(functions, "adminManageCourse");
+      await manageCourseFn({
+        action: "toggleStatus",
+        courseId: course.id,
+        courseData: { status: nextStatus, title: course.title },
+      });
+      triggerToast(`Course status updated to ${nextStatus}.`);
+      setCourses((prev) =>
+        prev.map((c) => (c.id === course.id ? { ...c, status: nextStatus } : c))
+      );
+      if (selectedCourse?.id === course.id) {
+        setSelectedCourse((prev) => ({ ...prev, status: nextStatus }));
+      }
+    } catch (err) {
+      console.error("Failed to toggle course status:", err);
+      triggerToast("Failed to update course status: " + (err.message || "Error"));
     }
   }
 
@@ -575,6 +727,7 @@ export default function TeachingPortal() {
             : `A new ${addContentType} has been added to ${selectedCourse?.title || "your course"}.`;
 
           enrollSnap.docs
+            .filter((d) => ["active", "approved"].includes(d.data()?.status))
             .map((d) => d.data().uid)
             .filter((uid) => uid && uid !== currentUser?.uid)
             .forEach((uid) => {
@@ -660,19 +813,23 @@ export default function TeachingPortal() {
       triggerToast("Please enter a title and attach a file or link.");
       return;
     }
+    if (!selectedCourse?.id) {
+      triggerToast("Please select an assigned course before uploading a resource.");
+      return;
+    }
     setIsUploadingRes(true);
     try {
       const newRes = await uploadResource({
         title: resTitle.trim(),
         description: resDesc.trim(),
         category: resCategory,
-        courseId: selectedCourse?.id || "platform",
+        courseId: selectedCourse.id,
         file: resFile,
         externalUrl: resLink.trim(),
         user: {
           uid: currentUser?.uid || "tutor",
           fullName: userProfile?.fullName || currentUser?.displayName || "Instructor",
-          role: "tutor",
+          role: isAdmin ? "admin" : "tutor",
         },
       });
       setResources((prev) => [newRes, ...prev]);
@@ -757,6 +914,12 @@ export default function TeachingPortal() {
                     onChange={(e) => {
                       const file = e.target.files[0];
                       if (file) {
+                        if (file.size > 5 * 1024 * 1024) {
+                          setApplyError("Portrait image exceeds the 5MB maximum file size limit.");
+                          e.target.value = "";
+                          return;
+                        }
+                        setApplyError("");
                         setPortraitFile(file);
                         setPortraitPreview(URL.createObjectURL(file));
                       }
@@ -764,7 +927,7 @@ export default function TeachingPortal() {
                     style={{ fontSize: "0.85rem", maxWidth: "100%" }}
                   />
                   <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 4 }}>
-                    Max 10MB (JPEG, PNG, WebP)
+                    Maximum file size: 5MB. (JPEG, PNG, WebP)
                   </div>
                 </div>
               </div>
@@ -950,6 +1113,7 @@ export default function TeachingPortal() {
         <div style={{ display: "flex", gap: 20, minWidth: "max-content" }}>
           {[
             { id: "courses", label: "My Courses & Modules" },
+            { id: "enrollments", label: `Course Enrollments (${courseEnrollments.length})` },
             { id: "submissions", label: `Student Submissions (${submissions.length})` },
             { id: "analytics", label: "Course Analytics" },
             { id: "resources", label: "Course Resources" },
@@ -1032,7 +1196,20 @@ export default function TeachingPortal() {
                     </p>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                    <span className="pill-badge pill-success">Status: Published</span>
+                    <span className={`pill-badge ${selectedCourse.status === "published" ? "pill-success" : "pill-warning"}`}>
+                      Status: {selectedCourse.status === "published" ? "Published" : "Draft"}
+                    </span>
+                    {(isAdmin || isAssignedTutor) && (
+                      <button
+                        type="button"
+                        onClick={() => handleToggleCourseStatus(selectedCourse)}
+                        className="btn btn-outline btn-sm"
+                      >
+                        {selectedCourse.status === "published"
+                          ? "Unpublish (Set Draft)"
+                          : "Publish Course"}
+                      </button>
+                    )}
                     <Link to={`/course/${selectedCourse.id}`} className="btn btn-outline btn-sm">
                       View as Student &rarr;
                     </Link>
@@ -1378,6 +1555,92 @@ export default function TeachingPortal() {
                     </div>
                   </form>
                 </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── TAB: COURSE ENROLLMENTS ────────────────────────────────── */}
+        {activeTab === "enrollments" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12, marginBottom: 24 }}>
+              <div>
+                <h2 style={{ fontSize: "clamp(1.2rem, 3.5vw, 1.45rem)", fontWeight: 800 }}>
+                  Course Enrollments &amp; Approvals
+                </h2>
+                <p style={{ fontSize: "0.875rem", color: "var(--text-muted)" }}>
+                  View learner enrollments for <strong>{selectedCourse?.title || "Selected Course"}</strong> and approve pending enrollment requests via server-authoritative workflow.
+                </p>
+              </div>
+            </div>
+
+            {loadingEnrollments ? (
+              <div style={{ textAlign: "center", padding: 40, color: "var(--text-muted)" }}>
+                Loading course enrollments...
+              </div>
+            ) : courseEnrollments.length === 0 ? (
+              <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "12px", padding: 36, textAlign: "center", color: "var(--text-muted)" }}>
+                No enrollments recorded for this course yet.
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {courseEnrollments.map((enr) => {
+                  const status = enr.status || "pending";
+                  const isPending = status === "pending";
+                  const isActive = status === "active" || status === "approved";
+                  return (
+                    <div
+                      key={enr.id}
+                      style={{
+                        background: "#FFFFFF",
+                        border: "1px solid var(--border-light)",
+                        borderRadius: "12px",
+                        padding: "16px 20px",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                        gap: 14,
+                      }}
+                    >
+                      <div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                          <span style={{ fontWeight: 700, fontSize: "0.95rem", color: "var(--text-primary)" }}>
+                            {enr.studentName || enr.userEmail || `Learner (${enr.uid?.slice(0, 8) || "UID"})`}
+                          </span>
+                          <span
+                            className={`pill-badge ${
+                              isActive ? "pill-success" : isPending ? "pill-warning" : "pill-danger"
+                            }`}
+                            style={{ textTransform: "capitalize" }}
+                          >
+                            {status}
+                          </span>
+                          <span className="pill-badge pill-tech" style={{ fontSize: "0.72rem" }}>
+                            {enr.experienceType === "hands-on" ? "Hands-on Training" : "Online"}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 4 }}>
+                          UID: {enr.uid} &bull; Progress: {enr.progressPercent || 0}% ({(enr.completedItemIds || []).length} items completed)
+                        </div>
+                      </div>
+
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        {isPending && (
+                          <button
+                            type="button"
+                            disabled={approvingEnrollmentId === enr.id}
+                            onClick={() => handleApproveEnrollment(enr)}
+                            className="btn btn-solid-dark btn-sm"
+                            style={{ background: "var(--primary-learner)", color: "#FFFFFF" }}
+                          >
+                            {approvingEnrollmentId === enr.id ? "Approving..." : "✓ Approve Enrollment"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

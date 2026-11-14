@@ -38,19 +38,20 @@ service cloud.firestore {
         isAdmin() ||
         (
           exists(/databases/$(database)/documents/courses/$(courseId)) &&
+          get(/databases/$(database)/documents/courses/$(courseId)).data.status != 'deleting' &&
           isAssignedTutor(get(/databases/$(database)/documents/courses/$(courseId)).data)
         )
       );
     }
 
-    // Unpublished course protection: only admin or assigned tutor can access unpublished course content
+    // Unpublished course protection: course must exist; only admin or assigned tutor can access unpublished course content
     function canReadCourse(courseId) {
-      return isSignedIn() && (
-        !exists(/databases/$(database)/documents/courses/$(courseId)) ||
-        get(/databases/$(database)/documents/courses/$(courseId)).data.status == 'published' ||
-        isAdmin() ||
-        isAssignedCourseTutor(courseId)
-      );
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/courses/$(courseId)) && (
+          get(/databases/$(database)/documents/courses/$(courseId)).data.status == 'published' ||
+          isAdmin() ||
+          isAssignedCourseTutor(courseId)
+        );
     }
 
     function canManageCourse(courseId) {
@@ -58,7 +59,18 @@ service cloud.firestore {
     }
 
     function isEnrolled(courseId, uid) {
-      return exists(/databases/$(database)/documents/enrollments/$(uid + '_' + courseId));
+      return exists(/databases/$(database)/documents/courses/$(courseId)) &&
+        get(/databases/$(database)/documents/courses/$(courseId)).data.status == 'published' &&
+        exists(/databases/$(database)/documents/enrollments/$(uid + '_' + courseId)) &&
+        get(/databases/$(database)/documents/enrollments/$(uid + '_' + courseId)).data.status in ['active', 'approved'];
+    }
+
+    function canAccessCourseMaterials(courseId) {
+      return isSignedIn() && (
+        isAdmin() ||
+        isAssignedCourseTutor(courseId) ||
+        (canReadCourse(courseId) && isEnrolled(courseId, request.auth.uid))
+      );
     }
 
     // ── 1. Users Collection ──────────────────────────────────────────
@@ -98,81 +110,102 @@ service cloud.firestore {
 
     // ── 2. Courses Collection & Subcollections ───────────────────────
     // Tutors can only manage courses assigned to them; unpublished content is protected.
+    // Classroom subcollections require an active/approved enrollment, assigned tutor, or admin.
     match /courses/{courseId} {
-      allow read: if isSignedIn() && (resource.data.status == 'published' || isAdmin() || isAssignedTutor(resource.data));
+      allow read: if resource.data.status == 'published' || isAdmin() || (resource.data.status != 'deleting' && isAssignedTutor(resource.data));
       allow create: if isAdmin() || (isTutor() && (request.resource.data.tutorId == request.auth.uid || request.resource.data.tutorUid == request.auth.uid));
-      allow update: if isAdmin() || (isTutor() && isAssignedTutor(resource.data));
+      allow update: if isAdmin() || (isTutor() && resource.data.status != 'deleting' && isAssignedTutor(resource.data));
       allow delete: if isAdmin();
 
       match /modules/{moduleId} {
-        allow read: if canReadCourse(courseId);
+        allow read: if canAccessCourseMaterials(courseId);
         allow create, update, delete: if canManageCourse(courseId);
       }
 
       match /lessons/{lessonId} {
-        allow read: if canReadCourse(courseId);
+        allow read: if canAccessCourseMaterials(courseId);
         allow create, update, delete: if canManageCourse(courseId);
       }
 
       match /announcements/{announcementId} {
-        allow read: if canReadCourse(courseId);
+        allow read: if canAccessCourseMaterials(courseId);
         allow create, update, delete: if canManageCourse(courseId);
       }
 
       match /comments/{commentId} {
-        allow read: if canReadCourse(courseId);
-        allow create: if isSignedIn() && canReadCourse(courseId) && request.resource.data.uid == request.auth.uid;
-        allow update: if isOwner(resource.data.uid);
+        allow read: if canAccessCourseMaterials(courseId);
+        allow create: if canAccessCourseMaterials(courseId) && request.resource.data.uid == request.auth.uid;
+        allow update: if isOwner(resource.data.uid) && canAccessCourseMaterials(courseId);
         allow delete: if isAdmin() || isOwner(resource.data.uid) || canManageCourse(courseId);
       }
 
       match /notes/{noteId} {
-        allow read: if canReadCourse(courseId);
+        allow read: if canAccessCourseMaterials(courseId);
         allow create, update, delete: if canManageCourse(courseId);
       }
 
       match /assignments/{assignmentId} {
-        allow read: if canReadCourse(courseId);
+        allow read: if canAccessCourseMaterials(courseId);
         allow create, update, delete: if canManageCourse(courseId);
       }
 
       match /tests/{testId} {
-        allow read: if canReadCourse(courseId);
+        allow read: if canAccessCourseMaterials(courseId);
         allow create, update, delete: if canManageCourse(courseId);
       }
 
       match /resources/{resourceId} {
-        allow read: if canReadCourse(courseId);
+        allow read: if canAccessCourseMaterials(courseId);
         allow create, update, delete: if canManageCourse(courseId);
+      }
+
+      match /analytics/{docId} {
+        allow read: if isAdmin() || isAssignedCourseTutor(courseId);
+        allow write: if false;
       }
     }
 
     // ── 3. Enrollments Collection ────────────────────────────────────
-    // Students can create enrollment requests and update only allowed learning-progress fields.
-    // Privileged status (approval, payment, access grants) can only be set by Admins or Cloud Functions.
+    // Authoritative enrollment creation and status transitions are handled server-side via Cloud Functions
+    // (requestCourseEnrollment, manageEnrollmentStatus, adminManageEnrollment).
+    // Client cannot grant active/approved status, modify enrollment status, or set privileged fields.
     match /enrollments/{enrollmentId} {
       allow read: if isOwner(resource.data.uid) || isAdmin() || isAssignedCourseTutor(resource.data.courseId);
 
-      // Student enrollment creation: cannot set paid, approved, or elevated access
+      // Direct client creation is restricted to pending requests on existing published courses with no privileged fields
       allow create: if isSignedIn() &&
         request.resource.data.uid == request.auth.uid &&
+        request.resource.data.courseId is string &&
         enrollmentId == request.auth.uid + '_' + request.resource.data.courseId &&
+        exists(/databases/$(database)/documents/courses/$(request.resource.data.courseId)) &&
+        get(/databases/$(database)/documents/courses/$(request.resource.data.courseId)).data.status == 'published' &&
+        request.resource.data.status == 'pending' &&
+        (!('progressPercent' in request.resource.data) || request.resource.data.progressPercent == 0) &&
+        (!('completedItemIds' in request.resource.data) || request.resource.data.completedItemIds.size() == 0) &&
         !request.resource.data.keys().hasAny([
-          'isPaid', 'paymentStatus', 'approvedAt', 'approvedBy',
-          'accessLevel', 'grade', 'certificateIssued'
-        ]) &&
-        (!('status' in request.resource.data) || request.resource.data.status in ['active', 'pending']);
+          'role', 'userRole', 'admin', 'tutor',
+          'isPaid', 'paymentStatus', 'paymentId', 'amountPaid',
+          'approvedAt', 'approvedBy', 'rejectedAt', 'rejectedBy',
+          'accessGrantedBy', 'accessLevel',
+          'revokedBy', 'revokedAt', 'grade', 'certificateIssued'
+        ]);
 
-      // Student enrollment progress updates: learning-progress fields ONLY
-      allow update: if isAdmin() || isAssignedCourseTutor(resource.data.courseId) || (
+      // Student enrollment progress updates: learning-progress fields ONLY when enrollment is already active/approved.
+      // Tutors and students cannot directly mutate enrollment status from the client; status transitions go through Cloud Functions.
+      allow update: if isAdmin() || (
         isOwner(resource.data.uid) &&
+        resource.data.status in ['active', 'approved'] &&
+        request.resource.data.status == resource.data.status &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'completedItemIds', 'completedLessonIds', 'lastAccessedLesson',
           'currentModule', 'progressPercent', 'notes', 'updatedAt'
         ]) &&
         !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'status', 'isPaid', 'paymentStatus', 'approvedAt',
-          'approvedBy', 'accessLevel', 'grade', 'certificateIssued',
+          'status', 'role', 'userRole', 'admin', 'tutor',
+          'isPaid', 'paymentStatus', 'paymentId', 'amountPaid',
+          'approvedAt', 'approvedBy', 'rejectedAt', 'rejectedBy',
+          'accessGrantedBy', 'accessLevel',
+          'revokedBy', 'revokedAt', 'grade', 'certificateIssued',
           'uid', 'courseId', 'experienceType'
         ])
       );
@@ -181,13 +214,15 @@ service cloud.firestore {
     }
 
     // ── 4. Submissions (Assignments & Tests) ─────────────────────────
-    // Students submit deliverables for enrolled courses.
+    // Students submit deliverables only for courses in which they have an active/approved enrollment.
     // Tutors can only read and grade submissions for courses assigned to them.
     match /assignmentSubmissions/{submissionId} {
       allow read: if isOwner(resource.data.uid) || isAdmin() || isAssignedCourseTutor(resource.data.courseId);
 
       allow create: if isSignedIn() &&
         request.resource.data.uid == request.auth.uid &&
+        request.resource.data.courseId is string &&
+        isEnrolled(request.resource.data.courseId, request.auth.uid) &&
         !request.resource.data.keys().hasAny(['grade', 'feedback', 'gradedAt', 'gradedBy']);
 
       // Grading restricted exclusively to Admins and assigned course Tutors
@@ -206,6 +241,8 @@ service cloud.firestore {
 
       allow create: if isSignedIn() &&
         request.resource.data.uid == request.auth.uid &&
+        request.resource.data.courseId is string &&
+        isEnrolled(request.resource.data.courseId, request.auth.uid) &&
         !request.resource.data.keys().hasAny(['grade', 'feedback', 'gradedAt', 'gradedBy']);
 
       // Grading restricted exclusively to Admins and assigned course Tutors
@@ -236,16 +273,21 @@ service cloud.firestore {
       allow update, delete: if isAdmin();
     }
 
-    // ── 7. Audit Logs Collection ─────────────────────────────────────
+    // ── 7. Audit Logs Collection (Server-Controlled Only) ────────────
     match /auditLogs/{logId} {
       allow read: if isAdmin();
-      allow write: if isAdmin();
+      allow create, update, delete: if false;
     }
 
     // ── 8. User Notifications Subcollection ──────────────────────────
+    // Creation is server-controlled via Cloud Functions; owners may only update read/readAt.
     match /users/{uid}/notifications/{notifId} {
-      allow read, update: if isOwner(uid);
-      allow create: if isAdmin() || isTutor();
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if false;
+      allow update: if isOwner(uid) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']) &&
+        request.resource.data.read is bool &&
+        (!('readAt' in request.resource.data) || request.resource.data.readAt == null || request.resource.data.readAt is timestamp || request.resource.data.readAt is string);
       allow delete: if isOwner(uid) || isAdmin();
     }
 
@@ -255,10 +297,27 @@ service cloud.firestore {
       allow read: if isAdmin() || isTutor();
     }
 
-    // ── 10. Platform Resources Collection ────────────────────────────
+    // ── 10. Platform & Course Resources Collection ───────────────────
     match /resources/{resourceId} {
-      allow read: if isSignedIn();
-      allow create, update, delete: if isAdmin();
+      allow read: if isSignedIn() && (
+        isAdmin() ||
+        !('courseId' in resource.data) ||
+        resource.data.courseId == 'platform' ||
+        isEnrolled(resource.data.courseId, request.auth.uid) ||
+        isAssignedCourseTutor(resource.data.courseId)
+      );
+      allow create, update: if isAdmin() || (
+        isTutor() &&
+        'courseId' in request.resource.data &&
+        request.resource.data.courseId != 'platform' &&
+        isAssignedCourseTutor(request.resource.data.courseId)
+      );
+      allow delete: if isAdmin() || (
+        isTutor() &&
+        'courseId' in resource.data &&
+        resource.data.courseId != 'platform' &&
+        isAssignedCourseTutor(resource.data.courseId)
+      );
     }
 
     // ── 11. Platform Announcements Collection ────────────────────────

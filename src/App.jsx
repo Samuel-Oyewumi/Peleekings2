@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect } from "react";
 import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
 import { AuthProvider } from "./contexts/AuthContext";
+import { resetSavedScrollPosition } from "./utils/scrollLock";
 import Navbar from "./components/Navbar";
 import ProtectedRoute from "./components/ProtectedRoute";
 import ErrorBoundary from "./components/ErrorBoundary";
@@ -13,6 +14,7 @@ function ScrollToTop() {
 
   useEffect(() => {
     if (!hash) {
+      resetSavedScrollPosition();
       window.scrollTo({ top: 0, left: 0, behavior: "instant" });
     }
   }, [pathname, hash]);
@@ -20,24 +22,42 @@ function ScrollToTop() {
   return null;
 }
 
-// Resilient lazy loader that retries once if a chunk import fails transiently
-function lazyWithRetry(importer) {
-  return lazy(async () => {
-    try {
-      const mod = await importer();
-      if (!mod || (!mod.default && typeof mod !== "function")) {
-        throw new Error("Loaded module does not export a valid React component.");
-      }
-      return mod;
-    } catch (firstErr) {
-      await new Promise((resolve) => setTimeout(resolve, 400));
-      const retryMod = await importer();
-      if (!retryMod || (!retryMod.default && typeof retryMod !== "function")) {
-        throw firstErr;
-      }
-      return retryMod;
+// Resilient lazy loader that retries once on transient failure and resets cache on rejection
+// so ErrorBoundary retry or route re-navigation can recover without an infinite reload loop.
+export function lazyWithRetry(importer) {
+  let LazyComponent = null;
+
+  const getLazyComponent = () => {
+    if (!LazyComponent) {
+      LazyComponent = lazy(async () => {
+        try {
+          const mod = await importer();
+          if (!mod || (!mod.default && typeof mod !== "function")) {
+            throw new Error("Loaded module does not export a valid React component.");
+          }
+          return mod;
+        } catch (firstErr) {
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          try {
+            const retryMod = await importer();
+            if (!retryMod || (!retryMod.default && typeof retryMod !== "function")) {
+              throw firstErr;
+            }
+            return retryMod;
+          } catch (retryErr) {
+            LazyComponent = null;
+            throw retryErr;
+          }
+        }
+      });
     }
-  });
+    return LazyComponent;
+  };
+
+  return function LazyRetryWrapper(props) {
+    const ComponentToRender = getLazyComponent();
+    return <ComponentToRender {...props} />;
+  };
 }
 
 // Lazy-loaded routes to eliminate initial bundle overhead

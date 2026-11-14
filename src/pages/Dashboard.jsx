@@ -14,10 +14,26 @@ import {
   LogOut,
   Menu,
   X,
+  Eye,
+  EyeOff,
+  CheckCircle2,
+  Circle,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
-import { getUserActivity, submitAssignment, getUserEnrollments, enrollInCourse, getWeeklyActivityData, incrementDailyActivity } from "../contexts/userActivity";
+import { useBodyScrollLock } from "../utils/scrollLock";
+import { checkPasswordRequirements, validatePasswordOrThrow } from "../utils/passwordPolicy";
+import {
+  getUserActivity,
+  submitAssignment,
+  getAssignmentSubmission,
+  getUserEnrollments,
+  enrollInCourse,
+  getWeeklyActivityData,
+  incrementDailyActivity,
+  isEnrollmentAuthorized,
+} from "../contexts/userActivity";
 import { COURSES_CATALOG } from "../data/courses";
+import { getCurriculumForCourse } from "../data/courseCurricula";
 import { doc, getDocs, collection, query, where, orderBy, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase";
 
@@ -82,11 +98,11 @@ function EmptyState({ icon: Icon, title, text, buttonText, onButtonClick }) {
 }
 
 export default function Dashboard() {
-  const { currentUser, userProfile, logout } = useAuth();
+  const { currentUser, userProfile, logout, changeUserPassword } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
 
-  const [activeNav, setActiveNav] = useState("dashboard");
+  const [activeNav, setActiveNav] = useState(location.state?.openTab || "dashboard");
   const [showMobileSidebar, setShowMobileSidebar] = useState(false);
   const [showPathModal, setShowPathModal] = useState(false);
   const [toastMessage, setToastMessage] = useState(location.state?.welcomeToast || "");
@@ -96,6 +112,37 @@ export default function Dashboard() {
   const [catalogFilter, setCatalogFilter] = useState("All");
   const [enrollingId, setEnrollingId] = useState(null);
   const [allCoursesList, setAllCoursesList] = useState(COURSES_CATALOG);
+
+  // Profile password update state
+  const [newProfilePassword, setNewProfilePassword] = useState("");
+  const [confirmProfilePassword, setConfirmProfilePassword] = useState("");
+  const [showProfilePassword, setShowProfilePassword] = useState(false);
+  const [profilePwError, setProfilePwError] = useState("");
+  const [profilePwSuccess, setProfilePwSuccess] = useState("");
+  const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
+
+  // Lock background page scroll on mobile/tablet (<= 1024px) when Profile view or Mobile Sidebar is open
+  useBodyScrollLock(activeNav === "profile" || showMobileSidebar, {
+    mobileOnly: true,
+    breakpoint: 1024,
+  });
+
+  useEffect(() => {
+    function handleResize() {
+      if (window.innerWidth > 1024) {
+        setShowMobileSidebar(false);
+      }
+    }
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  // Support opening specific tab (e.g. "profile") via navigation state
+  useEffect(() => {
+    if (location.state?.openTab) {
+      setActiveNav(location.state.openTab);
+    }
+  }, [location.state?.openTab, location.key]);
 
   // Auto-dismiss welcome toast after 4 seconds
   useEffect(() => {
@@ -219,12 +266,17 @@ export default function Dashboard() {
         if (enrollments && enrollments.length > 0) {
           const mapped = enrollments.map((enr) => {
             const catalogItem = allCoursesList.find((c) => c.id === enr.courseId) || COURSES_CATALOG.find((c) => c.id === enr.courseId) || {};
+            const status = enr.status || "pending";
             return {
               id: enr.courseId,
               title: catalogItem.title || enr.courseTitle || enr.courseId,
               type: enr.experienceType === "hands-on" ? "Hands-on Practical" : "Online",
+              status,
               progress: enr.progressPercent || 0,
-              currentModule: `${(enr.completedItemIds || []).length} lessons completed`,
+              currentModule:
+                status === "pending"
+                  ? "Pending administrator / instructor approval"
+                  : `${(enr.completedItemIds || []).length} lessons completed`,
               image:
                 catalogItem.image ||
                 "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=500&auto=format&fit=crop&q=80",
@@ -232,13 +284,19 @@ export default function Dashboard() {
             };
           });
           setLiveEnrollments(mapped);
+        } else {
+          setLiveEnrollments([]);
         }
       })
       .catch((err) => console.warn("Could not fetch live enrollments:", err));
   }, [currentUser, allCoursesList]);
 
-  // Active courses enrolled: prioritize live Firestore enrollments, fall back to cached
-  const enrolledCourses = liveEnrollments.length > 0 ? liveEnrollments : (userActivity?.enrolledCourses || []);
+  // Active courses enrolled: strictly require Firestore-verified active/approved enrollment (do not trust localStorage for enrollment access)
+  const enrolledCourses = liveEnrollments.filter((c) => isEnrollmentAuthorized(c));
+  const pendingEnrollments = liveEnrollments.filter((c) => c.status === "pending");
+  const inactiveEnrollments = liveEnrollments.filter((c) =>
+    ["rejected", "revoked", "suspended"].includes(c.status)
+  );
   const completedCourses = enrolledCourses.filter((c) => (c.progress || 0) >= 100);
 
   // Live Announcements from Firestore
@@ -282,58 +340,153 @@ export default function Dashboard() {
     loadAnnouncements();
   }, [enrolledCourses]);
 
-  const DEFAULT_ASSIGNMENTS = [
-    {
-      id: "ass-1",
-      title: "Zapier Automated Pipeline Architecture",
-      course: "AI Essentials & Automation",
-      status: "Pending Submission",
-      badge: "pill-audio",
-      description: "Design and implement an automated workflow integrating a webhook trigger with an AI agent or multi-step action. Submit your architecture blueprint as a PDF or export file."
-    },
-    {
-      id: "ass-2",
-      title: "Visual Brand Identity Mockup in Figma",
-      course: "Graphic Design Fundamentals",
-      status: "Pending Submission",
-      badge: "pill-tech",
-      description: "Create a complete visual style guide including color palette, typography hierarchy, and a mobile/desktop component set. Submit your Figma link or exported assets."
-    },
-    {
-      id: "ass-3",
-      title: "Organic Social Media Campaign Blueprint",
-      course: "Social Media Management",
-      status: "Pending Submission",
-      badge: "pill-tech",
-      description: "Draft a 30-day content calendar, hook scripts, and audience distribution plan for a target client. Submit as a document or spreadsheet."
-    }
-  ];
-
+  // Real Assignments loaded from Firestore + curriculum for actively enrolled courses
+  const [courseAssignments, setCourseAssignments] = useState([]);
+  const [loadingAssignments, setLoadingAssignments] = useState(false);
   const [activeUploadAssignment, setActiveUploadAssignment] = useState(null);
   const [uploadFile, setUploadFile] = useState(null);
   const [uploadLink, setUploadLink] = useState("");
   const [uploadNotes, setUploadNotes] = useState("");
   const [isSubmittingAssignment, setIsSubmittingAssignment] = useState(false);
 
+  // Lock background page scroll at all widths when any modal dialog is open
+  useBodyScrollLock(showPathModal || Boolean(activeUploadAssignment));
+
   const userSubmissions = userActivity?.assignmentSubmissions || {};
 
-  const assignments = DEFAULT_ASSIGNMENTS.map(item => {
-    const submission = userSubmissions[item.id];
-    if (submission) {
-      return {
-        ...item,
-        status: "Submitted (Under Review)",
-        badge: "pill-success",
-        submission
-      };
+  useEffect(() => {
+    let isMounted = true;
+    async function loadEnrolledCourseAssignments() {
+      if (!currentUser?.uid || enrolledCourses.length === 0) {
+        if (isMounted) setCourseAssignments([]);
+        return;
+      }
+      setLoadingAssignments(true);
+      try {
+        const collected = [];
+        for (const course of enrolledCourses) {
+          const courseId = course.id;
+          const courseTitle = course.title || courseId;
+          const seenIds = new Set();
+
+          // 1. Dynamic Firestore assignments under courses/{courseId}/assignments
+          try {
+            const snap = await getDocs(collection(db, "courses", courseId, "assignments"));
+            snap.docs.forEach((d) => {
+              const data = d.data();
+              seenIds.add(d.id);
+              collected.push({
+                id: d.id,
+                courseId,
+                course: courseTitle,
+                title: data.title || "Practical Course Assignment",
+                description:
+                  data.instructions ||
+                  data.description ||
+                  "Submit your practical deliverable or project link for instructor review.",
+                dueAt: data.dueAt || null,
+              });
+            });
+          } catch (err) {
+            console.warn(`Could not fetch dynamic assignments for ${courseId}:`, err);
+          }
+
+          // 2. Canonical static curriculum assignment items for this course
+          const curr = getCurriculumForCourse(courseId);
+          (curr.modules || []).forEach((mod) => {
+            (mod.lessons || []).forEach((les) => {
+              if (les.type === "assignment" && les.id && !seenIds.has(les.id)) {
+                seenIds.add(les.id);
+                collected.push({
+                  id: les.id,
+                  courseId,
+                  course: courseTitle,
+                  title: les.title || curr.assignment?.title || "Practical Assignment",
+                  description:
+                    les.instructions ||
+                    curr.assignment?.description ||
+                    "Complete and submit your practical deliverable for this module.",
+                  dueAt: les.dueAt || null,
+                });
+              }
+            });
+          });
+
+          if (curr.assignment?.id && !seenIds.has(curr.assignment.id)) {
+            seenIds.add(curr.assignment.id);
+            collected.push({
+              id: curr.assignment.id,
+              courseId,
+              course: courseTitle,
+              title: curr.assignment.title || "Course Capstone Project",
+              description:
+                curr.assignment.description ||
+                "Complete and submit your practical deliverable for this course.",
+              dueAt: null,
+            });
+          }
+        }
+
+        // Enrich with Firestore submission records
+        const enriched = await Promise.all(
+          collected.map(async (item) => {
+            let sub = null;
+            try {
+              sub = await getAssignmentSubmission(currentUser.uid, item.id);
+            } catch {}
+            if (!sub && userSubmissions[item.id]) {
+              sub = userSubmissions[item.id];
+            }
+            if (sub) {
+              return {
+                ...item,
+                status: sub.status === "graded" ? `Graded (${sub.grade})` : "Submitted (Under Review)",
+                badge: "pill-success",
+                submission: {
+                  ...sub,
+                  submittedAt: sub.submittedAt?.toDate
+                    ? sub.submittedAt.toDate().toISOString()
+                    : sub.submittedAt || new Date().toISOString(),
+                },
+              };
+            }
+            return {
+              ...item,
+              status: "Pending Submission",
+              badge: "pill-tech",
+              submission: null,
+            };
+          })
+        );
+
+        if (isMounted) {
+          setCourseAssignments(enriched);
+        }
+      } catch (err) {
+        console.warn("Failed to load enrolled course assignments:", err);
+      } finally {
+        if (isMounted) setLoadingAssignments(false);
+      }
     }
-    return item;
-  });
+
+    loadEnrolledCourseAssignments();
+    return () => {
+      isMounted = false;
+    };
+  }, [currentUser?.uid, enrolledCourses.length]);
+
+  const assignments = courseAssignments;
+  const submittedAssignmentsCount = assignments.filter((a) => Boolean(a.submission)).length;
+  const pendingAssignmentsCount = Math.max(0, assignments.length - submittedAssignmentsCount);
 
   async function handleAssignmentUploadSubmit(e) {
     e.preventDefault();
     if (!uploadFile && !uploadLink.trim()) {
-      alert("Please choose a file to upload or provide a project link.");
+      triggerToast("Please choose a file to upload or provide a project link.");
+      return;
+    }
+    if (!activeUploadAssignment?.courseId || !activeUploadAssignment?.id) {
+      triggerToast("Invalid assignment context: missing courseId or assignmentId.");
       return;
     }
 
@@ -347,20 +500,42 @@ export default function Dashboard() {
         fileType: uploadFile ? uploadFile.type : null,
         projectLink: uploadLink.trim() || null,
         notes: uploadNotes.trim() || null,
+        content: uploadNotes.trim() || uploadLink.trim() || (uploadFile ? uploadFile.name : ""),
         submittedAt: new Date().toISOString(),
         studentName: userName,
         studentEmail: email,
       };
 
-      await submitAssignment(currentUser?.uid, activeUploadAssignment.id, submissionData);
-      triggerToast(`Assignment "${activeUploadAssignment.title}" submitted successfully!`);
+      const savedSub = await submitAssignment(
+        currentUser?.uid,
+        activeUploadAssignment.courseId,
+        activeUploadAssignment.id,
+        submissionData
+      );
+      setCourseAssignments((prev) =>
+        prev.map((item) =>
+          item.id === activeUploadAssignment.id && item.courseId === activeUploadAssignment.courseId
+            ? {
+                ...item,
+                status: "Submitted (Under Review)",
+                badge: "pill-success",
+                submission: {
+                  ...submissionData,
+                  ...savedSub,
+                  submittedAt: new Date().toISOString(),
+                },
+              }
+            : item
+        )
+      );
+      triggerToast(`✓ Assignment "${activeUploadAssignment.title}" submitted successfully!`);
       setActiveUploadAssignment(null);
       setUploadFile(null);
       setUploadLink("");
       setUploadNotes("");
     } catch (err) {
       console.error("Assignment submission error:", err);
-      triggerToast("Failed to submit assignment. Please try again.");
+      triggerToast(err?.message || "Failed to submit assignment. Please try again.");
     } finally {
       setIsSubmittingAssignment(false);
     }
@@ -372,7 +547,7 @@ export default function Dashboard() {
   }
 
   return (
-    <div className="dashboard-page-layout">
+    <div className={`dashboard-page-layout ${activeNav === "profile" ? "dashboard-profile-active" : ""}`}>
       {/* Toast banner with close button and auto-dismiss */}
       {toastMessage && (
         <div style={{
@@ -422,7 +597,10 @@ export default function Dashboard() {
       )}
 
       {/* ── Left Sidebar (Screen 5) ─────────────────────────────────── */}
-      <aside className={`portal-left-sidebar ${showMobileSidebar ? "mobile-open" : ""}`}>
+      <aside
+        className={`portal-left-sidebar ${showMobileSidebar ? "mobile-open" : ""}`}
+        data-scroll-lock-scrollable="true"
+      >
         {/* Mobile-only close header */}
         <div className="sidebar-mobile-header">
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -515,7 +693,10 @@ export default function Dashboard() {
       </aside>
 
       {/* ── Main Dashboard Content ─────────────────────────────────── */}
-      <main className="dashboard-main-area" style={{ paddingBottom: 80 }}>
+      <main
+        className={`dashboard-main-area ${activeNav === "profile" ? "dashboard-profile-active" : ""}`}
+        style={{ paddingBottom: 80 }}
+      >
         {/* Top Header / Greeting */}
         <div className="dashboard-greeting-row">
           <div>
@@ -722,7 +903,7 @@ export default function Dashboard() {
                 </div>
                 <div>
                   <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "var(--text-primary)", lineHeight: 1.1, letterSpacing: "-0.02em" }}>
-                    {enrolledCourses.length > 0 ? Math.max(0, DEFAULT_ASSIGNMENTS.length - Object.keys(userSubmissions).length) : 0}
+                    {enrolledCourses.length > 0 ? pendingAssignmentsCount : 0}
                   </div>
                   <div style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginTop: 4, fontWeight: 500 }}>
                     Assignments pending
@@ -809,7 +990,7 @@ export default function Dashboard() {
           <div className="dashboard-tab-panel">
             <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>My Enrolled Courses</h2>
             <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Manage your active learning modules and track progress.</p>
-            {enrolledCourses.length === 0 ? (
+            {enrolledCourses.length === 0 && pendingEnrollments.length === 0 && inactiveEnrollments.length === 0 ? (
               <EmptyState
                 icon={BookOpen}
                 title="No courses enrolled yet"
@@ -823,7 +1004,12 @@ export default function Dashboard() {
                   <div key={c.id} style={{ border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", overflow: "hidden", background: "#F8FAFC" }}>
                     <img src={c.image} alt={c.title} style={{ width: "100%", height: 140, objectFit: "cover" }} />
                     <div style={{ padding: 16 }}>
-                      <span className="pill-badge pill-tech" style={{ marginBottom: 6 }}>{c.type}</span>
+                      <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
+                        <span className="pill-badge pill-tech">{c.type}</span>
+                        <span className="pill-badge pill-success">
+                          {c.status === "approved" ? "Approved" : "Active"}
+                        </span>
+                      </div>
                       <h3 style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 6 }}>{c.title}</h3>
                       <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: 12 }}>{c.currentModule}</div>
                       <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.75rem", fontWeight: 600, marginBottom: 4 }}>
@@ -839,6 +1025,44 @@ export default function Dashboard() {
                     </div>
                   </div>
                 ))}
+                {pendingEnrollments.map(c => (
+                  <div key={c.id} style={{ border: "1px solid #FDE68A", borderRadius: "var(--radius-md)", overflow: "hidden", background: "#FFFBEB" }}>
+                    <img src={c.image} alt={c.title} style={{ width: "100%", height: 140, objectFit: "cover", opacity: 0.85 }} />
+                    <div style={{ padding: 16 }}>
+                      <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
+                        <span className="pill-badge pill-tech">{c.type}</span>
+                        <span className="pill-badge" style={{ background: "#FEF3C7", color: "#92400E", fontWeight: 700 }}>Pending Approval</span>
+                      </div>
+                      <h3 style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 6 }}>{c.title}</h3>
+                      <div style={{ fontSize: "0.8rem", color: "#92400E", marginBottom: 16 }}>
+                        Awaiting approval by a course instructor or administrator.
+                      </div>
+                      <button className="btn btn-outline btn-sm" style={{ width: "100%" }} onClick={() => navigate(`/course/${c.id}`)}>
+                        ⏳ View Request Status &rarr;
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {inactiveEnrollments.map(c => (
+                  <div key={c.id} style={{ border: "1px solid #FECACA", borderRadius: "var(--radius-md)", overflow: "hidden", background: "#FEF2F2" }}>
+                    <img src={c.image} alt={c.title} style={{ width: "100%", height: 140, objectFit: "cover", opacity: 0.7 }} />
+                    <div style={{ padding: 16 }}>
+                      <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
+                        <span className="pill-badge pill-tech">{c.type}</span>
+                        <span className="pill-badge pill-danger" style={{ textTransform: "capitalize" }}>
+                          {c.status}
+                        </span>
+                      </div>
+                      <h3 style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 6 }}>{c.title}</h3>
+                      <div style={{ fontSize: "0.8rem", color: "#991B1B", marginBottom: 16 }}>
+                        Enrollment status: {c.status}. Please contact course staff or administration for assistance.
+                      </div>
+                      <button className="btn btn-outline btn-sm" style={{ width: "100%" }} onClick={() => navigate(`/course/${c.id}`)}>
+                        View Course Details &rarr;
+                      </button>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
@@ -846,7 +1070,9 @@ export default function Dashboard() {
 
         {/* ── TAB: BROWSE COURSES ─────────────────────────────────────── */}
         {activeNav === "browse-courses" && (() => {
-          const enrolledIds = new Set(liveEnrollments.map(e => e.id));
+          const activeIds = new Set(enrolledCourses.map(e => e.id));
+          const pendingIds = new Set(pendingEnrollments.map(e => e.id));
+          const inactiveMap = new Map(inactiveEnrollments.map(e => [e.id, e.status]));
           const categories = ["All", ...Array.from(new Set(allCoursesList.map(c => c.category).filter(Boolean)))];
           const filtered = allCoursesList.filter(c => {
             const matchCat = catalogFilter === "All" || c.category === catalogFilter;
@@ -859,27 +1085,36 @@ export default function Dashboard() {
             if (!currentUser?.uid) return;
             setEnrollingId(course.id);
             try {
-              await enrollInCourse(currentUser.uid, course.id, "online");
+              const created = await enrollInCourse(currentUser.uid, course.id, "online");
               // Refresh live enrollments
               const updated = await getUserEnrollments(currentUser.uid);
               if (updated && updated.length > 0) {
                 setLiveEnrollments(updated.map(enr => {
-                  const cat = COURSES_CATALOG.find(c => c.id === enr.courseId) || {};
+                  const cat = allCoursesList.find(c => c.id === enr.courseId) || COURSES_CATALOG.find(c => c.id === enr.courseId) || {};
+                  const status = enr.status || "pending";
                   return {
                     id: enr.courseId,
                     title: cat.title || enr.courseTitle || enr.courseId,
                     type: enr.experienceType === "hands-on" ? "Hands-on Practical" : "Online",
+                    status,
                     progress: enr.progressPercent || 0,
-                    currentModule: `${(enr.completedItemIds || []).length} lessons completed`,
+                    currentModule:
+                      status === "pending"
+                        ? "Pending administrator / instructor approval"
+                        : `${(enr.completedItemIds || []).length} lessons completed`,
                     image: cat.image || "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=500&auto=format&fit=crop&q=80",
                     enrolledAt: enr.enrolledAt?.toDate ? enr.enrolledAt.toDate().toISOString() : new Date().toISOString(),
                   };
                 }));
               }
-              triggerToast(`🎉 Enrolled in "${course.title}"! Go to My Courses to start learning.`);
+              if (created?.status === "active" || created?.status === "approved") {
+                triggerToast(`✓ Enrolled in "${course.title}"! You now have active classroom access.`);
+              } else {
+                triggerToast(`⏳ Enrollment request submitted for "${course.title}" (Pending Approval).`);
+              }
             } catch (err) {
               console.warn(err);
-              triggerToast("Enrollment failed. Please try again.");
+              triggerToast(err?.message || "Enrollment request failed. Please try again.");
             } finally {
               setEnrollingId(null);
             }
@@ -928,7 +1163,9 @@ export default function Dashboard() {
               {/* Course cards grid */}
               <div className="dashboard-catalog-grid">
                 {filtered.map(course => {
-                  const isEnrolled = enrolledIds.has(course.id);
+                  const isEnrolled = activeIds.has(course.id);
+                  const isPending = pendingIds.has(course.id);
+                  const inactiveStatus = inactiveMap.get(course.id);
                   const isEnrolling = enrollingId === course.id;
                   return (
                     <div key={course.id} style={{ border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", overflow: "hidden", background: "#FFFFFF", display: "flex", flexDirection: "column" }}>
@@ -956,6 +1193,22 @@ export default function Dashboard() {
                           >
                             ✓ Continue Learning →
                           </button>
+                        ) : isPending ? (
+                          <button
+                            className="btn btn-outline btn-sm"
+                            style={{ width: "100%", borderColor: "#FDE68A", background: "#FFFBEB", color: "#92400E" }}
+                            onClick={() => navigate(`/course/${course.id}`)}
+                          >
+                            ⏳ Pending Approval
+                          </button>
+                        ) : inactiveStatus ? (
+                          <button
+                            className="btn btn-outline btn-sm"
+                            style={{ width: "100%", borderColor: "#FECACA", background: "#FEF2F2", color: "#991B1B", textTransform: "capitalize" }}
+                            onClick={() => navigate(`/course/${course.id}`)}
+                          >
+                            Status: {inactiveStatus}
+                          </button>
                         ) : (
                           <button
                             className="btn btn-solid-dark btn-sm"
@@ -963,7 +1216,7 @@ export default function Dashboard() {
                             disabled={isEnrolling}
                             onClick={() => handleEnrollFromDashboard(course)}
                           >
-                            {isEnrolling ? "Enrolling…" : "Enroll Now →"}
+                            {isEnrolling ? "Submitting…" : "Enroll Now →"}
                           </button>
                         )}
                       </div>
@@ -983,10 +1236,10 @@ export default function Dashboard() {
                 <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Assignments &amp; Projects</h2>
                 <p style={{ color: "var(--text-muted)", fontSize: "0.9rem" }}>Submit required course deliverables, upload practical projects, and track instructor reviews.</p>
               </div>
-              {enrolledCourses.length > 0 && (
+              {enrolledCourses.length > 0 && assignments.length > 0 && (
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <span className="pill-badge pill-tech" style={{ padding: "6px 12px", fontSize: "0.8rem" }}>
-                    {Object.keys(userSubmissions).length} of {DEFAULT_ASSIGNMENTS.length} Submitted
+                    {submittedAssignmentsCount} of {assignments.length} Submitted
                   </span>
                 </div>
               )}
@@ -1000,11 +1253,21 @@ export default function Dashboard() {
                 buttonText="Browse courses"
                 onButtonClick={() => setActiveNav("browse-courses")}
               />
+            ) : loadingAssignments ? (
+              <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>
+                Loading course assignments...
+              </div>
+            ) : assignments.length === 0 ? (
+              <EmptyState
+                icon={ClipboardList}
+                title="No assignments published yet"
+                text="Your enrolled courses do not have any assignments published yet. Check back soon!"
+              />
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                 {assignments.map((ass) => (
                   <div
-                    key={ass.id}
+                    key={`${ass.courseId}_${ass.id}`}
                     style={{
                       padding: 22,
                       border: "1px solid var(--border-light)",
@@ -1029,7 +1292,9 @@ export default function Dashboard() {
                       </div>
 
                       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
-                        <span style={{ fontSize: "0.78rem", color: "var(--text-muted)", fontWeight: 500 }}>Deadline: set by your instructor</span>
+                        <span style={{ fontSize: "0.78rem", color: "var(--text-muted)", fontWeight: 500 }}>
+                          {ass.dueAt ? `Deadline: ${new Date(ass.dueAt).toLocaleDateString()}` : "Deadline: set by your instructor"}
+                        </span>
                         <button
                           className={`btn ${ass.submission ? "btn-outline" : "btn-solid-dark"} btn-sm`}
                           onClick={() => {
@@ -1053,7 +1318,7 @@ export default function Dashboard() {
                           </div>
                           <div>
                             <div style={{ fontWeight: 700, fontSize: "0.875rem", color: "#166534" }}>
-                              {ass.submission.fileName || "Project Link Submitted"}
+                              {ass.submission.fileName || "Project Deliverable Submitted"}
                             </div>
                             <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
                               {ass.submission.fileSize && `${ass.submission.fileSize} • `}
@@ -1171,46 +1436,265 @@ export default function Dashboard() {
 
         {/* ── TAB: PROFILE ───────────────────────────────────────────── */}
         {activeNav === "profile" && (
-          <div className="dashboard-tab-panel" style={{ maxWidth: 640 }}>
-            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Learner Profile</h2>
-            <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Your registration details and account settings.</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div
+            className="dashboard-tab-panel dashboard-profile-panel"
+            data-testid="dashboard-profile-panel"
+            style={{ maxWidth: 640 }}
+          >
+            <div
+              className="dashboard-profile-header"
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "flex-start",
+                gap: 12,
+                marginBottom: 16,
+              }}
+            >
               <div>
-                <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>Full Name</label>
-                <input type="text" readOnly className="form-field-input" value={userName} style={{ background: "#F8FAFC" }} />
+                <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Learner Profile</h2>
+                <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", margin: 0 }}>
+                  Your registration details and account settings.
+                </p>
               </div>
-              <div>
-                <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>Email Address</label>
-                <input type="email" readOnly className="form-field-input" value={email} style={{ background: "#F8FAFC" }} />
-              </div>
-              <div className="profile-fields-row" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <button
+                type="button"
+                className="btn btn-outline btn-sm profile-mobile-close-btn"
+                onClick={() => setActiveNav("dashboard")}
+                aria-label="Close profile and return to dashboard"
+              >
+                <X size={16} aria-hidden="true" /> Done
+              </button>
+            </div>
+
+            <div
+              className="dashboard-profile-scroll-body"
+              data-testid="dashboard-profile-scroll-body"
+              data-scroll-lock-scrollable="true"
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
                 <div>
-                  <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>User ID</label>
-                  <input
-                    type="text"
-                    readOnly
-                    className="form-field-input"
-                    value={regCode || "—"}
-                    style={{ background: "var(--success-bg)", color: "var(--success-text)", fontWeight: 700, letterSpacing: "0.04em" }}
-                  />
+                  <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>Full Name</label>
+                  <input type="text" readOnly className="form-field-input" value={userName} style={{ background: "#F8FAFC" }} />
                 </div>
                 <div>
-                  <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>
-                    {userProfile?.studentType === "non_corper" ? "Learner Category" : "NYSC State Code"}
-                  </label>
-                  <input
-                    type="text"
-                    readOnly
-                    className="form-field-input"
-                    value={userProfile?.studentType === "non_corper" ? "Non-Corper (Independent Learner)" : nyscCode}
-                    style={{ background: "#F8FAFC" }}
-                  />
+                  <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>Email Address</label>
+                  <input type="email" readOnly className="form-field-input" value={email} style={{ background: "#F8FAFC" }} />
                 </div>
-              </div>
-              <div style={{ marginTop: 12 }}>
-                <button className="btn btn-solid-dark" onClick={() => triggerToast("Profile data verified with Peleekings Registry.")}>
-                  Save Profile Settings
-                </button>
+                <div className="profile-fields-row" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  <div>
+                    <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>User ID</label>
+                    <input
+                      type="text"
+                      readOnly
+                      className="form-field-input"
+                      value={regCode || "—"}
+                      style={{ background: "var(--success-bg)", color: "var(--success-text)", fontWeight: 700, letterSpacing: "0.04em" }}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>
+                      {userProfile?.studentType === "non_corper" ? "Learner Category" : "NYSC State Code"}
+                    </label>
+                    <input
+                      type="text"
+                      readOnly
+                      className="form-field-input"
+                      value={userProfile?.studentType === "non_corper" ? "Non-Corper (Independent Learner)" : nyscCode}
+                      style={{ background: "#F8FAFC" }}
+                    />
+                  </div>
+                </div>
+                <div style={{ marginTop: 4 }}>
+                  <button className="btn btn-solid-dark" onClick={() => triggerToast("Profile data verified with Peleekings Registry.")}>
+                    Save Profile Settings
+                  </button>
+                </div>
+
+                {/* Password Update Section (Consistent 8+ char & numeric policy) */}
+                <div
+                  style={{
+                    marginTop: 12,
+                    paddingTop: 20,
+                    borderTop: "1px solid var(--border-light)",
+                  }}
+                >
+                  <h3 style={{ fontSize: "1.05rem", fontWeight: 700, marginBottom: 4 }}>
+                    Update Account Password
+                  </h3>
+                  <p style={{ fontSize: "0.825rem", color: "var(--text-muted)", marginBottom: 14 }}>
+                    Use a strong password with at least 8 characters and at least one number (0–9).
+                  </p>
+
+                  {profilePwError && (
+                    <div
+                      role="alert"
+                      style={{
+                        background: "#FEE2E2",
+                        color: "#B91C1C",
+                        padding: "10px 12px",
+                        borderRadius: "var(--radius-sm)",
+                        fontSize: "0.825rem",
+                        marginBottom: 12,
+                      }}
+                    >
+                      {profilePwError}
+                    </div>
+                  )}
+
+                  {profilePwSuccess && (
+                    <div
+                      style={{
+                        background: "#EAF7EF",
+                        color: "#166534",
+                        border: "1px solid #BBF7D0",
+                        padding: "10px 12px",
+                        borderRadius: "var(--radius-sm)",
+                        fontSize: "0.825rem",
+                        marginBottom: 12,
+                      }}
+                    >
+                      {profilePwSuccess}
+                    </div>
+                  )}
+
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      if (isUpdatingPassword) return;
+                      setProfilePwError("");
+                      setProfilePwSuccess("");
+                      try {
+                        validatePasswordOrThrow(newProfilePassword);
+                        if (newProfilePassword !== confirmProfilePassword) {
+                          throw new Error("Passwords do not match. Please verify both passwords.");
+                        }
+                        setIsUpdatingPassword(true);
+                        await changeUserPassword(newProfilePassword);
+                        setNewProfilePassword("");
+                        setConfirmProfilePassword("");
+                        setProfilePwSuccess("Password updated successfully.");
+                      } catch (err) {
+                        setProfilePwError(err.message || "Failed to update password.");
+                      } finally {
+                        setIsUpdatingPassword(false);
+                      }
+                    }}
+                  >
+                    <div className="profile-fields-row" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                      <div>
+                        <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>
+                          New Password
+                        </label>
+                        <div style={{ position: "relative" }}>
+                          <input
+                            type={showProfilePassword ? "text" : "password"}
+                            minLength={8}
+                            value={newProfilePassword}
+                            onChange={(e) => {
+                              setNewProfilePassword(e.target.value);
+                              setProfilePwError("");
+                              setProfilePwSuccess("");
+                            }}
+                            placeholder="At least 8 chars + 1 number"
+                            className="form-field-input"
+                            style={{ paddingRight: 36 }}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowProfilePassword((prev) => !prev)}
+                            aria-label={showProfilePassword ? "Hide password" : "Show password"}
+                            style={{
+                              position: "absolute",
+                              right: 8,
+                              top: "50%",
+                              transform: "translateY(-50%)",
+                              background: "none",
+                              border: "none",
+                              color: "var(--text-muted)",
+                              cursor: "pointer",
+                              display: "flex",
+                              alignItems: "center",
+                              padding: 4,
+                            }}
+                          >
+                            {showProfilePassword ? <EyeOff size={15} aria-hidden="true" /> : <Eye size={15} aria-hidden="true" />}
+                          </button>
+                        </div>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: "0.8rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>
+                          Confirm New Password
+                        </label>
+                        <input
+                          type={showProfilePassword ? "text" : "password"}
+                          minLength={8}
+                          value={confirmProfilePassword}
+                          onChange={(e) => {
+                            setConfirmProfilePassword(e.target.value);
+                            setProfilePwError("");
+                            setProfilePwSuccess("");
+                          }}
+                          placeholder="Re-enter new password"
+                          className="form-field-input"
+                        />
+                      </div>
+                    </div>
+
+                    {(() => {
+                      const pwReq = checkPasswordRequirements(newProfilePassword);
+                      return (
+                        <div
+                          style={{
+                            marginTop: 10,
+                            marginBottom: 12,
+                            padding: "8px 12px",
+                            background: "#F8FAFC",
+                            border: "1px solid var(--border-light)",
+                            borderRadius: "var(--radius-sm)",
+                            fontSize: "0.78rem",
+                            display: "flex",
+                            flexWrap: "wrap",
+                            gap: 14,
+                          }}
+                        >
+                          <span
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 5,
+                              color: pwReq.hasMinLength ? "#15803D" : "var(--text-muted)",
+                              fontWeight: pwReq.hasMinLength ? 600 : 500,
+                            }}
+                          >
+                            {pwReq.hasMinLength ? <CheckCircle2 size={14} aria-hidden="true" /> : <Circle size={14} aria-hidden="true" />}
+                            At least 8 characters
+                          </span>
+                          <span
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 5,
+                              color: pwReq.hasNumber ? "#15803D" : "var(--text-muted)",
+                              fontWeight: pwReq.hasNumber ? 600 : 500,
+                            }}
+                          >
+                            {pwReq.hasNumber ? <CheckCircle2 size={14} aria-hidden="true" /> : <Circle size={14} aria-hidden="true" />}
+                            Contains at least one number (0–9)
+                          </span>
+                        </div>
+                      );
+                    })()}
+
+                    <button
+                      type="submit"
+                      disabled={isUpdatingPassword}
+                      className="btn btn-outline btn-sm"
+                    >
+                      {isUpdatingPassword ? "Updating Password..." : "Update Password"}
+                    </button>
+                  </form>
+                </div>
               </div>
             </div>
           </div>

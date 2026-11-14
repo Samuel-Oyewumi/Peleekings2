@@ -18,8 +18,9 @@ import {
   X,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
+import { useBodyScrollLock } from "../utils/scrollLock";
 import { COURSES_CATALOG } from "../data/courses";
-import { getResources, uploadResource, DEFAULT_RESOURCES } from "../contexts/resourcesService";
+import { getResources, uploadResource } from "../contexts/resourcesService";
 import { subscribeToNotifications, markNotificationAsRead, markAllNotificationsAsRead } from "../contexts/notificationsService";
 
 export default function Navbar() {
@@ -34,7 +35,7 @@ export default function Navbar() {
   const [showMobileMenu, setShowMobileMenu] = useState(false);
 
   // Platform resources state
-  const [platformResources, setPlatformResources] = useState(DEFAULT_RESOURCES);
+  const [platformResources, setPlatformResources] = useState([]);
   const [showResourceUploadForm, setShowResourceUploadForm] = useState(false);
   const [resourceUploadData, setResourceUploadData] = useState({
     title: "",
@@ -51,61 +52,44 @@ export default function Navbar() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchCategory, setSearchCategory] = useState("All");
 
-  // Notifications state with full messages
-  const [notifications, setNotifications] = useState([
-    {
-      id: 1,
-      title: "Assignment Graded",
-      text: "Module 02 Prompt Engineering received 95%",
-      fullMessage: "Congratulations! Your Module 02 Prompt Engineering assignment has been graded by your instructor with a score of 95/100 (Distinction). Your prompt chaining pipelines and Zapier automation workflows demonstrated exceptional practical mastery.",
-      time: "2h ago",
-      unread: true,
-      actionLink: "/dashboard"
-    },
-    {
-      id: 2,
-      title: "New Lesson Available",
-      text: "AI Essentials & Automation: Module 5 unlocked",
-      fullMessage: "Module 5: 'End-to-End Enterprise Automations' is now available in your classroom. In this module, you will build production-grade webhooks, multi-agent chains, and data extractors.",
-      time: "1d ago",
-      unread: true,
-      actionLink: "/course/ai-essentials"
-    },
-    {
-      id: 3,
-      title: "Welcome to Peleekings",
-      text: "Your registration code is AS1399",
-      fullMessage: "Welcome to Peleekings E-Learning Platform! Your account is active with official registration code AS1399. You can use this code for all credential verifications, certificates of completion, and NYSC skill endorsements.",
-      time: "3d ago",
-      unread: false,
-      actionLink: "/dashboard"
-    },
-  ]);
+  // Notifications state (server-authoritative from Firestore)
+  const [notifications, setNotifications] = useState([]);
 
   const [activeSection, setActiveSection] = useState("courses");
   const [selectedNotification, setSelectedNotification] = useState(null);
+
+  // Lock background page scroll when the mobile Profile/Navigation drawer or any navbar dropdown/modal is open
+  useBodyScrollLock(showMobileMenu, { mobileOnly: true, breakpoint: 860 });
+  useBodyScrollLock(
+    showMenu ||
+      showNotifications ||
+      showResourcesModal ||
+      showSearchModal ||
+      Boolean(selectedNotification)
+  );
 
   const navRef = useRef(null);
 
   // Subscribe to real-time user notifications
   useEffect(() => {
-    if (!currentUser?.uid) return;
+    if (!currentUser?.uid) {
+      setNotifications([]);
+      return;
+    }
     const unsubscribe = subscribeToNotifications(currentUser.uid, (items) => {
-      if (items && items.length > 0) {
-        setNotifications(
-          items.map((it) => ({
-            id: it.id,
-            title: it.title,
-            text: it.body,
-            fullMessage: it.body,
-            time: it.createdAt?.seconds
-              ? new Date(it.createdAt.seconds * 1000).toLocaleDateString()
-              : "Recent",
-            unread: !it.read,
-            actionLink: it.courseId ? `/course/${it.courseId}` : "/dashboard",
-          }))
-        );
-      }
+      setNotifications(
+        (items || []).map((it) => ({
+          id: it.id,
+          title: it.title,
+          text: it.body,
+          fullMessage: it.body,
+          time: it.createdAt?.seconds
+            ? new Date(it.createdAt.seconds * 1000).toLocaleDateString()
+            : "Recent",
+          unread: !it.read,
+          actionLink: it.courseId ? `/course/${it.courseId}` : "/dashboard",
+        }))
+      );
     });
     return unsubscribe;
   }, [currentUser?.uid]);
@@ -115,9 +99,12 @@ export default function Navbar() {
     if (showResourcesModal) {
       getResources("platform")
         .then((res) => {
-          if (res && res.length > 0) setPlatformResources(res);
+          setPlatformResources(res || []);
         })
-        .catch((err) => console.warn("Error fetching platform resources:", err));
+        .catch((err) => {
+          console.warn("Error fetching platform resources:", err);
+          setPlatformResources([]);
+        });
     }
   }, [showResourcesModal]);
 
@@ -168,7 +155,7 @@ export default function Navbar() {
     }
   }
 
-  // Close menus on click outside
+  // Close menus on click/touch outside or viewport resize to desktop
   useEffect(() => {
     function handleClickOutside(event) {
       if (navRef.current && !navRef.current.contains(event.target)) {
@@ -176,8 +163,19 @@ export default function Navbar() {
         setShowNotifications(false);
       }
     }
+    function handleResize() {
+      if (window.innerWidth > 860) {
+        setShowMobileMenu(false);
+      }
+    }
     document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
+    document.addEventListener("touchstart", handleClickOutside, { passive: true });
+    window.addEventListener("resize", handleResize);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("touchstart", handleClickOutside);
+      window.removeEventListener("resize", handleResize);
+    };
   }, []);
 
   // Close mobile menu on route change
@@ -185,7 +183,7 @@ export default function Navbar() {
     setShowMobileMenu(false);
     setShowMenu(false);
     setShowNotifications(false);
-  }, [location.pathname]);
+  }, [location.pathname, location.key]);
 
 
 
@@ -404,30 +402,44 @@ export default function Navbar() {
                     )}
                   </div>
 
-                  <div style={{ maxHeight: 280, overflowY: "auto" }}>
-                    {notifications.map(item => (
-                      <div
-                        key={item.id}
-                        style={{
-                          padding: "12px 16px",
-                          borderBottom: "1px solid var(--border-subtle)",
-                          background: item.unread ? "#F8FAFC" : "#FFFFFF",
-                          cursor: "pointer",
-                          transition: "background 0.2s"
-                        }}
-                        onClick={() => {
-                          setNotifications(prev => prev.map(n => n.id === item.id ? { ...n, unread: false } : n));
-                          setSelectedNotification(item);
-                          setShowNotifications(false);
-                        }}
-                      >
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
-                          <span style={{ fontWeight: 600, fontSize: "0.85rem", color: "var(--text-primary)" }}>{item.title}</span>
-                          <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>{item.time}</span>
-                        </div>
-                        <p style={{ fontSize: "0.775rem", color: "var(--text-secondary)", lineHeight: 1.4 }}>{item.text}</p>
+                  <div
+                    data-scroll-lock-scrollable="true"
+                    style={{ maxHeight: 280, overflowY: "auto", overscrollBehavior: "contain" }}
+                  >
+                    {notifications.length === 0 ? (
+                      <div style={{ padding: "24px 16px", textAlign: "center", fontSize: "0.825rem", color: "var(--text-muted)" }}>
+                        No notifications yet.
                       </div>
-                    ))}
+                    ) : (
+                      notifications.map(item => (
+                        <div
+                          key={item.id}
+                          style={{
+                            padding: "12px 16px",
+                            borderBottom: "1px solid var(--border-subtle)",
+                            background: item.unread ? "#F8FAFC" : "#FFFFFF",
+                            cursor: "pointer",
+                            transition: "background 0.2s"
+                          }}
+                          onClick={() => {
+                            setNotifications(prev => prev.map(n => n.id === item.id ? { ...n, unread: false } : n));
+                            if (item.unread && currentUser?.uid) {
+                              markNotificationAsRead(currentUser.uid, item.id).catch(err =>
+                                console.warn("Could not mark notification read:", err)
+                              );
+                            }
+                            setSelectedNotification(item);
+                            setShowNotifications(false);
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+                            <span style={{ fontWeight: 600, fontSize: "0.85rem", color: "var(--text-primary)" }}>{item.title}</span>
+                            <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>{item.time}</span>
+                          </div>
+                          <p style={{ fontSize: "0.775rem", color: "var(--text-secondary)", lineHeight: 1.4 }}>{item.text}</p>
+                        </div>
+                      ))
+                    )}
                   </div>
                 </div>
               )}
@@ -453,11 +465,15 @@ export default function Navbar() {
 
               {showMenu && (
                 <div
+                  data-scroll-lock-scrollable="true"
                   style={{
                     position: "absolute",
                     top: "calc(100% + 12px)",
                     right: 0,
                     width: 260,
+                    maxHeight: "calc(100dvh - 80px)",
+                    overflowY: "auto",
+                    overscrollBehavior: "contain",
                     background: "#FFFFFF",
                     border: "1px solid var(--border-light)",
                     borderRadius: "var(--radius-md)",
@@ -551,7 +567,11 @@ export default function Navbar() {
         {/* ── Mobile Hamburger Menu Toggle Button (Available for all on mobile) ── */}
         <button
           className="mobile-hamburger-btn"
-          onClick={() => setShowMobileMenu(prev => !prev)}
+          onClick={() => {
+            setShowMenu(false);
+            setShowNotifications(false);
+            setShowMobileMenu(prev => !prev);
+          }}
           aria-label="Toggle navigation menu"
         >
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
@@ -570,68 +590,113 @@ export default function Navbar() {
           </svg>
         </button>
       </div>
+    </header>
 
-      {/* ── Mobile Drawer ───────────────────────────────────────────── */}
+      {/* ── Mobile Drawer (Outside .site-navbar so backdrop-filter does not trap position:fixed) ── */}
       {showMobileMenu && (
-        <div className="mobile-nav-drawer">
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            {/* User Profile Banner if Logged In */}
-            {showAuthUser && (
-              <div style={{ padding: "12px 14px", background: "#F8FAFC", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-light)", display: "flex", alignItems: "center", gap: 12 }}>
-                <div className="user-avatar-circle" style={{ width: 38, height: 38, fontSize: "0.85rem" }}>
-                  {currentUser?.photoURL ? (
-                    <img src={currentUser.photoURL} alt="Avatar" style={{ width: "100%", height: "100%", borderRadius: "50%", objectFit: "cover" }} />
-                  ) : initials}
-                </div>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontWeight: 800, fontSize: "0.925rem", color: "var(--text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    {currentUser?.displayName || userProfile?.fullName || "Learner"}
+        <>
+          <div
+            className="mobile-drawer-backdrop"
+            onClick={() => setShowMobileMenu(false)}
+            aria-hidden="true"
+          />
+          <div
+            className="mobile-nav-drawer"
+            data-testid="mobile-nav-drawer"
+            data-scroll-lock-scrollable="true"
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {/* User Profile Banner if Logged In */}
+              {showAuthUser && (
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    setShowMobileMenu(false);
+                    navigate("/dashboard", { state: { openTab: "profile" } });
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setShowMobileMenu(false);
+                      navigate("/dashboard", { state: { openTab: "profile" } });
+                    }
+                  }}
+                  style={{
+                    padding: "12px 14px",
+                    background: "#F8FAFC",
+                    borderRadius: "var(--radius-sm)",
+                    border: "1px solid var(--border-light)",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  <div className="user-avatar-circle" style={{ width: 38, height: 38, fontSize: "0.85rem" }}>
+                    {currentUser?.photoURL ? (
+                      <img src={currentUser.photoURL} alt="Avatar" style={{ width: "100%", height: "100%", borderRadius: "50%", objectFit: "cover" }} />
+                    ) : initials}
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
-                    <span className={`pill-badge ${isAdmin ? "pill-solid-dark" : isTutor ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.65rem", padding: "1px 6px" }}>
-                      {isAdmin ? "Admin" : isTutor ? "Tutor" : "Student"}
-                    </span>
-                    {userProfile?.regNumber && (
-                      <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 600 }}>
-                        {userProfile.regNumber}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 800, fontSize: "0.925rem", color: "var(--text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {currentUser?.displayName || userProfile?.fullName || "Learner"}
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
+                      <span className={`pill-badge ${isAdmin ? "pill-solid-dark" : isTutor ? "pill-tech" : "pill-success"}`} style={{ fontSize: "0.65rem", padding: "1px 6px" }}>
+                        {isAdmin ? "Admin" : isTutor ? "Tutor" : "Student"}
                       </span>
-                    )}
+                      {userProfile?.regNumber && (
+                        <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 600 }}>
+                          {userProfile.regNumber}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
-            )}
+              )}
 
-            {/* Search Trigger for Mobile */}
-            <button
-              className="mobile-nav-link"
-              style={{ textAlign: "left", background: "#F1F5F9", borderRadius: "var(--radius-sm)", padding: "10px 14px", border: "none", display: "flex", alignItems: "center", gap: 10, color: "var(--primary-learner)", fontWeight: 600 }}
-              onClick={() => {
-                setShowMobileMenu(false);
-                setShowSearchModal(true);
-              }}
-            >
-              <Search size={18} aria-hidden="true" /> Search courses, skills, tools...
-            </button>
+              {/* Search Trigger for Mobile */}
+              <button
+                className="mobile-nav-link"
+                style={{ textAlign: "left", background: "#F1F5F9", borderRadius: "var(--radius-sm)", padding: "10px 14px", border: "none", display: "flex", alignItems: "center", gap: 10, color: "var(--primary-learner)", fontWeight: 600 }}
+                onClick={() => {
+                  setShowMobileMenu(false);
+                  setShowSearchModal(true);
+                }}
+              >
+                <Search size={18} aria-hidden="true" /> Search courses, skills, tools...
+              </button>
 
-            {/* Navigation Destinations */}
-            {showAuthUser ? (
-              <>
-                <Link
-                  to="/dashboard"
-                  className={`mobile-nav-link ${isActive("/dashboard") ? "active" : ""}`}
-                  style={{ display: "flex", alignItems: "center", gap: 10 }}
-                  onClick={() => setShowMobileMenu(false)}
-                >
-                  <LayoutDashboard size={18} aria-hidden="true" /> Learner Dashboard
-                </Link>
-                <Link
-                  to="/"
-                  className={`mobile-nav-link ${isActive("/") ? "active" : ""}`}
-                  style={{ display: "flex", alignItems: "center", gap: 10 }}
-                  onClick={() => setShowMobileMenu(false)}
-                >
-                  <Compass size={18} aria-hidden="true" /> Course Catalog
-                </Link>
+              {/* Navigation Destinations */}
+              {showAuthUser ? (
+                <>
+                  <Link
+                    to="/dashboard"
+                    state={{ openTab: "profile" }}
+                    className={`mobile-nav-link ${isActive("/dashboard") && location.state?.openTab === "profile" ? "active" : ""}`}
+                    style={{ display: "flex", alignItems: "center", gap: 10 }}
+                    onClick={() => setShowMobileMenu(false)}
+                  >
+                    <User size={18} aria-hidden="true" /> My Profile
+                  </Link>
+                  <Link
+                    to="/dashboard"
+                    state={{ openTab: "dashboard" }}
+                    className={`mobile-nav-link ${isActive("/dashboard") && location.state?.openTab !== "profile" ? "active" : ""}`}
+                    style={{ display: "flex", alignItems: "center", gap: 10 }}
+                    onClick={() => setShowMobileMenu(false)}
+                  >
+                    <LayoutDashboard size={18} aria-hidden="true" /> Learner Dashboard
+                  </Link>
+                  <Link
+                    to="/"
+                    className={`mobile-nav-link ${isActive("/") ? "active" : ""}`}
+                    style={{ display: "flex", alignItems: "center", gap: 10 }}
+                    onClick={() => setShowMobileMenu(false)}
+                  >
+                    <Compass size={18} aria-hidden="true" /> Course Catalog
+                  </Link>
                 <button
                   className="mobile-nav-link"
                   style={{ textAlign: "left", background: "none", border: "none", display: "flex", alignItems: "center", gap: 10 }}
@@ -752,6 +817,7 @@ export default function Navbar() {
             </div>
           </div>
         </div>
+      </>
       )}
 
       {/* ── Resources Modal ─────────────────────────────────────────── */}
@@ -897,38 +963,47 @@ export default function Navbar() {
               </div>
             )}
 
-            <div style={{ display: "flex", flexDirection: "column", gap: 12, maxHeight: 360, overflowY: "auto" }}>
-              {platformResources.map((res) => (
-                <div
-                  key={res.id}
-                  className="resource-item-card"
-                >
-                  <div className="resource-item-info">
-                    <div style={{ fontWeight: 700, fontSize: "0.925rem", color: "var(--text-primary)" }}>{res.title}</div>
-                    <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 2 }}>{res.desc}</div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
-                      <span className="pill-badge pill-success">{res.type}</span>
-                      {res.fileSize && (
-                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>{res.fileSize}</span>
-                      )}
-                      {res.uploaderName && (
-                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-                          • By {res.uploaderName}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <a
-                    href={res.fileUrl || "#"}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="btn btn-outline btn-sm"
-                    style={{ textDecoration: "none", flexShrink: 0 }}
-                  >
-                    Download ↓
-                  </a>
+            <div
+              data-scroll-lock-scrollable="true"
+              style={{ display: "flex", flexDirection: "column", gap: 12, maxHeight: 360, overflowY: "auto", overscrollBehavior: "contain" }}
+            >
+              {platformResources.length === 0 ? (
+                <div style={{ padding: "32px 16px", textAlign: "center", color: "var(--text-muted)", fontSize: "0.875rem", background: "#F8FAFC", borderRadius: "var(--radius-sm)", border: "1px dashed var(--border-light)" }}>
+                  No platform resources published yet.
                 </div>
-              ))}
+              ) : (
+                platformResources.map((res) => (
+                  <div
+                    key={res.id}
+                    className="resource-item-card"
+                  >
+                    <div className="resource-item-info">
+                      <div style={{ fontWeight: 700, fontSize: "0.925rem", color: "var(--text-primary)" }}>{res.title}</div>
+                      <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 2 }}>{res.desc}</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+                        <span className="pill-badge pill-success">{res.type}</span>
+                        {res.fileSize && (
+                          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>{res.fileSize}</span>
+                        )}
+                        {res.uploaderName && (
+                          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                            • By {res.uploaderName}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <a
+                      href={res.fileUrl || "#"}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="btn btn-outline btn-sm"
+                      style={{ textDecoration: "none", flexShrink: 0 }}
+                    >
+                      Download ↓
+                    </a>
+                  </div>
+                ))
+              )}
             </div>
 
             <div style={{ marginTop: 20, textAlign: "right" }}>
@@ -1042,7 +1117,10 @@ export default function Navbar() {
             </div>
 
             {/* Results List */}
-            <div style={{ overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: 10, paddingRight: 4, minHeight: 180 }}>
+            <div
+              data-scroll-lock-scrollable="true"
+              style={{ overflowY: "auto", overscrollBehavior: "contain", flex: 1, display: "flex", flexDirection: "column", gap: 10, paddingRight: 4, minHeight: 180 }}
+            >
               {filteredSearchCourses.length > 0 ? (
                 filteredSearchCourses.map(course => (
                   <div
@@ -1123,13 +1201,17 @@ export default function Navbar() {
           </div>
         </div>
       )}
-    </header>
 
     {/* ── Ergonomic Mobile Bottom Tab Bar (Pattern 1 Mobile Navigation Anchor) ── */}
     <nav className="mobile-bottom-tab-bar" aria-label="Mobile Navigation">
       <div className="mobile-bottom-tab-bar-inner">
         <Link
           to="/"
+          onClick={() => {
+            setShowMobileMenu(false);
+            setShowMenu(false);
+            setShowNotifications(false);
+          }}
           className={`mobile-tab-btn ${location.pathname === "/" && !showMobileMenu ? "active" : ""}`}
           aria-label="Home"
         >
@@ -1139,10 +1221,13 @@ export default function Navbar() {
 
         <Link
           to={showAuthUser ? "/dashboard" : "/"}
+          state={showAuthUser ? { openTab: "browse-courses" } : undefined}
           onClick={(e) => {
-            if (location.pathname === "/") {
+            setShowMobileMenu(false);
+            setShowMenu(false);
+            setShowNotifications(false);
+            if (!showAuthUser && location.pathname === "/") {
               e.preventDefault();
-              setShowMobileMenu(false);
               document.getElementById("courses-catalog-section")?.scrollIntoView({ behavior: "smooth" });
             }
           }}
@@ -1155,8 +1240,13 @@ export default function Navbar() {
 
         <Link
           to={showAuthUser ? "/dashboard" : "/auth"}
-          state={showAuthUser ? undefined : { mode: "login" }}
-          className={`mobile-tab-btn ${location.pathname === "/dashboard" ? "active" : ""}`}
+          state={showAuthUser ? { openTab: "dashboard" } : { mode: "login" }}
+          onClick={() => {
+            setShowMobileMenu(false);
+            setShowMenu(false);
+            setShowNotifications(false);
+          }}
+          className={`mobile-tab-btn ${location.pathname === "/dashboard" && !showMobileMenu ? "active" : ""}`}
           aria-label={showAuthUser ? "Dashboard" : "Sign In"}
         >
           <span className="tab-icon">
@@ -1170,6 +1260,8 @@ export default function Navbar() {
           className="mobile-tab-btn"
           onClick={() => {
             setShowMobileMenu(false);
+            setShowMenu(false);
+            setShowNotifications(false);
             setShowResourcesModal(true);
           }}
           aria-label="Resources"
@@ -1181,7 +1273,11 @@ export default function Navbar() {
         <button
           type="button"
           className={`mobile-tab-btn ${showMobileMenu ? "active" : ""}`}
-          onClick={() => setShowMobileMenu(prev => !prev)}
+          onClick={() => {
+            setShowMenu(false);
+            setShowNotifications(false);
+            setShowMobileMenu(prev => !prev);
+          }}
           aria-label={showAuthUser ? "Profile" : "Menu"}
         >
           <span className="tab-icon">

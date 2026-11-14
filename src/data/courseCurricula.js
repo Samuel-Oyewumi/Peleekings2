@@ -779,5 +779,17 @@ export const COURSE_CURRICULA = {
  * Helper to retrieve curriculum for a given course ID, with safe fallback to AI Essentials.
  */
 export function getCurriculumForCourse(courseId) {
-  return COURSE_CURRICULA[courseId] || COURSE_CURRICULA["ai-essentials"];
+  if (courseId && Object.prototype.hasOwnProperty.call(COURSE_CURRICULA, courseId)) {
+    return COURSE_CURRICULA[courseId];
+  }
+  return {
+    overview: {
+      description: "",
+      objectives: [],
+    },
+    assignment: null,
+    quizQuestions: [],
+    notesFileName: "",
+    modules: [],
+  };
 }

@@ -26,6 +26,7 @@ service firebase.storage {
         isAdmin() ||
         (
           firestore.exists(/databases/(default)/documents/courses/$(courseId)) &&
+          firestore.get(/databases/(default)/documents/courses/$(courseId)).data.status != 'deleting' &&
           (
             firestore.get(/databases/(default)/documents/courses/$(courseId)).data.tutorId == request.auth.uid ||
             firestore.get(/databases/(default)/documents/courses/$(courseId)).data.tutorUid == request.auth.uid ||
@@ -37,68 +38,97 @@ service firebase.storage {
       );
     }
 
-    // Verified enrollment lookup in Cloud Firestore
+    // Verified active enrollment lookup in Cloud Firestore
     function isEnrolledStudent(courseId, uid) {
-      return firestore.exists(/databases/(default)/documents/enrollments/$(uid + '_' + courseId));
+      return firestore.exists(/databases/(default)/documents/courses/$(courseId)) &&
+        firestore.get(/databases/(default)/documents/courses/$(courseId)).data.status == 'published' &&
+        firestore.exists(/databases/(default)/documents/enrollments/$(uid + '_' + courseId)) &&
+        firestore.get(/databases/(default)/documents/enrollments/$(uid + '_' + courseId)).data.status in ['active', 'approved'];
     }
 
     // Size validation helpers
     function isValidSize(maxMb) {
-      return request.resource.size <= maxMb * 1024 * 1024;
+      return request.resource != null && request.resource.size <= maxMb * 1024 * 1024;
     }
 
     // Allowed image formats (PNG, JPEG, WebP, GIF, SVG)
     function isImage() {
-      return request.resource.contentType.matches('image/.*');
+      return request.resource != null && request.resource.contentType.matches('image/.*');
     }
 
     // Allowed deliverable document formats (PDF, DOC/DOCX, PPT/PPTX, XLS/XLSX, TXT, ZIP, Images)
     function isValidSubmissionType() {
-      return isImage() ||
+      return request.resource != null && (
+        isImage() ||
         request.resource.contentType == 'application/pdf' ||
         request.resource.contentType == 'text/plain' ||
         request.resource.contentType.matches('application/(zip|x-zip-compressed|x-zip)') ||
         request.resource.contentType.matches('application/vnd\\.openxmlformats-officedocument\\..*') ||
-        request.resource.contentType.matches('application/(msword|vnd\\.ms-excel|vnd\\.ms-powerpoint)');
+        request.resource.contentType.matches('application/(msword|vnd\\.ms-excel|vnd\\.ms-powerpoint)')
+      );
     }
 
     // Allowed educational resource file formats
     function isValidResourceType() {
-      return isValidSubmissionType() ||
-        request.resource.contentType.matches('(video|audio)/.*');
+      return request.resource != null && (
+        isValidSubmissionType() ||
+        request.resource.contentType.matches('(video|audio)/.*')
+      );
     }
 
     // ── 1. User Profile Portraits: users/{uid}/portrait/{allPaths=**} ────
     match /users/{uid}/portrait/{allPaths=**} {
       allow read: if isSignedIn();
-      allow write: if isOwner(uid) && isValidSize(5) && isImage();
+      allow create, update: if isOwner(uid) && isValidSize(5) && isImage();
+      allow delete: if isOwner(uid) || isAdmin();
     }
 
     // ── 2. Course Submissions: courses/{courseId}/submissions/{uid}/{allPaths=**} ────
     // Read: Submitting student, verified assigned course tutor, or admin
-    // Write: Student owner who is enrolled in this course (max 25MB, validated file types)
+    // Write: Student owner who has an active/approved enrollment in this course (max 25MB, validated file types)
     match /courses/{courseId}/submissions/{uid}/{allPaths=**} {
       allow read: if isOwner(uid) || isAdmin() || isAssignedCourseTutor(courseId);
-      allow write: if isOwner(uid) && (isEnrolledStudent(courseId, uid) || isAdmin()) && isValidSize(25) && isValidSubmissionType();
+      allow create, update: if isOwner(uid) && (isEnrolledStudent(courseId, uid) || isAdmin()) && isValidSize(25) && isValidSubmissionType();
+      allow delete: if isAdmin();
     }
 
     // ── 3. Course Resources: courses/{courseId}/resources/{allPaths=**} ────
-    // Read: Enrolled learners, assigned course tutors, or admins
-    // Write: Strictly assigned course tutors or admins (max 50MB, validated resource types)
+    // Read: Actively enrolled learners, assigned course tutors, or admins
+    // Create/Update: Strictly assigned course tutors or admins (max 50MB, validated resource types)
+    // Delete: Strictly assigned course tutors or admins
     match /courses/{courseId}/resources/{allPaths=**} {
       allow read: if isSignedIn() && (isEnrolledStudent(courseId, request.auth.uid) || isAssignedCourseTutor(courseId) || isAdmin());
-      allow write: if (isAdmin() || isAssignedCourseTutor(courseId)) && isValidSize(50) && isValidResourceType();
+      allow create, update: if (isAdmin() || isAssignedCourseTutor(courseId)) && isValidSize(50) && isValidResourceType();
+      allow delete: if isAdmin() || isAssignedCourseTutor(courseId);
     }
 
-    // ── 4. Platform Resources: resources/{allPaths=**} ─────────────
+    // ── 4. Course Module Materials: courses/{courseId}/{moduleId}/{allPaths=**} ────
+    match /courses/{courseId}/{moduleId}/{allPaths=**} {
+      allow read: if isSignedIn() &&
+        moduleId != 'submissions' &&
+        moduleId != 'resources' &&
+        (isEnrolledStudent(courseId, request.auth.uid) || isAssignedCourseTutor(courseId) || isAdmin());
+      allow create, update: if moduleId != 'submissions' &&
+        moduleId != 'resources' &&
+        (isAdmin() || isAssignedCourseTutor(courseId)) &&
+        isValidSize(50) &&
+        isValidResourceType();
+      allow delete: if moduleId != 'submissions' &&
+        moduleId != 'resources' &&
+        (isAdmin() || isAssignedCourseTutor(courseId));
+    }
+
+    // ── 5. Platform Resources: resources/{allPaths=**} ─────────────
     // Read: All signed-in platform users
-    // Write: Strictly verified administrators (max 50MB, validated resource types)
+    // Create/Update: Strictly verified administrators (max 50MB, validated resource types)
+    // Delete: Strictly verified administrators
     match /resources/{allPaths=**} {
       allow read: if isSignedIn();
-      allow write: if isAdmin() && isValidSize(50) && isValidResourceType();
+      allow create, update: if isAdmin() && isValidSize(50) && isValidResourceType();
+      allow delete: if isAdmin();
     }
 
-    // ── 5. Default Deny ───────────────────────────────────────────
+    // ── 6. Default Deny ───────────────────────────────────────────
     match /{allPaths=**} {
       allow read, write: if false;
     }

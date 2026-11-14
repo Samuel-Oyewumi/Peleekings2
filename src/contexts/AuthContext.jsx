@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, useCallback } from "react";
+import { createContext, useContext, useEffect, useState, useCallback, useRef } from "react";
 import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
@@ -8,10 +8,14 @@ import {
   GoogleAuthProvider,
   signInWithPopup,
   sendPasswordResetEmail,
+  confirmPasswordReset,
+  verifyPasswordResetCode,
+  updatePassword,
 } from "firebase/auth";
 import { doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore";
-import { auth, db } from "../firebase";
-import { enrollInCourse } from "./userActivity";
+import { httpsCallable } from "firebase/functions";
+import { auth, db, functions } from "../firebase";
+import { validatePasswordOrThrow } from "../utils/passwordPolicy";
 
 const AuthContext = createContext(null);
 
@@ -36,7 +40,13 @@ function formatAuthError(err) {
     case "auth/email-already-in-use":
       return "An account with this email address already exists. Please sign in.";
     case "auth/weak-password":
-      return "Password should be at least 6 characters.";
+    case "auth/password-does-not-meet-requirements":
+      return "Password must be at least 8 characters long and include at least one number (0–9).";
+    case "auth/expired-action-code":
+    case "auth/invalid-action-code":
+      return "This password reset link is invalid or has expired. Please request a new reset link.";
+    case "auth/requires-recent-login":
+      return "For your security, please sign out and sign back in before changing your password.";
     case "auth/invalid-email":
       return "Please enter a valid email address.";
     case "auth/user-disabled":
@@ -50,6 +60,50 @@ function formatAuthError(err) {
     default:
       return err.message || "Authentication failed. Please try again.";
   }
+}
+
+/**
+ * Unified privilege-resolution policy from Firebase Auth Custom Claims.
+ * - Requires verified boolean custom claims (`admin: true` or `tutor: true`).
+ * - Contradictory claims (e.g., both admin & tutor true, or role string mismatching boolean claim)
+ *   strictly FAIL CLOSED to unprivileged "student".
+ */
+export function resolveClaimsPrivilege(rawClaims) {
+  if (!rawClaims || typeof rawClaims !== "object") {
+    return { isAdmin: false, isTutor: false, role: "student", hasContradiction: false };
+  }
+
+  const adminClaim = rawClaims.admin;
+  const tutorClaim = rawClaims.tutor;
+  const roleClaim = rawClaims.role;
+
+  const invalidBooleanType =
+    (adminClaim !== undefined && typeof adminClaim !== "boolean") ||
+    (tutorClaim !== undefined && typeof tutorClaim !== "boolean");
+
+  const bothPrivilegedTrue = adminClaim === true && tutorClaim === true;
+  const adminRoleMismatch =
+    (adminClaim === true && roleClaim !== undefined && roleClaim !== "admin") ||
+    (roleClaim === "admin" && adminClaim !== true);
+  const tutorRoleMismatch =
+    (tutorClaim === true && roleClaim !== undefined && roleClaim !== "tutor") ||
+    (roleClaim === "tutor" && tutorClaim !== true);
+
+  if (invalidBooleanType || bothPrivilegedTrue || adminRoleMismatch || tutorRoleMismatch) {
+    console.warn("Security: Contradictory or malformed custom claims detected; failing closed to student.");
+    return { isAdmin: false, isTutor: false, role: "student", hasContradiction: true };
+  }
+
+  const verifiedAdmin = adminClaim === true;
+  const verifiedTutor = tutorClaim === true || verifiedAdmin;
+  const resolvedRole = verifiedAdmin ? "admin" : verifiedTutor ? "tutor" : "student";
+
+  return {
+    isAdmin: verifiedAdmin,
+    isTutor: verifiedTutor,
+    role: resolvedRole,
+    hasContradiction: false,
+  };
 }
 
 export function useAuth() {
@@ -69,6 +123,7 @@ export function AuthProvider({ children }) {
   const [role, setRole] = useState("student");
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState(null);
+  const signupInFlightRef = useRef(false);
 
   /**
    * Refreshes the ID token and custom claims from Firebase Authentication.
@@ -87,9 +142,8 @@ export function AuthProvider({ children }) {
     try {
       const tokenResult = await withTimeout(auth.currentUser.getIdTokenResult(true), 4000);
       const userClaims = tokenResult.claims || {};
-      const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
-      const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
-      const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
+      const { isAdmin: verifiedAdmin, isTutor: verifiedTutor, role: resolvedRole } =
+        resolveClaimsPrivilege(userClaims);
 
       setClaims(userClaims);
       setIsAdmin(verifiedAdmin);
@@ -176,9 +230,8 @@ export function AuthProvider({ children }) {
           // Fetch verified claims directly from Firebase Authentication token
           const tokenResult = await withTimeout(user.getIdTokenResult(), 3500);
           const userClaims = tokenResult.claims || {};
-          const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
-          const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
-          const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
+          const { isAdmin: verifiedAdmin, isTutor: verifiedTutor, role: resolvedRole } =
+            resolveClaimsPrivilege(userClaims);
 
           if (!isMounted) return;
           setCurrentUser(user);
@@ -239,11 +292,15 @@ export function AuthProvider({ children }) {
   /**
    * signup:
    * Standard Firebase Authentication registration.
-   * Writes initial non-privileged user document with ONLY permitted registration fields.
-   * Role and regNumber are omitted; trusted onUserCreated Cloud Function assigns them.
-   * Throws if Firestore profile write fails (never silently ignores failures).
+   * Enforces strict password policy (8+ chars, >= 1 digit) before creating account.
+   * Parallelizes profile initialization and immediate registration code allocation
+   * so the registration code is returned without waiting for cold-start triggers.
    */
   async function signup(email, password, arg3, arg4) {
+    if (signupInFlightRef.current) {
+      throw new Error("Registration is already in progress. Please wait.");
+    }
+
     let displayName = "";
     let customProfile = {};
     if (typeof arg3 === "string") {
@@ -258,74 +315,105 @@ export function AuthProvider({ children }) {
     const cleanName = (displayName || customProfile.fullName || "").trim();
 
     if (!cleanEmail) throw new Error("Please provide a valid email address.");
-    if (!password || password.length < 6) throw new Error("Password must be at least 6 characters.");
+    validatePasswordOrThrow(password);
 
-    let userCredential;
+    signupInFlightRef.current = true;
     try {
-      userCredential = await createUserWithEmailAndPassword(auth, cleanEmail, password);
-    } catch (authErr) {
-      throw new Error(formatAuthError(authErr));
-    }
-
-    const user = userCredential.user;
-
-    if (cleanName) {
+      let userCredential;
       try {
-        await updateProfile(user, { displayName: cleanName });
-      } catch (e) {
-        console.warn("Could not set display name in Firebase Auth:", e);
+        userCredential = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      } catch (authErr) {
+        throw new Error(formatAuthError(authErr));
       }
+
+      const user = userCredential.user;
+
+      // Write initial user profile with ONLY permitted registration fields.
+      // Crucially: 'role' is omitted so server-side logic assigns the authoritative role.
+      const isNonCorper = customProfile.studentType === "non_corper";
+      const surnameClean = (customProfile.surname || "").trim();
+      const firstNameClean = (customProfile.firstName || "").trim();
+      const initialData = {
+        uid: user.uid,
+        email: cleanEmail,
+        displayName: cleanName || cleanEmail.split("@")[0],
+        fullName: cleanName || cleanEmail.split("@")[0],
+        surname: surnameClean || null,
+        firstName: firstNameClean || null,
+        studentType: customProfile.studentType || "non_corper",
+        nyscStateCode: isNonCorper ? null : (customProfile.nyscStateCode || null),
+        phoneNumber: customProfile.phoneNumber || "",
+        createdAt: serverTimestamp(),
+        status: "active",
+      };
+
+      const updateAuthProfilePromise = cleanName
+        ? updateProfile(user, { displayName: cleanName }).catch((e) => {
+            console.warn("Could not set display name in Firebase Auth:", e);
+          })
+        : Promise.resolve();
+
+      const writeFirestoreProfilePromise = withTimeout(
+        setDoc(doc(db, "users", user.uid), initialData, { merge: true }),
+        3500
+      ).catch((firestoreErr) => {
+        console.warn("Notice: Initial user profile write timed out or failed in Firestore:", firestoreErr);
+      });
+
+      const tokenResultPromise = withTimeout(user.getIdTokenResult(false), 2500).catch(() => ({
+        claims: {},
+      }));
+
+      const allocateRegCodePromise = (async () => {
+        try {
+          const allocateFn = httpsCallable(functions, "allocateRegistrationCode");
+          const res = await withTimeout(
+            allocateFn({
+              email: cleanEmail,
+              fullName: initialData.fullName,
+              displayName: initialData.displayName,
+              surname: surnameClean,
+              firstName: firstNameClean,
+              studentType: initialData.studentType,
+              nyscStateCode: initialData.nyscStateCode,
+              phoneNumber: initialData.phoneNumber,
+            }),
+            3000
+          );
+          return res?.data?.regNumber || null;
+        } catch {
+          return null;
+        }
+      })();
+
+      const [, , tokenResult, allocatedRegNumber] = await Promise.all([
+        updateAuthProfilePromise,
+        writeFirestoreProfilePromise,
+        tokenResultPromise,
+        allocateRegCodePromise,
+      ]);
+
+      const userClaims = tokenResult?.claims || {};
+      const { isAdmin: verifiedAdmin, isTutor: verifiedTutor, role: resolvedRole } =
+        resolveClaimsPrivilege(userClaims);
+
+      const resolvedProfile = {
+        ...initialData,
+        ...(allocatedRegNumber ? { regNumber: allocatedRegNumber } : {}),
+        role: resolvedRole,
+      };
+
+      setCurrentUser(user);
+      setClaims(userClaims);
+      setIsAdmin(verifiedAdmin);
+      setIsTutor(verifiedTutor);
+      setRole(resolvedRole);
+      setUserProfile(resolvedProfile);
+
+      return { user, role: resolvedRole, profile: resolvedProfile };
+    } finally {
+      signupInFlightRef.current = false;
     }
-
-    // Write initial user profile with ONLY permitted registration fields.
-    // Crucially: 'role' is omitted so onUserCreated Cloud Function assigns the authoritative role.
-    const isNonCorper = customProfile.studentType === "non_corper";
-    const surnameClean = (customProfile.surname || "").trim();
-    const firstNameClean = (customProfile.firstName || "").trim();
-    const initialData = {
-      uid: user.uid,
-      email: cleanEmail,
-      displayName: cleanName || cleanEmail.split("@")[0],
-      fullName: cleanName || cleanEmail.split("@")[0],
-      surname: surnameClean || null,
-      firstName: firstNameClean || null,
-      studentType: customProfile.studentType || "non_corper",
-      nyscStateCode: isNonCorper ? null : (customProfile.nyscStateCode || null),
-      phoneNumber: customProfile.phoneNumber || "",
-      createdAt: serverTimestamp(),
-      status: "active",
-    };
-
-    // Strict profile creation with timeout protection so UI never hangs indefinitely
-    try {
-      await withTimeout(setDoc(doc(db, "users", user.uid), initialData, { merge: true }), 4000);
-    } catch (firestoreErr) {
-      console.warn("Notice: Initial user profile write timed out or failed in Firestore:", firestoreErr);
-    }
-
-    // Auto-enroll in default welcome course
-    enrollInCourse(user.uid, "ai-essentials", "online")
-      .catch((err) => console.warn("Notice: auto-enrollment in default course skipped:", err));
-
-    let tokenResult;
-    try {
-      tokenResult = await withTimeout(user.getIdTokenResult(true), 3500);
-    } catch {
-      tokenResult = { claims: {} };
-    }
-    const userClaims = tokenResult.claims || {};
-    const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
-    const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
-    const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
-
-    setCurrentUser(user);
-    setClaims(userClaims);
-    setIsAdmin(verifiedAdmin);
-    setIsTutor(verifiedTutor);
-    setRole(resolvedRole);
-    setUserProfile({ ...initialData, role: resolvedRole });
-
-    return { user, role: resolvedRole, profile: initialData };
   }
 
   /**
@@ -347,17 +435,16 @@ export function AuthProvider({ children }) {
 
     const user = userCredential.user;
 
-    // Force refresh ID token to get latest Custom Claims
+    // Force refresh ID token to get latest Custom Claims; fail closed if verification fails
     let tokenResult;
     try {
       tokenResult = await withTimeout(user.getIdTokenResult(true), 3500);
     } catch {
-      tokenResult = await user.getIdTokenResult(false).catch(() => ({ claims: {} }));
+      tokenResult = { claims: {} };
     }
     const userClaims = tokenResult.claims || {};
-    const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
-    const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
-    const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
+    const { isAdmin: verifiedAdmin, isTutor: verifiedTutor, role: resolvedRole } =
+      resolveClaimsPrivilege(userClaims);
 
     setCurrentUser(user);
     setClaims(userClaims);
@@ -391,12 +478,11 @@ export function AuthProvider({ children }) {
     try {
       tokenResult = await withTimeout(user.getIdTokenResult(true), 3500);
     } catch {
-      tokenResult = await user.getIdTokenResult(false).catch(() => ({ claims: {} }));
+      tokenResult = { claims: {} };
     }
     const userClaims = tokenResult.claims || {};
-    const verifiedAdmin = userClaims.admin === true || userClaims.role === "admin";
-    const verifiedTutor = userClaims.tutor === true || userClaims.role === "tutor" || verifiedAdmin;
-    const resolvedRole = verifiedAdmin ? "admin" : (verifiedTutor ? "tutor" : "student");
+    const { isAdmin: verifiedAdmin, isTutor: verifiedTutor, role: resolvedRole } =
+      resolveClaimsPrivilege(userClaims);
 
     // Check if Firestore profile exists; create with ONLY permitted registration fields if first-time user
     try {
@@ -429,7 +515,6 @@ export function AuthProvider({ children }) {
           createdAt: serverTimestamp(),
         };
         await withTimeout(setDoc(userRef, initialGoogleData), 3500);
-        enrollInCourse(user.uid, "ai-essentials", "online").catch(() => {});
       }
     } catch (fsErr) {
       console.warn("Google sign-in profile sync notice:", fsErr);
@@ -450,6 +535,40 @@ export function AuthProvider({ children }) {
     const cleanEmail = (email || "").trim().toLowerCase();
     if (!cleanEmail) throw new Error("Please enter your email address to reset password.");
     return sendPasswordResetEmail(auth, cleanEmail);
+  }
+
+  /**
+   * Completes a password reset flow (oobCode from email link) while enforcing the password policy.
+   */
+  async function confirmResetPassword(oobCode, newPassword) {
+    const cleanCode = (oobCode || "").trim();
+    if (!cleanCode) {
+      throw new Error("Missing or invalid password reset code.");
+    }
+    validatePasswordOrThrow(newPassword);
+    try {
+      await verifyPasswordResetCode(auth, cleanCode);
+      await confirmPasswordReset(auth, cleanCode, newPassword);
+      return true;
+    } catch (err) {
+      throw new Error(formatAuthError(err));
+    }
+  }
+
+  /**
+   * Updates the currently signed-in user's password while enforcing the password policy.
+   */
+  async function changeUserPassword(newPassword) {
+    if (!auth.currentUser) {
+      throw new Error("You must be signed in to update your password.");
+    }
+    validatePasswordOrThrow(newPassword);
+    try {
+      await updatePassword(auth.currentUser, newPassword);
+      return true;
+    } catch (err) {
+      throw new Error(formatAuthError(err));
+    }
   }
 
   async function logout() {
@@ -487,6 +606,8 @@ export function AuthProvider({ children }) {
     logout,
     loginWithGoogle,
     resetPassword,
+    confirmResetPassword,
+    changeUserPassword,
     refreshClaims,
   };
 

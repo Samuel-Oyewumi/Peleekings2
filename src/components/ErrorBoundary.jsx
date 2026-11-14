@@ -174,20 +174,18 @@ export default class ErrorBoundary extends Component {
               <button
                 type="button"
                 className="btn btn-solid-dark btn-sm"
-                onClick={isChunkError ? this.handleReload : this.handleRetry}
+                onClick={this.handleRetry}
               >
-                {isChunkError ? "Reload Application" : "Try Again"}
+                Try Again
               </button>
 
-              {!isChunkError && (
-                <button
-                  type="button"
-                  className="btn btn-outline btn-sm"
-                  onClick={this.handleReload}
-                >
-                  Reload Page
-                </button>
-              )}
+              <button
+                type="button"
+                className="btn btn-outline btn-sm"
+                onClick={this.handleReload}
+              >
+                Reload Page
+              </button>
 
               {!this.props.inline && (
                 <a

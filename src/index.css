@@ -3480,3 +3480,152 @@ button, a, input, select, textarea {
   }
 }
 
+/* ── Mobile Profile, Drawer & Modal Scroll Containment ──────────────── */
+.profile-mobile-close-btn {
+  display: none;
+}
+
+.mobile-drawer-backdrop,
+.portal-sidebar-backdrop,
+.modal-backdrop-overlay {
+  touch-action: none;
+  overscroll-behavior: none;
+}
+
+.mobile-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.4);
+  backdrop-filter: blur(2px);
+  z-index: 940;
+}
+
+.mobile-nav-drawer {
+  position: fixed;
+  top: var(--nav-height);
+  left: 0;
+  right: 0;
+  max-height: calc(100vh - var(--nav-height));
+  max-height: calc(100dvh - var(--nav-height));
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  z-index: 950;
+}
+
+.modal-dialog-box,
+.portal-modal-card {
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+body[data-scroll-locked="true"],
+html:has(body[data-scroll-locked="true"]) {
+  overflow: hidden !important;
+  overscroll-behavior: none !important;
+}
+
+body[data-scroll-locked="true"]:has(.site-navbar) {
+  padding-top: var(--nav-height);
+}
+
+body[data-scroll-locked="true"] .site-navbar {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  width: 100% !important;
+  z-index: 1000 !important;
+}
+
+body[data-scroll-locked="true"] .app-container,
+body[data-scroll-locked="true"] .dashboard-page-layout,
+body[data-scroll-locked="true"] .dashboard-main-area,
+body[data-scroll-locked="true"] .classroom-container,
+body[data-scroll-locked="true"] .classroom-split-layout,
+body[data-scroll-locked="true"] .classroom-video-main,
+body[data-scroll-locked="true"] .portal-main-container,
+body[data-scroll-locked="true"] .admin-panel-container {
+  overflow: hidden !important;
+  overscroll-behavior: none !important;
+}
+
+@media (max-width: 1024px) {
+  .profile-mobile-close-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .portal-left-sidebar,
+  .classroom-curriculum-sidebar {
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+  }
+
+  .dashboard-main-area.dashboard-profile-active > :not(.dashboard-profile-panel) {
+    display: none !important;
+  }
+
+  .dashboard-profile-panel {
+    position: fixed;
+    top: var(--nav-height);
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 900;
+    margin: 0 !important;
+    max-width: 100% !important;
+    max-height: none;
+    border-radius: 0 !important;
+    border-left: none !important;
+    border-right: none !important;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: #FFFFFF;
+    padding: 16px 20px 0 !important;
+  }
+
+  .dashboard-profile-header {
+    flex-shrink: 0;
+    padding-bottom: 12px;
+    margin-bottom: 12px !important;
+    border-bottom: 1px solid var(--border-light);
+    background: #FFFFFF;
+    touch-action: none;
+  }
+
+  .dashboard-profile-scroll-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    touch-action: pan-y;
+    padding-bottom: 28px;
+  }
+}
+
+@media (max-width: 768px) {
+  body[data-scroll-locked="true"]:has(.site-navbar) {
+    padding-top: 52px;
+  }
+
+  .mobile-nav-drawer {
+    top: 52px;
+    max-height: calc(100vh - 108px);
+    max-height: calc(100dvh - 108px);
+  }
+
+  .dashboard-profile-panel {
+    top: 52px;
+    bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+    padding: 16px 16px 0 !important;
+  }
+}
+

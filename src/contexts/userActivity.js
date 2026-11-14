@@ -14,11 +14,31 @@ import {
   getDocs,
   serverTimestamp,
   arrayUnion,
-  arrayRemove,
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { db, storage } from "../firebase";
+import { httpsCallable } from "firebase/functions";
+import { db, storage, functions } from "../firebase";
 import { COURSES_CATALOG } from "../data/courses";
+import { getCurriculumForCourse } from "../data/courseCurricula";
+
+const MAX_SUBMISSION_FILE_BYTES = 25 * 1024 * 1024; // 25MB matching storage.rules
+
+function isAllowedSubmissionFile(file) {
+  if (!file) return true;
+  if (typeof file.size === "number" && file.size > MAX_SUBMISSION_FILE_BYTES) {
+    return false;
+  }
+  const type = (file.type || "").toLowerCase();
+  if (!type) return false;
+  return (
+    type.startsWith("image/") ||
+    type === "application/pdf" ||
+    type === "text/plain" ||
+    /^application\/(zip|x-zip-compressed|x-zip)$/.test(type) ||
+    /^application\/vnd\.openxmlformats-officedocument\..*/.test(type) ||
+    /^application\/(msword|vnd\.ms-excel|vnd\.ms-powerpoint)$/.test(type)
+  );
+}
 
 // ── Daily Activity Tracking ────────────────────────────────────────────────
 
@@ -125,72 +145,90 @@ export async function getWeeklyActivityData(uid) {
 }
 
 /**
- * Enroll a user in a course.
- * Writes to enrollments/{uid}_{courseId} via setDoc with merge: true.
- * Synchronously updates the user's local activity cache so UI updates immediately.
+ * Helper to verify whether an enrollment record grants active classroom access.
+ */
+export function isEnrollmentAuthorized(enrollment) {
+  return Boolean(enrollment && (enrollment.status === "active" || enrollment.status === "approved"));
+}
+
+/**
+ * Request or activate enrollment for a user in a course via the server-authoritative
+ * requestCourseEnrollment Cloud Function.
+ * - Hands-on requests and courses with requiresApproval == true return status: "pending".
+ * - Eligible published online courses that do not require approval return status: "active".
+ * - Missing or unpublished courses are rejected.
  */
 export async function enrollInCourse(uid, courseId, experienceType = "online", totalLessons = 1) {
-  if (!uid || !courseId) return null;
+  if (!uid || typeof uid !== "string" || !uid.trim()) {
+    throw new Error("Authentication required to enroll in a course.");
+  }
+  if (
+    !courseId ||
+    typeof courseId !== "string" ||
+    !courseId.trim() ||
+    courseId === "general" ||
+    courseId === "platform"
+  ) {
+    throw new Error("A valid courseId is required to enroll.");
+  }
 
-  const course = COURSES_CATALOG.find((item) => item.id === courseId);
-  const enrollmentId = `${uid}_${courseId}`;
-  const enrollmentRef = doc(db, "enrollments", enrollmentId);
+  const normalizedCourseId = courseId.trim();
+  const normalizedExp = experienceType === "hands-on" ? "hands-on" : "online";
+  const enrollmentId = `${uid}_${normalizedCourseId}`;
 
-  const newEnrollment = {
+  const requestEnrollmentFn = httpsCallable(functions, "requestCourseEnrollment");
+  const response = await requestEnrollmentFn({
+    courseId: normalizedCourseId,
+    experienceType: normalizedExp,
+    totalLessons: Math.max(Number(totalLessons) || 0, 0),
+  });
+
+  const resultData = response?.data || {};
+  const persistedEnrollment = resultData.enrollment || {
+    id: resultData.enrollmentId || enrollmentId,
     uid,
-    courseId,
-    courseTitle: course?.title || "Course",
-    enrolledAt: serverTimestamp(),
-    status: "active",
-    experienceType: experienceType === "hands-on" ? "hands-on" : "online",
+    courseId: normalizedCourseId,
+    experienceType: normalizedExp,
+    status: resultData.status || (normalizedExp === "hands-on" ? "pending" : "active"),
     completedItemIds: [],
     progressPercent: 0,
-    totalLessons: Math.max(totalLessons, 1),
-    currentModule: "Module 1",
-    updatedAt: serverTimestamp(),
+    totalLessons: Math.max(Number(totalLessons) || 0, 0),
   };
 
-  // 1. Instantly update local activity cache and notify all UI listeners
+  // Update in-memory activity cache after server confirmation
   try {
+    const course = COURSES_CATALOG.find((item) => item.id === normalizedCourseId);
     const currentActivity = getUserActivity(uid);
-    const existing = (currentActivity.enrolledCourses || []).find((c) => c.id === courseId);
-    if (!existing) {
-      const courseCard = {
-        id: courseId,
-        title: course?.title || courseId,
-        type: experienceType === "hands-on" ? "Hands-on Practical" : "Online",
-        progress: 0,
-        currentModule: "0 lessons completed",
-        image:
-          course?.image ||
-          "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=500&auto=format&fit=crop&q=80",
-        enrolledAt: new Date().toISOString(),
-      };
-      const updated = {
-        ...currentActivity,
-        enrolledCourses: [courseCard, ...(currentActivity.enrolledCourses || [])],
-      };
-      saveUserActivity(uid, updated);
+    const existingIdx = (currentActivity.enrolledCourses || []).findIndex((c) => c.id === normalizedCourseId);
+    const courseCard = {
+      id: normalizedCourseId,
+      title: persistedEnrollment.courseTitle || course?.title || normalizedCourseId,
+      type: persistedEnrollment.experienceType === "hands-on" ? "Hands-on Practical" : "Online",
+      status: persistedEnrollment.status || "pending",
+      progress: persistedEnrollment.progressPercent || 0,
+      currentModule: isEnrollmentAuthorized(persistedEnrollment)
+        ? `${(persistedEnrollment.completedItemIds || []).length} lessons completed`
+        : "Pending approval",
+      image:
+        course?.image ||
+        "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=500&auto=format&fit=crop&q=80",
+      enrolledAt: new Date().toISOString(),
+    };
+    const nextList = [...(currentActivity.enrolledCourses || [])];
+    if (existingIdx >= 0) {
+      nextList[existingIdx] = courseCard;
+    } else {
+      nextList.unshift(courseCard);
     }
+    saveUserActivity(uid, {
+      ...currentActivity,
+      enrolledCourses: nextList,
+    });
   } catch (cacheErr) {
     console.warn("Notice: could not update local cache for enrollment:", cacheErr);
   }
 
-  // 2. Persist directly to Firestore: check existence first and only create if it doesn't exist
-  // Using setDoc(..., {merge: true}) triggers an UPDATE on existing docs which violates strict update rules
-  try {
-    const existingSnap = await getDoc(enrollmentRef);
-    if (!existingSnap.exists()) {
-      await setDoc(enrollmentRef, newEnrollment);
-    } else {
-      return { id: enrollmentId, ...existingSnap.data() };
-    }
-  } catch (err) {
-    console.error(`Firestore enrollment error for ${enrollmentId}:`, err);
-    throw err;
-  }
-
-  return { id: enrollmentId, ...newEnrollment };
+  return persistedEnrollment;
 }
 
 /**
@@ -211,19 +249,20 @@ export async function getCourseEnrollment(uid, courseId) {
 }
 
 /**
- * Fetch all active enrollments for a user from Firestore.
+ * Fetch enrollments for a user from Firestore.
+ * By default returns both active/approved and pending enrollments so UI can show accurate status.
  */
-export async function getUserEnrollments(uid) {
+export async function getUserEnrollments(uid, { activeOnly = false } = {}) {
   if (!uid) return [];
   try {
     const q = query(
       collection(db, "enrollments"),
-      where("uid", "==", uid),
-      where("status", "==", "active")
+      where("uid", "==", uid)
     );
     const snap = await getDocs(q);
     if (!snap.empty) {
-      return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const all = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      return activeOnly ? all.filter((e) => isEnrollmentAuthorized(e)) : all;
     }
     return [];
   } catch (err) {
@@ -234,10 +273,16 @@ export async function getUserEnrollments(uid) {
 
 /**
  * Toggle lesson/item completion and recompute progressPercent.
- * Uses arrayUnion / arrayRemove in Firestore and recomputes progress based on total items.
+ * - Requires an active or approved enrollment in Firestore.
+ * - Calculates unique canonical curriculum items across lessons, notes, assignments, and tests subcollections.
+ * - Verifies lessonId belongs to the course's valid curriculum items before adding it.
+ * - Filters out deleted/invalid item IDs from completedItemIds and caps progressPercent at 100%.
+ * - Only uses enrollmentData.totalLessons || fallbackTotalLessons when Firestore curriculum subcollections are empty.
  */
 export async function toggleLessonCompletion(uid, courseId, lessonId, fallbackTotalLessons = 8) {
-  if (!uid || !courseId || !lessonId) return null;
+  if (!uid || !courseId || !lessonId) {
+    throw new Error("Missing uid, courseId, or lessonId.");
+  }
 
   const enrollmentId = `${uid}_${courseId}`;
   const enrollmentRef = doc(db, "enrollments", enrollmentId);
@@ -249,54 +294,79 @@ export async function toggleLessonCompletion(uid, courseId, lessonId, fallbackTo
     }
 
     const enrollmentData = enrollmentSnap.data();
-    const currentCompleted = new Set(enrollmentData.completedItemIds || enrollmentData.completedLessonIds || []);
+    if (!isEnrollmentAuthorized(enrollmentData)) {
+      throw new Error("Enrollment is not active. Active course access is required to update lesson progress.");
+    }
+
+    // 1. Query actual curriculum subcollections: lessons, notes, assignments, tests
+    const [lessonsSnap, notesSnap, asnSnap, testsSnap] = await Promise.all([
+      getDocs(collection(db, "courses", courseId, "lessons")).catch(() => ({ docs: [] })),
+      getDocs(collection(db, "courses", courseId, "notes")).catch(() => ({ docs: [] })),
+      getDocs(collection(db, "courses", courseId, "assignments")).catch(() => ({ docs: [] })),
+      getDocs(collection(db, "courses", courseId, "tests")).catch(() => ({ docs: [] })),
+    ]);
+
+    const firestoreItemIds = new Set();
+    (lessonsSnap.docs || []).forEach((d) => firestoreItemIds.add(d.id));
+    (notesSnap.docs || []).forEach((d) => firestoreItemIds.add(d.id));
+    (asnSnap.docs || []).forEach((d) => firestoreItemIds.add(d.id));
+    (testsSnap.docs || []).forEach((d) => firestoreItemIds.add(d.id));
+
+    const staticCurr = getCurriculumForCourse(courseId);
+    const staticItemIds = new Set(
+      (staticCurr?.modules || []).flatMap((m) => (m.lessons || []).map((l) => l.id)).filter(Boolean)
+    );
+
+    let validItemIds;
+    let totalLessons;
+
+    if (firestoreItemIds.size > 0) {
+      validItemIds = firestoreItemIds;
+      totalLessons = firestoreItemIds.size;
+    } else if (staticItemIds.size > 0) {
+      validItemIds = staticItemIds;
+      totalLessons = enrollmentData.totalLessons || fallbackTotalLessons || staticItemIds.size;
+    } else {
+      validItemIds = null;
+      totalLessons = enrollmentData.totalLessons || fallbackTotalLessons || 1;
+    }
+
+    const rawCompleted = Array.isArray(enrollmentData.completedItemIds)
+      ? enrollmentData.completedItemIds
+      : Array.isArray(enrollmentData.completedLessonIds)
+        ? enrollmentData.completedLessonIds
+        : [];
+
+    // Retain only valid canonical item IDs for this course
+    const currentCompleted = new Set(
+      validItemIds ? rawCompleted.filter((id) => validItemIds.has(id)) : rawCompleted.filter(Boolean)
+    );
     const isCompleted = currentCompleted.has(lessonId);
 
-    // Fetch real module/lesson count from courses/{courseId}/modules if present
-    let totalLessons = 0;
-    try {
-      const modulesSnap = await getDocs(collection(db, "courses", courseId, "modules"));
-      if (!modulesSnap.empty) {
-        modulesSnap.forEach((mDoc) => {
-          const mData = mDoc.data();
-          if (Array.isArray(mData.lessons)) {
-            totalLessons += mData.lessons.length;
-          } else if (Array.isArray(mData.items)) {
-            totalLessons += mData.items.length;
-          }
-        });
-      }
-    } catch (mErr) {
-      console.warn("Could not query modules subcollection for lesson count:", mErr);
+    if (!isCompleted && validItemIds && !validItemIds.has(lessonId)) {
+      throw new Error(`Curriculum item '${lessonId}' does not belong to course '${courseId}'.`);
     }
-
-    if (totalLessons === 0) {
-      totalLessons = enrollmentData.totalLessons || fallbackTotalLessons || 8;
-    }
-
-    let updatedCompletedIds;
-    let newProgressPercent;
 
     if (isCompleted) {
       currentCompleted.delete(lessonId);
-      updatedCompletedIds = Array.from(currentCompleted);
-      newProgressPercent = Math.max(0, Math.round((updatedCompletedIds.length / Math.max(totalLessons, 1)) * 100));
-
-      await updateDoc(enrollmentRef, {
-        completedItemIds: arrayRemove(lessonId),
-        progressPercent: newProgressPercent,
-        updatedAt: serverTimestamp(),
-      });
     } else {
       currentCompleted.add(lessonId);
-      updatedCompletedIds = Array.from(currentCompleted);
-      newProgressPercent = Math.min(100, Math.round((updatedCompletedIds.length / Math.max(totalLessons, 1)) * 100));
+    }
 
-      await updateDoc(enrollmentRef, {
-        completedItemIds: arrayUnion(lessonId),
-        progressPercent: newProgressPercent,
-        updatedAt: serverTimestamp(),
-      });
+    const updatedCompletedIds = Array.from(currentCompleted);
+    const denominator = Math.max(Number(totalLessons) || 1, 1);
+    const newProgressPercent = Math.min(
+      100,
+      Math.max(0, Math.round((updatedCompletedIds.length / denominator) * 100))
+    );
+
+    await updateDoc(enrollmentRef, {
+      completedItemIds: updatedCompletedIds,
+      progressPercent: newProgressPercent,
+      updatedAt: serverTimestamp(),
+    });
+
+    if (!isCompleted) {
       // Award 5 minutes of active learning for completing a lesson
       incrementDailyActivity(uid, 5).catch(() => {});
     }
@@ -312,32 +382,104 @@ export async function toggleLessonCompletion(uid, courseId, lessonId, fallbackTo
 }
 
 /**
+ * Helper: Verifies that a course exists and that a specific assignment or test belongs to that course.
+ */
+async function verifyCourseAndAssessment(courseId, itemId, itemType) {
+  const courseRef = doc(db, "courses", courseId);
+  const courseSnap = await getDoc(courseRef);
+  if (!courseSnap.exists()) {
+    throw new Error(`Course '${courseId}' does not exist.`);
+  }
+  const courseData = courseSnap.data() || {};
+
+  const primaryCollection = itemType === "assignment" ? "assignments" : "tests";
+  const [primarySnap, lessonSnap] = await Promise.all([
+    getDoc(doc(db, "courses", courseId, primaryCollection, itemId)),
+    getDoc(doc(db, "courses", courseId, "lessons", itemId)),
+  ]);
+
+  let existsInCourse = false;
+  if (primarySnap.exists()) {
+    existsInCourse = true;
+  } else if (lessonSnap.exists() && lessonSnap.data()?.type === itemType) {
+    existsInCourse = true;
+  } else {
+    const staticCurr = getCurriculumForCourse(courseId);
+    const staticMatch = (staticCurr?.modules || [])
+      .flatMap((m) => m.lessons || [])
+      .find((l) => l.id === itemId && l.type === itemType);
+    if (staticMatch) {
+      existsInCourse = true;
+    }
+  }
+
+  if (!existsInCourse) {
+    throw new Error(
+      `${itemType === "assignment" ? "Assignment" : "Test"} '${itemId}' does not exist in course '${courseId}'.`
+    );
+  }
+
+  return courseData;
+}
+
+/**
  * Submit an assignment.
- * Supports file uploads to Firebase Storage and writes submission record to assignmentSubmissions.
- * Client never sets grade or feedback (strictly rule-protected).
+ * - Rejects missing courseId or "general" bypass.
+ * - Verifies course existence, active/approved enrollment, and assignment membership BEFORE uploading to Storage or writing to Firestore.
+ * - Client never sets grade or feedback (strictly rule-protected).
  */
 export async function submitAssignment(uid, courseIdOrAssignment, assignmentIdOrData, maybeSubmissionData) {
-  let courseId = "general";
+  let courseId = "";
   let assignmentId = "";
   let submissionData = {};
   let courseTitle = null;
 
   if (maybeSubmissionData !== undefined) {
-    courseId = courseIdOrAssignment || "general";
-    assignmentId = assignmentIdOrData;
+    courseId = typeof courseIdOrAssignment === "string" ? courseIdOrAssignment.trim() : "";
+    assignmentId = typeof assignmentIdOrData === "string" ? assignmentIdOrData.trim() : "";
     submissionData = maybeSubmissionData || {};
   } else if (typeof courseIdOrAssignment === "object" && courseIdOrAssignment !== null) {
-    assignmentId = courseIdOrAssignment.id;
-    courseId = courseIdOrAssignment.courseId || "general";
+    assignmentId = typeof courseIdOrAssignment.id === "string" ? courseIdOrAssignment.id.trim() : "";
+    courseId = typeof courseIdOrAssignment.courseId === "string" ? courseIdOrAssignment.courseId.trim() : "";
     courseTitle = courseIdOrAssignment.course || courseIdOrAssignment.courseTitle || null;
     submissionData = assignmentIdOrData || {};
   } else {
-    assignmentId = courseIdOrAssignment;
+    assignmentId = typeof courseIdOrAssignment === "string" ? courseIdOrAssignment.trim() : "";
     submissionData = assignmentIdOrData || {};
-    courseId = submissionData.courseId || "general";
+    courseId = typeof submissionData.courseId === "string" ? submissionData.courseId.trim() : "";
   }
 
-  if (!uid || !assignmentId) throw new Error("Missing uid or assignmentId.");
+  if (!uid || typeof uid !== "string" || !uid.trim()) {
+    throw new Error("Authentication required to submit an assignment.");
+  }
+  if (!courseId || courseId === "general" || courseId === "platform") {
+    throw new Error("A valid courseId is required to submit an assignment.");
+  }
+  if (!assignmentId) {
+    throw new Error("A valid assignmentId is required to submit an assignment.");
+  }
+
+  // 1. Verify active/approved enrollment in courseId BEFORE any Storage upload or Firestore write
+  const enr = await getCourseEnrollment(uid, courseId);
+  if (!isEnrollmentAuthorized(enr)) {
+    throw new Error("Active course enrollment is required to submit assignments.");
+  }
+
+  // 2. Verify course exists and assignment belongs to courseId
+  const courseData = await verifyCourseAndAssessment(courseId, assignmentId, "assignment");
+  if (!courseTitle) {
+    courseTitle = courseData.title || enr?.courseTitle || courseId;
+  }
+
+  // 3. Validate file size and content type before uploading to Storage
+  if (submissionData.file) {
+    if (typeof submissionData.file.size === "number" && submissionData.file.size > MAX_SUBMISSION_FILE_BYTES) {
+      throw new Error("Submission file exceeds the maximum allowed size of 25MB.");
+    }
+    if (!isAllowedSubmissionFile(submissionData.file)) {
+      throw new Error("Unsupported submission file format. Allowed formats: PDF, ZIP, DOCX/Office, TXT, and images.");
+    }
+  }
 
   const submissionDocId = `${uid}_${assignmentId}`;
   const submissionRef = doc(db, "assignmentSubmissions", submissionDocId);
@@ -374,15 +516,22 @@ export async function submitAssignment(uid, courseIdOrAssignment, assignmentIdOr
     submittedAt: serverTimestamp(),
   };
 
-  // Client never sets grade or feedback
+  // Client never sets grade, feedback, gradedAt, or gradedBy
   delete payload.grade;
   delete payload.feedback;
+  delete payload.gradedAt;
+  delete payload.gradedBy;
 
   try {
     await setDoc(submissionRef, payload, { merge: true });
 
-    // Mark assignment as completed in enrollment
-    if (courseId && courseId !== "general") {
+    // Mark assignment as completed in enrollment and recompute progress
+    try {
+      const currentDone = new Set(enr.completedItemIds || []);
+      if (!currentDone.has(assignmentId)) {
+        await toggleLessonCompletion(uid, courseId, assignmentId);
+      }
+    } catch {
       try {
         await updateDoc(doc(db, "enrollments", `${uid}_${courseId}`), {
           completedItemIds: arrayUnion(assignmentId),
@@ -391,6 +540,20 @@ export async function submitAssignment(uid, courseIdOrAssignment, assignmentIdOr
       } catch (enrErr) {
         console.warn("Notice: could not auto-mark assignment complete in enrollment:", enrErr);
       }
+    }
+
+    // Record in local activity cache so UI updates immediately
+    try {
+      const currentAct = getUserActivity(uid);
+      saveUserActivity(uid, {
+        ...currentAct,
+        assignmentSubmissions: {
+          ...(currentAct.assignmentSubmissions || {}),
+          [assignmentId]: { id: submissionDocId, ...payload, submittedAt: new Date().toISOString() },
+        },
+      });
+    } catch {
+      // Ignore cache update error
     }
 
     // Award 10 minutes of active learning for assignment submission
@@ -420,25 +583,46 @@ export async function getAssignmentSubmission(uid, assignmentId) {
 
 /**
  * Submit a test/quiz.
- * Calculates score and records submission in testSubmissions.
- * Client never sets tutor grade or feedback.
+ * - Rejects missing courseId or "general" bypass.
+ * - Verifies course existence, active/approved enrollment, and test membership BEFORE writing to Firestore.
+ * - Client never sets tutor grade or feedback.
  */
 export async function submitTest(uid, courseIdOrTestId, testIdOrAnswers, maybeAnswers, calculatedScore = null) {
-  let courseId = "general";
+  let courseId = "";
   let testId = "";
   let answers = {};
   let score = calculatedScore;
 
   if (maybeAnswers !== undefined) {
-    courseId = courseIdOrTestId || "general";
-    testId = testIdOrAnswers;
+    courseId = typeof courseIdOrTestId === "string" ? courseIdOrTestId.trim() : "";
+    testId = typeof testIdOrAnswers === "string" ? testIdOrAnswers.trim() : "";
     answers = maybeAnswers || {};
   } else {
-    testId = courseIdOrTestId;
-    answers = testIdOrAnswers || {};
+    throw new Error("A valid courseId and testId are required to submit a test.");
   }
 
-  if (!uid || !testId) throw new Error("Missing uid or testId.");
+  if (!uid || typeof uid !== "string" || !uid.trim()) {
+    throw new Error("Authentication required to submit a test.");
+  }
+  if (!courseId || courseId === "general" || courseId === "platform") {
+    throw new Error("A valid courseId is required to submit a test.");
+  }
+  if (!testId) {
+    throw new Error("A valid testId is required to submit a test.");
+  }
+
+  // 1. Verify active/approved enrollment in courseId
+  const enr = await getCourseEnrollment(uid, courseId);
+  if (!isEnrollmentAuthorized(enr)) {
+    throw new Error("Active course enrollment is required to submit tests.");
+  }
+
+  // 2. Verify course exists and test belongs to courseId
+  await verifyCourseAndAssessment(courseId, testId, "test");
+
+  const numericScore = typeof score === "number" && Number.isFinite(score)
+    ? Math.min(100, Math.max(0, Math.round(score * 10) / 10))
+    : 0;
 
   const submissionDocId = `${uid}_${testId}`;
   const submissionRef = doc(db, "testSubmissions", submissionDocId);
@@ -448,19 +632,26 @@ export async function submitTest(uid, courseIdOrTestId, testIdOrAnswers, maybeAn
     courseId,
     testId,
     answers,
-    score,
+    score: numericScore,
     status: "submitted",
     submittedAt: serverTimestamp(),
   };
 
   delete payload.grade;
   delete payload.feedback;
+  delete payload.gradedAt;
+  delete payload.gradedBy;
 
   try {
     await setDoc(submissionRef, payload, { merge: true });
 
-    // Mark test as completed in enrollment
-    if (courseId && courseId !== "general") {
+    // Mark test as completed in enrollment and recompute progress
+    try {
+      const currentDone = new Set(enr.completedItemIds || []);
+      if (!currentDone.has(testId)) {
+        await toggleLessonCompletion(uid, courseId, testId);
+      }
+    } catch {
       try {
         await updateDoc(doc(db, "enrollments", `${uid}_${courseId}`), {
           completedItemIds: arrayUnion(testId),

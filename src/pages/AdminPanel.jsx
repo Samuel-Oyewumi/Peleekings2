@@ -7,7 +7,6 @@ import {
   getDoc,
   getDocs,
   setDoc,
-  updateDoc,
   deleteDoc,
   query,
   where,
@@ -18,8 +17,10 @@ import {
 import { httpsCallable } from "firebase/functions";
 import { db, functions } from "../firebase";
 import { COURSES_CATALOG } from "../data/courses";
+import { COURSE_CURRICULA } from "../data/courseCurricula";
 import { getResources, uploadResource, deleteResource } from "../contexts/resourcesService";
 import ErrorBoundary from "../components/ErrorBoundary";
+import { useBodyScrollLock } from "../utils/scrollLock";
 
 function withTimeout(promise, ms = 5000) {
   return Promise.race([
@@ -30,22 +31,44 @@ function withTimeout(promise, ms = 5000) {
   ]);
 }
 
-function formatFirestoreDate(value, fallback = "Recent", includeTime = false) {
-  if (!value) return fallback;
+export function safeStr(value, fallback = "") {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? value : fallback;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return fallback;
+}
+
+export function formatFirestoreDate(value, fallback = "Recent", includeTime = false) {
+  if (value === null || value === undefined || value === "") return fallback;
   try {
     let dateObj = null;
     if (typeof value.toDate === "function") {
       dateObj = value.toDate();
     } else if (typeof value === "object" && typeof value.seconds === "number") {
       dateObj = new Date(value.seconds * 1000);
+    } else if (typeof value === "object" && typeof value._seconds === "number") {
+      dateObj = new Date(value._seconds * 1000);
     } else if (value instanceof Date) {
       dateObj = value;
-    } else if (typeof value === "string" || typeof value === "number") {
-      const parsed = new Date(value);
+    } else if (typeof value === "number") {
+      // Support both millisecond and Unix-second numeric timestamps
+      const ms = value > 1e11 ? value : value * 1000;
+      const parsed = new Date(ms);
       if (!Number.isNaN(parsed.getTime())) {
         dateObj = parsed;
-      } else if (typeof value === "string" && value.trim()) {
-        return value.trim();
+      }
+    } else if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) return fallback;
+      const parsed = new Date(trimmed);
+      if (!Number.isNaN(parsed.getTime())) {
+        dateObj = parsed;
+      } else {
+        return trimmed;
       }
     }
     if (dateObj && !Number.isNaN(dateObj.getTime())) {
@@ -57,12 +80,143 @@ function formatFirestoreDate(value, fallback = "Recent", includeTime = false) {
   return fallback;
 }
 
-function getTimestampMillis(value) {
+export function getTimestampMillis(value) {
   if (!value) return 0;
   if (typeof value.toMillis === "function") return value.toMillis();
   if (typeof value === "object" && typeof value.seconds === "number") return value.seconds * 1000;
+  if (typeof value === "object" && typeof value._seconds === "number") return value._seconds * 1000;
+  if (typeof value === "number") return value > 1e11 ? value : value * 1000;
   const parsed = new Date(value).getTime();
   return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+export function normalizeApplicationDoc(docId, rawData) {
+  const data = rawData && typeof rawData === "object" ? rawData : {};
+  const rawDate = data.submittedAt || data.createdAt || data.date || null;
+  const dateStr = formatFirestoreDate(rawDate, "Recent", false);
+  return {
+    ...data,
+    id: String(docId || data.id || ""),
+    applicantUid: safeStr(data.applicantUid || data.uid, ""),
+    fullName: safeStr(data.fullName || data.name, "Instructor Applicant"),
+    email: safeStr(data.email, ""),
+    courseTitle: safeStr(data.courseTitle, "Proposed Course"),
+    category: safeStr(data.category, "Tech & Digital Skills"),
+    courseDescription: safeStr(data.courseDescription || data.description, ""),
+    learningOutcomes: safeStr(data.learningOutcomes, ""),
+    syllabus: safeStr(data.syllabus, ""),
+    status: safeStr(data.status, "pending").toLowerCase(),
+    date: dateStr,
+    reviewedBy: safeStr(data.reviewedBy, "") || null,
+    rejectionReason: safeStr(data.rejectionReason, "") || null,
+    _sortTime: getTimestampMillis(rawDate),
+  };
+}
+
+export function normalizeUserDoc(docId, rawData) {
+  const data = rawData && typeof rawData === "object" ? rawData : {};
+  const emailStr = safeStr(data.email, "");
+  const userName = safeStr(
+    data.fullName || data.displayName || (emailStr ? emailStr.split("@")[0] : ""),
+    "User"
+  );
+  const sType = safeStr(data.studentType, "non_corper").toLowerCase() === "corper" ? "corper" : "non_corper";
+  const userType = sType === "corper" ? "Corper" : "Non-Corper";
+  const rawDate = data.createdAt || data.date || null;
+  const dateStr = formatFirestoreDate(rawDate, "Recent", false);
+  const resolvedId = String(docId || data.uid || data.id || "");
+  return {
+    ...data,
+    id: resolvedId,
+    uid: resolvedId,
+    name: userName,
+    fullName: safeStr(data.fullName, userName),
+    email: emailStr,
+    phone: safeStr(data.phoneNumber || data.phone, "N/A"),
+    phoneNumber: safeStr(data.phoneNumber || data.phone, ""),
+    type: userType,
+    studentType: sType,
+    regId: safeStr(data.regNumber || data.regId, "Pending"),
+    regNumber: safeStr(data.regNumber || data.regId, "Pending"),
+    nyscCode: safeStr(data.nyscStateCode || data.nyscCode, ""),
+    nyscStateCode: safeStr(data.nyscStateCode || data.nyscCode, ""),
+    role: safeStr(data.role, "student").toLowerCase(),
+    status: safeStr(data.status, "active").toLowerCase(),
+    bio: safeStr(data.bio, ""),
+    date: dateStr,
+    suspensionReason: safeStr(data.suspensionReason, "") || null,
+    suspendedAt: data.suspendedAt ? formatFirestoreDate(data.suspendedAt, "", true) : null,
+    _sortTime: getTimestampMillis(rawDate),
+  };
+}
+
+export function normalizeCourseDoc(docId, rawData) {
+  const data = rawData && typeof rawData === "object" ? rawData : {};
+  const resolvedId = String(docId || data.id || "");
+  const tutorId = safeStr(data.tutorId || data.tutorUid, "");
+  const assignedTutors = Array.isArray(data.assignedTutors)
+    ? data.assignedTutors.filter((t) => typeof t === "string")
+    : tutorId
+    ? [tutorId]
+    : [];
+  return {
+    ...data,
+    id: resolvedId,
+    title: safeStr(data.title, "Untitled Course"),
+    category: safeStr(data.category, "Tech & Digital Skills"),
+    level: safeStr(data.level, "Beginner"),
+    status: safeStr(data.status, "published").toLowerCase(),
+    duration: safeStr(data.duration, "Self-paced"),
+    description: safeStr(data.description, ""),
+    learningOutcomes: safeStr(data.learningOutcomes, ""),
+    syllabus: safeStr(data.syllabus, ""),
+    image: safeStr(data.image, ""),
+    tutorId: tutorId || null,
+    tutorName: safeStr(data.tutorName, "") || null,
+    assignedTutors,
+  };
+}
+
+export function normalizeAnnouncementDoc(docId, rawData) {
+  const data = rawData && typeof rawData === "object" ? rawData : {};
+  const rawDate = data.createdAt || data.date || null;
+  const dateStr = formatFirestoreDate(rawDate, "Recent", false);
+  const expiresAtStr = data.expiresAt ? formatFirestoreDate(data.expiresAt, "", false) : "";
+  return {
+    ...data,
+    id: String(docId || data.id || ""),
+    title: safeStr(data.title, "Announcement"),
+    body: safeStr(data.body, ""),
+    category: safeStr(data.category, "General"),
+    status: safeStr(data.status, "published").toLowerCase(),
+    audience: safeStr(data.audience, "all").toLowerCase(),
+    priority: safeStr(data.priority, "normal").toLowerCase(),
+    courseId: safeStr(data.courseId, ""),
+    pinned: Boolean(data.pinned),
+    date: dateStr,
+    expiresAt: expiresAtStr,
+    _sortTime: getTimestampMillis(rawDate),
+  };
+}
+
+export function normalizeAuditLogDoc(docId, rawData) {
+  const data = rawData && typeof rawData === "object" ? rawData : {};
+  const rawTs = data.timestamp || data.createdAt || null;
+  const dateStr = formatFirestoreDate(rawTs, "Just now", true);
+  return {
+    ...data,
+    id: String(docId || data.id || ""),
+    action: safeStr(data.action, "System Event"),
+    detail: safeStr(data.detail, ""),
+    badge: safeStr(data.badge, "pill-tech"),
+    target: safeStr(data.target, "All"),
+    adminUid: safeStr(data.adminUid, ""),
+    approvedBy: safeStr(data.approvedBy, ""),
+    uid: safeStr(data.uid, ""),
+    timestamp: dateStr,
+    rawTimestamp: rawTs,
+    _sortTime: getTimestampMillis(rawTs),
+  };
 }
 
 export default function AdminPanel() {
@@ -107,30 +261,9 @@ export default function AdminPanel() {
     setSectionError("applications", null);
     try {
       const snap = await withTimeout(getDocs(collection(db, "tutorApplications")), 6000);
-      const list = snap.docs.map((d) => {
-        const data = d.data() || {};
-        const dateStr = formatFirestoreDate(
-          data.submittedAt || data.createdAt || data.date,
-          "Recent",
-          false
-        );
-        return {
-          ...data,
-          id: d.id,
-          applicantUid: data.applicantUid || data.uid || "",
-          fullName: String(data.fullName || data.name || "Instructor Applicant"),
-          email: String(data.email || ""),
-          courseTitle: String(data.courseTitle || "Proposed Course"),
-          category: String(data.category || "Tech & Digital Skills"),
-          courseDescription: String(data.courseDescription || data.description || ""),
-          learningOutcomes: String(data.learningOutcomes || ""),
-          syllabus: String(data.syllabus || ""),
-          status: String(data.status || "pending").toLowerCase(),
-          date: dateStr,
-          reviewedBy: data.reviewedBy || null,
-          rejectionReason: data.rejectionReason ? String(data.rejectionReason) : null,
-        };
-      });
+      const list = snap.docs
+        .map((d) => normalizeApplicationDoc(d.id, d.data()))
+        .sort((a, b) => b._sortTime - a._sortTime);
       setApplications(list);
     } catch (err) {
       console.error("Failed to load tutor applications from Firestore:", err);
@@ -177,36 +310,7 @@ export default function AdminPanel() {
     try {
       const q = query(collection(db, "users"), limit(200));
       const snap = await withTimeout(getDocs(q), 6000);
-      const docs = snap.docs.map((d) => {
-        const data = d.data() || {};
-        const userName = String(
-          data.fullName || data.displayName || (typeof data.email === "string" ? data.email.split("@")[0] : "") || "User"
-        );
-        const userType = data.studentType === "corper" ? "Corper" : "Non-Corper";
-        const dateStr = formatFirestoreDate(data.createdAt || data.date, "Recent", false);
-        return {
-          ...data,
-          id: d.id,
-          uid: d.id,
-          name: userName,
-          fullName: String(data.fullName || userName),
-          email: String(data.email || ""),
-          phone: String(data.phoneNumber || data.phone || "N/A"),
-          phoneNumber: String(data.phoneNumber || data.phone || ""),
-          type: userType,
-          studentType: String(data.studentType || "non_corper"),
-          regId: String(data.regNumber || "Pending"),
-          regNumber: String(data.regNumber || "Pending"),
-          nyscCode: String(data.nyscStateCode || ""),
-          nyscStateCode: String(data.nyscStateCode || ""),
-          role: String(data.role || "student").toLowerCase(),
-          status: String(data.status || "active").toLowerCase(),
-          bio: String(data.bio || ""),
-          date: dateStr,
-          suspensionReason: data.suspensionReason ? String(data.suspensionReason) : null,
-          suspendedAt: data.suspendedAt || null,
-        };
-      });
+      const docs = snap.docs.map((d) => normalizeUserDoc(d.id, d.data()));
       setUsersList(docs);
     } catch (err) {
       console.error("Failed to load users from Firestore:", err);
@@ -223,7 +327,22 @@ export default function AdminPanel() {
     try {
       const q = query(collection(db, "enrollments"), where("uid", "==", uid));
       const snap = await withTimeout(getDocs(q), 5000);
-      const list = snap.docs.map((d) => ({ ...d.data(), id: d.id }));
+      const list = snap.docs.map((d) => {
+        const data = d.data() || {};
+        return {
+          ...data,
+          id: d.id,
+          uid: safeStr(data.uid, uid),
+          courseId: safeStr(data.courseId, d.id),
+          courseTitle: safeStr(data.courseTitle, safeStr(data.courseId, d.id)),
+          progressPercent:
+            typeof data.progressPercent === "number"
+              ? data.progressPercent
+              : Number(data.progressPercent) || 0,
+          status: safeStr(data.status, "active").toLowerCase(),
+          enrolledAt: formatFirestoreDate(data.enrolledAt || data.createdAt, "Recent", false),
+        };
+      });
       setLearnerEnrollments(list);
     } catch (err) {
       console.warn("Notice loading learner enrollments:", err);
@@ -240,6 +359,7 @@ export default function AdminPanel() {
   const [selectedTutor, setSelectedTutor] = useState(null);
   const [showCourseAssignModal, setShowCourseAssignModal] = useState(false);
   const [assignCourseSelectId, setAssignCourseSelectId] = useState("");
+  const [tutorRemovalModal, setTutorRemovalModal] = useState(null); // { tutor, mode: 'deactivate' | 'delete', reason: '' }
 
   const approvedTutors = useMemo(() => {
     return usersList.filter((u) => u.role === "tutor" || u.role === "admin");
@@ -255,6 +375,7 @@ export default function AdminPanel() {
   const [courseSearch, setCourseSearch] = useState("");
   const [showAddCourseModal, setShowAddCourseModal] = useState(false);
   const [editingCourse, setEditingCourse] = useState(null);
+  const [courseToDelete, setCourseToDelete] = useState(null);
   const [selectedCourseCurriculum, setSelectedCourseCurriculum] = useState(null);
   const [newCourseForm, setNewCourseForm] = useState({
     title: "",
@@ -275,27 +396,15 @@ export default function AdminPanel() {
     try {
       const snap = await withTimeout(getDocs(collection(db, "courses")), 6000);
       if (!snap.empty) {
-        const list = snap.docs.map((d) => {
-          const data = d.data() || {};
-          return {
-            ...data,
-            id: d.id,
-            title: String(data.title || "Untitled Course"),
-            category: String(data.category || "Tech & Digital Skills"),
-            status: String(data.status || "published").toLowerCase(),
-            duration: String(data.duration || "Self-paced"),
-            description: String(data.description || ""),
-          };
-        });
+        const list = snap.docs.map((d) => normalizeCourseDoc(d.id, d.data()));
         setAdminCourses(list);
       } else {
-        // Fallback to catalog defaults if empty
-        setAdminCourses(COURSES_CATALOG.map((c) => ({ ...c, status: "published" })));
+        setAdminCourses([]);
       }
     } catch (err) {
       console.error("Failed to load courses from Firestore:", err);
-      setSectionError("courses", err.message || "Failed to load courses.");
-      setAdminCourses((prev) => (prev.length > 0 ? prev : COURSES_CATALOG.map((c) => ({ ...c, status: "published" }))));
+      setSectionError("courses", err.message || "Failed to load courses from Firestore.");
+      setAdminCourses([]);
     } finally {
       setLoadingCourses(false);
     }
@@ -334,21 +443,7 @@ export default function AdminPanel() {
         snap = await withTimeout(getDocs(collection(db, "announcements")), 5000);
       }
       const list = snap.docs
-        .map((d) => {
-          const data = d.data() || {};
-          const dateStr = formatFirestoreDate(data.createdAt || data.date, "Recent", false);
-          return {
-            ...data,
-            id: d.id,
-            title: String(data.title || "Announcement"),
-            body: String(data.body || ""),
-            status: String(data.status || "published").toLowerCase(),
-            audience: String(data.audience || "all"),
-            priority: String(data.priority || "normal"),
-            date: dateStr,
-            _sortTime: getTimestampMillis(data.createdAt),
-          };
-        })
+        .map((d) => normalizeAnnouncementDoc(d.id, d.data()))
         .sort((a, b) => b._sortTime - a._sortTime);
       setAnnouncements(list);
     } catch (err) {
@@ -391,15 +486,18 @@ export default function AdminPanel() {
 
   const fetchAdminResources = useCallback(async () => {
     setLoadingResources(true);
+    setSectionError("resources", null);
     try {
-      const res = await withTimeout(getResources("all"), 6000);
+      const res = await withTimeout(getResources("all", { throwOnError: true }), 6000);
       setAdminResources(Array.isArray(res) ? res : []);
     } catch (err) {
       console.error("Failed to load admin resources:", err);
+      setSectionError("resources", err.message || "Failed to load resources from Firestore.");
+      setAdminResources([]);
     } finally {
       setLoadingResources(false);
     }
-  }, []);
+  }, [setSectionError]);
 
   // ══════════════════════════════════════════════════════════════════
   // 8. DATA STATE: AUDIT LOGS
@@ -409,6 +507,25 @@ export default function AdminPanel() {
   const [auditFilter, setAuditFilter] = useState("all");
   const [auditSearch, setAuditSearch] = useState("");
   const [selectedAuditLog, setSelectedAuditLog] = useState(null);
+
+  // Lock background page scroll whenever any Admin Console modal or Learner Profile drawer is open
+  useBodyScrollLock(
+    Boolean(selectedLearner) ||
+      showEditLearnerModal ||
+      showSuspendModal ||
+      showManualEnrollModal ||
+      showCourseAssignModal ||
+      Boolean(selectedAppModal) ||
+      Boolean(rejectModalApp) ||
+      showAddCourseModal ||
+      Boolean(editingCourse) ||
+      showAnnouncementModal ||
+      showSendNotifModal ||
+      showAddResourceModal ||
+      Boolean(selectedAuditLog) ||
+      Boolean(tutorRemovalModal) ||
+      Boolean(courseToDelete)
+  );
 
   const fetchAuditLogs = useCallback(async () => {
     setLoadingLogs(true);
@@ -423,21 +540,7 @@ export default function AdminPanel() {
         snap = await withTimeout(getDocs(fallbackQ), 5000);
       }
       const list = snap.docs
-        .map((d) => {
-          const data = d.data() || {};
-          const rawTs = data.timestamp || data.createdAt || null;
-          const dateStr = formatFirestoreDate(rawTs, "Just now", true);
-          return {
-            ...data,
-            id: d.id,
-            action: typeof data.action === "string" && data.action ? data.action : "System Event",
-            detail: typeof data.detail === "string" ? data.detail : "",
-            badge: typeof data.badge === "string" && data.badge ? data.badge : "pill-tech",
-            timestamp: dateStr,
-            rawTimestamp: rawTs,
-            _sortTime: getTimestampMillis(rawTs),
-          };
-        })
+        .map((d) => normalizeAuditLogDoc(d.id, d.data()))
         .sort((a, b) => b._sortTime - a._sortTime);
       setAuditLogs(list);
     } catch (err) {
@@ -466,17 +569,35 @@ export default function AdminPanel() {
 
   const fetchPlatformSettings = useCallback(async () => {
     setLoadingSettings(true);
+    setSectionError("settings", null);
     try {
       const docSnap = await withTimeout(getDoc(doc(db, "platformSettings", "general")), 5000);
       if (docSnap.exists()) {
-        setPlatformSettings((prev) => ({ ...prev, ...docSnap.data() }));
+        const data = docSnap.data() || {};
+        setPlatformSettings((prev) => ({
+          ...prev,
+          platformName: safeStr(data.platformName, prev.platformName),
+          supportEmail: safeStr(data.supportEmail, prev.supportEmail),
+          maintenanceMode: typeof data.maintenanceMode === "boolean" ? data.maintenanceMode : prev.maintenanceMode,
+          openRegistrations: typeof data.openRegistrations === "boolean" ? data.openRegistrations : prev.openRegistrations,
+          announcementBannerActive:
+            typeof data.announcementBannerActive === "boolean"
+              ? data.announcementBannerActive
+              : prev.announcementBannerActive,
+          bannerMessage: safeStr(data.bannerMessage, prev.bannerMessage),
+          allowTutorApplications:
+            typeof data.allowTutorApplications === "boolean"
+              ? data.allowTutorApplications
+              : prev.allowTutorApplications,
+        }));
       }
     } catch (err) {
       console.warn("Notice loading platform settings:", err);
+      setSectionError("settings", err.message || "Failed to load platform settings.");
     } finally {
       setLoadingSettings(false);
     }
-  }, []);
+  }, [setSectionError]);
 
   // Initial Data Fetch
   useEffect(() => {
@@ -660,6 +781,56 @@ export default function AdminPanel() {
     }
   }
 
+  async function handleApprovePendingEnrollment(enrollment) {
+    if (!enrollment) return;
+    const enrollmentId = enrollment.id || `${enrollment.uid}_${enrollment.courseId}`;
+    setIsProcessing(true);
+    try {
+      const manageStatusFn = httpsCallable(functions, "manageEnrollmentStatus");
+      await manageStatusFn({
+        enrollmentId,
+        status: "active",
+      });
+      triggerToast(`✓ Approved enrollment in "${enrollment.courseTitle || enrollment.courseId}".`);
+      await loadLearnerEnrollments(enrollment.uid);
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to approve pending enrollment:", err);
+      triggerToast("Error approving enrollment: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleSeedDefaultCatalogCourses() {
+    setIsProcessing(true);
+    try {
+      const manageCourseFn = httpsCallable(functions, "adminManageCourse");
+      const coursesWithCurricula = COURSES_CATALOG.map((c) => ({
+        ...c,
+        curriculum: COURSE_CURRICULA[c.id] || null,
+      }));
+      const res = await manageCourseFn({
+        action: "seedCatalog",
+        courses: coursesWithCurricula,
+      });
+      const seededCount = res?.data?.seededCount ?? 0;
+      const skippedCount = res?.data?.skippedCount ?? 0;
+      triggerToast(
+        seededCount > 0
+          ? `✓ Seeded ${seededCount} catalog course(s) (${skippedCount} existing preserved).`
+          : `All ${skippedCount} catalog courses already exist in Firestore.`
+      );
+      await fetchCourses();
+      await fetchAuditLogs();
+    } catch (err) {
+      console.error("Failed to seed catalog courses:", err);
+      triggerToast("Error seeding catalog courses: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
   async function handleRevokeEnrollment(enrollment) {
     if (!window.confirm(`Revoke enrollment in "${enrollment.courseTitle || enrollment.courseId}" for ${selectedLearner?.name}?`)) {
       return;
@@ -725,6 +896,7 @@ export default function AdminPanel() {
       });
       triggerToast("Course assignment removed.");
       await fetchCourses();
+      await fetchUsers();
       await fetchAuditLogs();
     } catch (err) {
       console.error("Failed to remove course assignment:", err);
@@ -734,8 +906,51 @@ export default function AdminPanel() {
     }
   }
 
+  async function handleConfirmTutorRemoval(e) {
+    if (e && typeof e.preventDefault === "function") e.preventDefault();
+    if (!tutorRemovalModal || !tutorRemovalModal.tutor) return;
+
+    const { tutor, mode, reason } = tutorRemovalModal;
+    setIsProcessing(true);
+    try {
+      const deleteTutorFn = httpsCallable(functions, "adminDeleteTutor");
+      const res = await deleteTutorFn({
+        targetUid: tutor.id,
+        mode: mode === "delete" ? "delete" : "deactivate",
+        reason: (reason || "").trim() || (mode === "delete" ? "Permanent tutor account deletion." : "Administrative tutor role deactivation."),
+      });
+
+      const unassignedCount = Array.isArray(res?.data?.unassignedCourseIds)
+        ? res.data.unassignedCourseIds.length
+        : 0;
+
+      if (mode === "delete") {
+        triggerToast(
+          `✓ Tutor account "${tutor.name}" permanently deleted (${unassignedCount} course(s) safely unassigned).`
+        );
+      } else {
+        triggerToast(
+          `✓ Instructor privileges deactivated for "${tutor.name}" (${unassignedCount} course(s) safely unassigned).`
+        );
+      }
+
+      setTutorRemovalModal(null);
+      await Promise.all([
+        fetchUsers(),
+        fetchCourses(),
+        fetchApplications(),
+        fetchAuditLogs(),
+      ]);
+    } catch (err) {
+      console.error("Failed to remove/deactivate tutor:", err);
+      triggerToast("Tutor removal error: " + (err.message || "Operation failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
   // ══════════════════════════════════════════════════════════════════
-  // ACTIONS: COURSE MANAGEMENT
+  // ACTIONS: COURSE MANAGEMENT (Server-Controlled Audit Logging via Cloud Functions)
   // ══════════════════════════════════════════════════════════════════
   async function handleCreateCourse(e) {
     e.preventDefault();
@@ -745,10 +960,9 @@ export default function AdminPanel() {
     try {
       const slug = newCourseForm.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
       const courseId = `${slug}-${Date.now().toString().slice(-4)}`;
-
       const assignedTutor = approvedTutors.find((t) => t.id === newCourseForm.tutorId);
 
-      const payload = {
+      const coursePayload = {
         id: courseId,
         title: newCourseForm.title.trim(),
         category: newCourseForm.category,
@@ -761,18 +975,13 @@ export default function AdminPanel() {
         status: newCourseForm.status || "published",
         tutorId: newCourseForm.tutorId || null,
         tutorName: assignedTutor ? assignedTutor.name : null,
-        assignedTutors: newCourseForm.tutorId ? [newCourseForm.tutorId] : [],
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
       };
 
-      await setDoc(doc(db, "courses", courseId), payload);
-
-      // Create default Module 1 for the new course
-      await setDoc(doc(db, "courses", courseId, "modules", "module-1"), {
-        title: "Module 1: Orientation & Foundations",
-        order: 1,
-        createdAt: serverTimestamp(),
+      const manageCourseFn = httpsCallable(functions, "adminManageCourse");
+      await manageCourseFn({
+        action: "create",
+        courseId,
+        courseData: coursePayload,
       });
 
       triggerToast(`✓ Course "${newCourseForm.title}" created successfully!`);
@@ -793,7 +1002,7 @@ export default function AdminPanel() {
       await fetchAuditLogs();
     } catch (err) {
       console.error("Failed to create course:", err);
-      triggerToast("Error creating course: " + err.message, "error");
+      triggerToast("Error creating course: " + (err.message || "Failed."), "error");
     } finally {
       setIsProcessing(false);
     }
@@ -805,34 +1014,36 @@ export default function AdminPanel() {
 
     setIsProcessing(true);
     try {
-      const courseRef = doc(db, "courses", editingCourse.id);
       const assignedTutor = approvedTutors.find((t) => t.id === editingCourse.tutorId);
 
       const updates = {
-        title: editingCourse.title.trim(),
-        category: editingCourse.category,
-        level: editingCourse.level,
-        duration: editingCourse.duration,
+        id: editingCourse.id,
+        title: (editingCourse.title || "").trim(),
+        category: editingCourse.category || "Tech & Digital Skills",
+        level: editingCourse.level || "Beginner",
+        duration: editingCourse.duration || "Self-paced",
         description: (editingCourse.description || "").trim(),
-        status: editingCourse.status,
-        image: editingCourse.image,
+        status: editingCourse.status || "published",
+        ...(editingCourse.image ? { image: editingCourse.image } : {}),
+        ...(editingCourse.learningOutcomes !== undefined ? { learningOutcomes: editingCourse.learningOutcomes } : {}),
+        ...(editingCourse.syllabus !== undefined ? { syllabus: editingCourse.syllabus } : {}),
         tutorId: editingCourse.tutorId || null,
-        tutorName: assignedTutor ? assignedTutor.name : null,
-        updatedAt: serverTimestamp(),
+        tutorName: assignedTutor ? assignedTutor.name : (editingCourse.tutorId ? editingCourse.tutorName || null : null),
       };
 
-      if (editingCourse.tutorId) {
-        updates.assignedTutors = [editingCourse.tutorId];
-      }
-
-      await updateDoc(courseRef, updates);
-      triggerToast(`✓ Course "${editingCourse.title}" updated.`);
+      const manageCourseFn = httpsCallable(functions, "adminManageCourse");
+      await manageCourseFn({
+        action: "update",
+        courseId: editingCourse.id,
+        courseData: updates,
+      });
+      triggerToast(`Course "${editingCourse.title}" updated successfully.`);
       setEditingCourse(null);
       await fetchCourses();
       await fetchAuditLogs();
     } catch (err) {
       console.error("Failed to update course:", err);
-      triggerToast("Error updating course: " + err.message, "error");
+      triggerToast("Error updating course: " + (err.message || "Failed."), "error");
     } finally {
       setIsProcessing(false);
     }
@@ -842,10 +1053,17 @@ export default function AdminPanel() {
     const nextStatus = course.status === "published" ? "draft" : "published";
     setIsProcessing(true);
     try {
-      await updateDoc(doc(db, "courses", course.id), {
-        status: nextStatus,
-        updatedAt: serverTimestamp(),
+      const manageCourseFn = httpsCallable(functions, "adminManageCourse");
+      await manageCourseFn({
+        action: "toggleStatus",
+        courseId: course.id,
+        courseData: {
+          title: course.title,
+          category: course.category || "Tech & Digital Skills",
+          status: nextStatus,
+        },
       });
+
       triggerToast(`Course status updated to ${nextStatus}.`);
       setAdminCourses((prev) =>
         prev.map((c) => (c.id === course.id ? { ...c, status: nextStatus } : c))
@@ -853,26 +1071,39 @@ export default function AdminPanel() {
       await fetchAuditLogs();
     } catch (err) {
       console.error("Failed to toggle course status:", err);
-      triggerToast("Error updating course status: " + err.message, "error");
+      triggerToast("Error updating course status: " + (err.message || "Failed."), "error");
     } finally {
       setIsProcessing(false);
     }
   }
 
-  async function handleDeleteCourse(course) {
-    if (!window.confirm(`Are you sure you want to delete course "${course.title}"? This action is permanent.`)) {
+  async function handleDeleteCourse(course, skipConfirmModal = false) {
+    if (!course || !course.id) return;
+    if (!skipConfirmModal) {
+      setCourseToDelete(course);
       return;
     }
 
     setIsProcessing(true);
     try {
-      await deleteDoc(doc(db, "courses", course.id));
-      triggerToast(`Course "${course.title}" deleted.`);
+      const manageCourseFn = httpsCallable(functions, "adminManageCourse");
+      const res = await manageCourseFn({
+        action: "delete",
+        courseId: course.id,
+        courseData: { title: course.title },
+      });
+
+      const subCount = res?.data?.deletedSubDocs ?? 0;
+      const archivedCount = res?.data?.archivedEnrollmentsCount ?? 0;
+      triggerToast(
+        `✓ Course "${course.title}" deleted (${subCount} curriculum item(s) removed, ${archivedCount} enrollment(s) archived).`
+      );
+      setCourseToDelete(null);
       setAdminCourses((prev) => prev.filter((c) => c.id !== course.id));
-      await fetchAuditLogs();
+      await Promise.all([fetchCourses(), fetchAdminResources(), fetchAuditLogs()]);
     } catch (err) {
       console.error("Failed to delete course:", err);
-      triggerToast("Error deleting course: " + err.message, "error");
+      triggerToast("Error deleting course: " + (err.message || "Failed."), "error");
     } finally {
       setIsProcessing(false);
     }
@@ -922,13 +1153,17 @@ export default function AdminPanel() {
 
     setIsProcessing(true);
     try {
-      await deleteDoc(doc(db, "announcements", announcement.id));
+      const delFn = httpsCallable(functions, "adminDeleteAnnouncement");
+      await delFn({
+        announcementId: announcement.id,
+        title: announcement.title,
+      });
       triggerToast("Announcement removed.");
       setAnnouncements((prev) => prev.filter((a) => a.id !== announcement.id));
       await fetchAuditLogs();
     } catch (err) {
       console.error("Failed to delete announcement:", err);
-      triggerToast("Error deleting announcement: " + err.message, "error");
+      triggerToast("Error deleting announcement: " + (err.message || "Failed."), "error");
     } finally {
       setIsProcessing(false);
     }
@@ -1018,12 +1253,13 @@ export default function AdminPanel() {
 
     setIsProcessing(true);
     try {
-      await deleteResource(resource.id, resource.fileUrl);
+      await deleteResource(resource.id, resource.fileUrl, resource.storagePath);
       setAdminResources((prev) => prev.filter((r) => r.id !== resource.id));
-      triggerToast("Resource removed.");
+      triggerToast("✓ Resource and associated storage file removed.");
+      await fetchAuditLogs();
     } catch (err) {
       console.error("Failed to delete resource:", err);
-      triggerToast("Failed to delete resource: " + err.message, "error");
+      triggerToast("Failed to delete resource: " + (err.message || "Deletion error."), "error");
     } finally {
       setIsProcessing(false);
     }
@@ -1036,27 +1272,14 @@ export default function AdminPanel() {
     e.preventDefault();
     setSavingSettings(true);
     try {
-      const settingsRef = doc(db, "platformSettings", "general");
-      await setDoc(settingsRef, {
-        ...platformSettings,
-        updatedAt: serverTimestamp(),
-        updatedBy: currentUser?.uid || "admin",
-      }, { merge: true });
-
-      // Record audit log
-      await setDoc(doc(collection(db, "auditLogs")), {
-        action: "Platform Settings Updated",
-        detail: "Administrator updated platform system configurations.",
-        adminUid: currentUser?.uid || "admin",
-        badge: "pill-tech",
-        timestamp: serverTimestamp(),
-      });
+      const updateSettingsFn = httpsCallable(functions, "adminUpdatePlatformSettings");
+      await updateSettingsFn({ settings: platformSettings });
 
       triggerToast("✓ Platform settings successfully saved!");
       await fetchAuditLogs();
     } catch (err) {
       console.error("Failed to save settings:", err);
-      triggerToast("Error saving platform settings: " + err.message, "error");
+      triggerToast("Error saving platform settings: " + (err.message || "Failed."), "error");
     } finally {
       setSavingSettings(false);
     }
@@ -1087,9 +1310,9 @@ export default function AdminPanel() {
       return true;
     }).sort((a, b) => {
       if (learnerSortBy === "name") return (a.name || "").localeCompare(b.name || "");
-      if (learnerSortBy === "oldest") return (a.date || "").localeCompare(b.date || "");
+      if (learnerSortBy === "oldest") return (a._sortTime || 0) - (b._sortTime || 0);
       // Default newest
-      return (b.date || "").localeCompare(a.date || "");
+      return (b._sortTime || 0) - (a._sortTime || 0);
     });
   }, [usersList, learnerStatusFilter, learnerSearch, learnerSortBy]);
 
@@ -1301,7 +1524,8 @@ export default function AdminPanel() {
                   else if (activeTab === "learners" || activeTab === "tutors" || activeTab === "analytics") fetchUsers();
                   else if (activeTab === "courses") fetchCourses();
                   else if (activeTab === "announcements") fetchAnnouncements();
-                  else if (activeTab === "resources") fetchResources();
+                  else if (activeTab === "resources") fetchAdminResources();
+                  else if (activeTab === "settings") fetchPlatformSettings();
                   else fetchAuditLogs();
                 }}
               >
@@ -1604,23 +1828,35 @@ export default function AdminPanel() {
                     (c) => c.tutorId === t.id || (c.assignedTutors && c.assignedTutors.includes(t.id))
                   );
 
+                  const isSuspendedTutor = t.status === "suspended";
+                  const isProtectedAdmin = t.role === "admin" || t.id === currentUser?.uid;
+
                   return (
                     <div
                       key={t.id}
                       className="dashboard-card"
                       style={{ padding: 20, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}
                     >
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12, gap: 10, flexWrap: "wrap" }}>
                         <div>
-                          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-                            <span className="pill-badge pill-success">APPROVED INSTRUCTOR</span>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4, flexWrap: "wrap" }}>
+                            <span className={`pill-badge ${isSuspendedTutor ? "pill-danger" : "pill-success"}`}>
+                              {isSuspendedTutor ? "SUSPENDED INSTRUCTOR" : "APPROVED INSTRUCTOR"}
+                            </span>
                             {t.role === "admin" && <span className="pill-badge pill-tech">ADMIN</span>}
                           </div>
                           <h3 style={{ margin: 0, fontSize: "1.1rem", fontWeight: 700 }}>{t.name}</h3>
                           <div style={{ fontSize: "0.825rem", color: "var(--text-muted)" }}>{t.email}</div>
+                          {t.regId && (
+                            <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: 2 }}>
+                              Reg ID: {t.regId}
+                            </div>
+                          )}
                         </div>
                         <button
                           className="btn btn-outline btn-sm"
+                          disabled={isProcessing || isSuspendedTutor}
+                          title={isSuspendedTutor ? "Reactivate this instructor before assigning courses" : "Assign a course to this instructor"}
                           onClick={() => {
                             setSelectedTutor(t);
                             setShowCourseAssignModal(true);
@@ -1634,6 +1870,12 @@ export default function AdminPanel() {
                         <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", margin: "0 0 12px", lineHeight: 1.4 }}>
                           {t.bio}
                         </p>
+                      )}
+
+                      {t.suspensionReason && isSuspendedTutor && (
+                        <div style={{ fontSize: "0.8rem", color: "#DC2626", background: "#FEE2E2", padding: "6px 10px", borderRadius: 6, marginBottom: 10, fontWeight: 600 }}>
+                          Suspended: {t.suspensionReason}
+                        </div>
                       )}
 
                       <div style={{ borderTop: "1px solid var(--border-light)", paddingTop: 12, marginTop: 8 }}>
@@ -1661,11 +1903,13 @@ export default function AdminPanel() {
                               >
                                 <span style={{ fontWeight: 600 }}>{c.title}</span>
                                 <button
+                                  type="button"
+                                  disabled={isProcessing}
                                   style={{
                                     border: "none",
                                     background: "transparent",
                                     color: "#DC2626",
-                                    cursor: "pointer",
+                                    cursor: isProcessing ? "not-allowed" : "pointer",
                                     fontSize: "0.75rem",
                                     fontWeight: 700,
                                   }}
@@ -1678,6 +1922,77 @@ export default function AdminPanel() {
                           </div>
                         )}
                       </div>
+
+                      {/* Tutor Lifecycle Actions: Suspend/Reactivate, Deactivate Role, Delete Tutor */}
+                      {!isProtectedAdmin && (
+                        <div
+                          style={{
+                            borderTop: "1px solid var(--border-light)",
+                            paddingTop: 12,
+                            marginTop: 12,
+                            display: "flex",
+                            flexWrap: "wrap",
+                            gap: 8,
+                            justifyContent: "flex-end",
+                          }}
+                        >
+                          {isSuspendedTutor ? (
+                            <button
+                              type="button"
+                              className="btn btn-outline btn-sm"
+                              style={{ color: "#16A34A" }}
+                              disabled={isProcessing}
+                              onClick={() => handleReactivateLearner(t)}
+                            >
+                              Reactivate
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn btn-outline btn-sm"
+                              style={{ color: "#D97706" }}
+                              disabled={isProcessing}
+                              onClick={() => {
+                                setSuspendTargetUser(t);
+                                setShowSuspendModal(true);
+                              }}
+                            >
+                              Suspend
+                            </button>
+                          )}
+
+                          <button
+                            type="button"
+                            className="btn btn-outline btn-sm"
+                            disabled={isProcessing}
+                            onClick={() =>
+                              setTutorRemovalModal({
+                                tutor: t,
+                                mode: "deactivate",
+                                reason: "",
+                              })
+                            }
+                          >
+                            Deactivate Tutor
+                          </button>
+
+                          <button
+                            type="button"
+                            className="btn btn-outline btn-sm"
+                            style={{ color: "#DC2626", borderColor: "#FECACA" }}
+                            disabled={isProcessing}
+                            onClick={() =>
+                              setTutorRemovalModal({
+                                tutor: t,
+                                mode: "delete",
+                                reason: "",
+                              })
+                            }
+                          >
+                            Delete Tutor
+                          </button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1805,9 +2120,19 @@ export default function AdminPanel() {
                   Create and publish courses, edit metadata, configure assigned instructors, and manage curriculum modules.
                 </p>
               </div>
-              <button className="btn btn-solid-dark btn-sm" onClick={() => setShowAddCourseModal(true)}>
-                + Create New Course
-              </button>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  disabled={isProcessing}
+                  onClick={handleSeedDefaultCatalogCourses}
+                >
+                  {isProcessing ? "Seeding..." : "Seed Default Catalog Courses"}
+                </button>
+                <button className="btn btn-solid-dark btn-sm" onClick={() => setShowAddCourseModal(true)}>
+                  + Create New Course
+                </button>
+              </div>
             </div>
 
             {/* Filter Bar */}
@@ -1877,26 +2202,37 @@ export default function AdminPanel() {
                           </span>
                         </td>
                         <td style={{ padding: "12px 16px", fontSize: "0.85rem" }}>
-                          {c.tutorName || (c.tutorId ? "Assigned" : "Unassigned")}
+                          <div>{c.tutorName || (c.tutorId ? "Assigned" : "Unassigned")}</div>
+                          {c.needsTutorReassignment && (
+                            <span className="pill-badge pill-warning" style={{ fontSize: "0.68rem", marginTop: 4 }}>
+                              NEEDS REASSIGNMENT
+                            </span>
+                          )}
                         </td>
                         <td style={{ padding: "12px 16px", fontSize: "0.85rem", color: "var(--text-muted)" }}>{c.duration || "Self-paced"}</td>
                         <td style={{ padding: "12px 16px", textAlign: "right" }}>
                           <div style={{ display: "inline-flex", gap: 6 }}>
                             <button
+                              type="button"
                               className="btn btn-outline btn-sm"
+                              disabled={isProcessing}
                               onClick={() => handleToggleCourseStatus(c)}
                             >
                               {c.status === "published" ? "Unpublish" : "Publish"}
                             </button>
                             <button
+                              type="button"
                               className="btn btn-outline btn-sm"
+                              disabled={isProcessing}
                               onClick={() => setEditingCourse(c)}
                             >
                               Edit
                             </button>
                             <button
+                              type="button"
                               className="btn btn-outline btn-sm"
                               style={{ color: "#DC2626" }}
+                              disabled={isProcessing}
                               onClick={() => handleDeleteCourse(c)}
                             >
                               Delete
@@ -2596,6 +2932,7 @@ export default function AdminPanel() {
                           display: "flex",
                           justifyContent: "space-between",
                           alignItems: "center",
+                          gap: 10,
                         }}
                       >
                         <div>
@@ -2603,16 +2940,28 @@ export default function AdminPanel() {
                             {enr.courseTitle || enr.courseId}
                           </div>
                           <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-                            Progress: {enr.progressPercent || 0}% • Status: {enr.status || "active"}
+                            Progress: {enr.progressPercent || 0}% • Status: {enr.status || "pending"}
                           </div>
                         </div>
-                        <button
-                          className="btn btn-outline btn-sm"
-                          style={{ color: "#DC2626" }}
-                          onClick={() => handleRevokeEnrollment(enr)}
-                        >
-                          Revoke
-                        </button>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          {enr.status === "pending" && (
+                            <button
+                              className="btn btn-solid-dark btn-sm"
+                              disabled={isProcessing}
+                              onClick={() => handleApprovePendingEnrollment(enr)}
+                            >
+                              Approve
+                            </button>
+                          )}
+                          <button
+                            className="btn btn-outline btn-sm"
+                            style={{ color: "#DC2626" }}
+                            disabled={isProcessing}
+                            onClick={() => handleRevokeEnrollment(enr)}
+                          >
+                            Revoke
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -3494,6 +3843,144 @@ export default function AdminPanel() {
               <div style={{ display: "flex", justifyContent: "flex-end" }}>
                 <button className="btn btn-outline" onClick={() => setSelectedAuditLog(null)}>
                   Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 14: TUTOR DEACTIVATION / DELETION CONFIRMATION MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {tutorRemovalModal && tutorRemovalModal.tutor && (
+          <div className="modal-backdrop-overlay" onClick={() => !isProcessing && setTutorRemovalModal(null)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 520 }} onClick={(e) => e.stopPropagation()}>
+              <h3
+                style={{
+                  margin: "0 0 8px",
+                  fontSize: "1.2rem",
+                  fontWeight: 800,
+                  color: tutorRemovalModal.mode === "delete" ? "#DC2626" : "var(--text-primary)",
+                }}
+              >
+                {tutorRemovalModal.mode === "delete"
+                  ? `Permanently Delete Tutor: ${tutorRemovalModal.tutor.name}`
+                  : `Deactivate Tutor Role: ${tutorRemovalModal.tutor.name}`}
+              </h3>
+              <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", margin: "0 0 14px", lineHeight: 1.5 }}>
+                {tutorRemovalModal.mode === "delete"
+                  ? "This will permanently delete the instructor's Firebase Authentication account and remove their profile. All courses they taught will remain intact and be marked for instructor reassignment, and all student submissions, grades, enrollments, and audit records will be preserved."
+                  : "This will revoke the instructor's teaching privileges and custom claims while keeping their learner account active. All courses they taught will remain intact and be unassigned for reassignment."}
+              </p>
+
+              <form onSubmit={handleConfirmTutorRemoval}>
+                <div className="form-field-group" style={{ marginBottom: 12 }}>
+                  <label className="form-field-label">Action Mode</label>
+                  <select
+                    className="form-field-input"
+                    value={tutorRemovalModal.mode}
+                    disabled={isProcessing}
+                    onChange={(e) =>
+                      setTutorRemovalModal((prev) => ({ ...prev, mode: e.target.value }))
+                    }
+                  >
+                    <option value="deactivate">Deactivate Instructor Role (Demote to Student)</option>
+                    <option value="delete">Permanently Delete Tutor Account</option>
+                  </select>
+                </div>
+
+                <div className="form-field-group" style={{ marginBottom: 16 }}>
+                  <label className="form-field-label">Administrative Reason *</label>
+                  <textarea
+                    rows={3}
+                    required
+                    disabled={isProcessing}
+                    className="form-field-input"
+                    placeholder="Provide the reason for audit logging..."
+                    value={tutorRemovalModal.reason}
+                    onChange={(e) =>
+                      setTutorRemovalModal((prev) => ({ ...prev, reason: e.target.value }))
+                    }
+                  />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button
+                    type="button"
+                    className="btn btn-outline"
+                    disabled={isProcessing}
+                    onClick={() => setTutorRemovalModal(null)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isProcessing}
+                    className="btn btn-solid-dark"
+                    style={
+                      tutorRemovalModal.mode === "delete"
+                        ? { background: "#DC2626", borderColor: "#DC2626" }
+                        : {}
+                    }
+                  >
+                    {isProcessing
+                      ? "Processing..."
+                      : tutorRemovalModal.mode === "delete"
+                        ? "Confirm Permanent Delete"
+                        : "Confirm Deactivation"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 15: COURSE DELETION CONFIRMATION MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {courseToDelete && (
+          <div className="modal-backdrop-overlay" onClick={() => !isProcessing && setCourseToDelete(null)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 500 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 10px", fontSize: "1.2rem", fontWeight: 800, color: "#DC2626" }}>
+                Delete Course: {courseToDelete.title}
+              </h3>
+              <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", margin: "0 0 12px", lineHeight: 1.5 }}>
+                Are you sure you want to permanently delete <strong>{courseToDelete.title}</strong> (<code>{courseToDelete.id}</code>)?
+              </p>
+              <div
+                style={{
+                  background: "var(--bg-main)",
+                  border: "1px solid var(--border-light)",
+                  borderRadius: 8,
+                  padding: "10px 14px",
+                  fontSize: "0.825rem",
+                  color: "var(--text-secondary)",
+                  marginBottom: 18,
+                  lineHeight: 1.5,
+                }}
+              >
+                <div>• Recursively removes all modules, lessons, notes, assignments, tests, announcements, and course resources.</div>
+                <div>• Cleans up associated course files in Firebase Storage.</div>
+                <div>• Preserves student academic history by archiving existing enrollments and keeping past submissions intact.</div>
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  disabled={isProcessing}
+                  onClick={() => setCourseToDelete(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  className="btn btn-solid-dark"
+                  style={{ background: "#DC2626", borderColor: "#DC2626" }}
+                  onClick={() => handleDeleteCourse(courseToDelete, true)}
+                >
+                  {isProcessing ? "Deleting Course..." : "Permanently Delete Course"}
                 </button>
               </div>
             </div>

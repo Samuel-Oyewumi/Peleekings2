@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Award, Gem, Rocket, CheckCircle2, X } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { submitUserMilestone } from "../contexts/userActivity";
+import { useBodyScrollLock } from "../utils/scrollLock";
 
 export default function About() {
   const { currentUser, userProfile } = useAuth();
@@ -13,6 +14,7 @@ export default function About() {
   }, []);
 
   const [showMilestoneModal, setShowMilestoneModal] = useState(false);
+  useBodyScrollLock(showMilestoneModal);
   const [milestoneType, setMilestoneType] = useState("Passing Out Parade (POP)");
   const [fullName, setFullName] = useState(userProfile?.fullName || currentUser?.displayName || "");
   const [details, setDetails] = useState("");

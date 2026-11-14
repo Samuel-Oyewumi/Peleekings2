@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { GraduationCap, Briefcase, Target, Sparkles, Search, X, Award, ArrowRight } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
 import { getUserActivity } from "../contexts/userActivity";
+import { useBodyScrollLock } from "../utils/scrollLock";
 import { COURSES_CATALOG } from "../data/courses";
 export { COURSES_CATALOG };
 
@@ -18,6 +19,7 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState("");
   const [showPreviewMockup, setShowPreviewMockup] = useState(true);
   const [showHowItWorksModal, setShowHowItWorksModal] = useState(false);
+  useBodyScrollLock(showHowItWorksModal);
   const [userActivity, setUserActivity] = useState(() => getUserActivity(currentUser?.uid));
 
   // Redirect authenticated users to their verified role portal
