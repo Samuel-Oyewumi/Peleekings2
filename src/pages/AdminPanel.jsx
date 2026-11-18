@@ -181,7 +181,17 @@ export function normalizeAnnouncementDoc(docId, rawData) {
   const data = rawData && typeof rawData === "object" ? rawData : {};
   const rawDate = data.createdAt || data.date || null;
   const dateStr = formatFirestoreDate(rawDate, "Recent", false);
-  const expiresAtStr = data.expiresAt ? formatFirestoreDate(data.expiresAt, "", false) : "";
+  const rawPubDate = data.publishedAt || data.createdAt || data.date || null;
+  const publishedDateStr = formatFirestoreDate(rawPubDate, dateStr, false);
+  let expiresAtStr = "";
+  let expiresAtInput = "";
+  if (data.expiresAt) {
+    const dt = data.expiresAt?.toDate ? data.expiresAt.toDate() : new Date(data.expiresAt);
+    if (!Number.isNaN(dt.getTime()) && dt.getUTCFullYear() < 9000) {
+      expiresAtStr = formatFirestoreDate(data.expiresAt, "", false);
+      expiresAtInput = dt.toISOString().slice(0, 10);
+    }
+  }
   return {
     ...data,
     id: String(docId || data.id || ""),
@@ -194,8 +204,63 @@ export function normalizeAnnouncementDoc(docId, rawData) {
     courseId: safeStr(data.courseId, ""),
     pinned: Boolean(data.pinned),
     date: dateStr,
+    publishedDate: publishedDateStr,
     expiresAt: expiresAtStr,
+    expiresAtInput,
     _sortTime: getTimestampMillis(rawDate),
+  };
+}
+
+export function normalizeBroadcastDoc(docId, rawData) {
+  const data = rawData && typeof rawData === "object" ? rawData : {};
+  const rawCreatedTs = data.createdAt || data.timestamp || null;
+  const rawCompletedTs = data.completedAt || null;
+  const rawSortTs = data.createdAt || data.completedAt || data.timestamp || null;
+  const createdAtFormatted = formatFirestoreDate(rawCreatedTs, "Just now", true);
+  const completedAtFormatted = rawCompletedTs ? formatFirestoreDate(rawCompletedTs, "", true) : "";
+  const deliveredCount =
+    typeof data.deliveredCount === "number"
+      ? data.deliveredCount
+      : typeof data.recipientCount === "number" && data.status === "completed"
+        ? data.recipientCount
+        : Number(data.count) || 0;
+  const failedCount = typeof data.failedCount === "number" ? data.failedCount : 0;
+  const totalRecipients =
+    typeof data.totalRecipients === "number"
+      ? data.totalRecipients
+      : typeof data.recipientCount === "number"
+        ? data.recipientCount
+        : deliveredCount + failedCount;
+  const pendingCount =
+    typeof data.pendingCount === "number"
+      ? data.pendingCount
+      : Math.max(0, totalRecipients - deliveredCount - failedCount);
+  const defaultStatus =
+    pendingCount > 0
+      ? "sending"
+      : failedCount > 0
+        ? deliveredCount > 0
+          ? "partial_failure"
+          : "failed"
+        : "completed";
+  const status = safeStr(data.status, defaultStatus).toLowerCase();
+  return {
+    ...data,
+    id: String(docId || data.id || ""),
+    title: safeStr(data.title, safeStr(data.detail, "Broadcast Notification")),
+    body: safeStr(data.body, ""),
+    target: safeStr(data.target, "all_learners"),
+    targetId: safeStr(data.targetId || data.courseId, ""),
+    courseId: safeStr(data.courseId, ""),
+    deliveredCount,
+    failedCount,
+    pendingCount,
+    totalRecipients,
+    status,
+    timestamp: createdAtFormatted,
+    createdAtFormatted,
+    completedAtFormatted,
+    _sortTime: getTimestampMillis(rawSortTs),
   };
 }
 
@@ -418,6 +483,7 @@ export default function AdminPanel() {
   const [announcementFilter, setAnnouncementFilter] = useState("all");
   const [showAnnouncementModal, setShowAnnouncementModal] = useState(false);
   const [editingAnnouncement, setEditingAnnouncement] = useState(null);
+  const [announcementToDelete, setAnnouncementToDelete] = useState(null);
   const [announcementForm, setAnnouncementForm] = useState({
     id: null,
     title: "",
@@ -444,7 +510,10 @@ export default function AdminPanel() {
       }
       const list = snap.docs
         .map((d) => normalizeAnnouncementDoc(d.id, d.data()))
-        .sort((a, b) => b._sortTime - a._sortTime);
+        .sort((a, b) => {
+          if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+          return b._sortTime - a._sortTime;
+        });
       setAnnouncements(list);
     } catch (err) {
       console.warn("Notice fetching announcements:", err);
@@ -456,8 +525,10 @@ export default function AdminPanel() {
   }, [setSectionError]);
 
   // ══════════════════════════════════════════════════════════════════
-  // 6. DATA STATE: NOTIFICATIONS DISPATCH
+  // 6. DATA STATE: NOTIFICATIONS & BROADCAST DISPATCH
   // ══════════════════════════════════════════════════════════════════
+  const [broadcastsList, setBroadcastsList] = useState([]);
+  const [loadingBroadcasts, setLoadingBroadcasts] = useState(true);
   const [showSendNotifModal, setShowSendNotifModal] = useState(false);
   const [notifForm, setNotifForm] = useState({
     target: "all_learners",
@@ -466,7 +537,33 @@ export default function AdminPanel() {
     body: "",
     type: "announcement",
     courseId: "",
+    idempotencyKey: "",
   });
+
+  const fetchBroadcasts = useCallback(async () => {
+    setLoadingBroadcasts(true);
+    setSectionError("notifications", null);
+    try {
+      let snap;
+      try {
+        const q = query(collection(db, "broadcasts"), orderBy("createdAt", "desc"), limit(100));
+        snap = await withTimeout(getDocs(q), 5000);
+      } catch {
+        const fallbackQ = query(collection(db, "broadcasts"), limit(100));
+        snap = await withTimeout(getDocs(fallbackQ), 5000);
+      }
+      const list = snap.docs
+        .map((d) => normalizeBroadcastDoc(d.id, d.data()))
+        .sort((a, b) => b._sortTime - a._sortTime);
+      setBroadcastsList(list);
+    } catch (err) {
+      console.warn("Notice fetching broadcasts:", err);
+      setSectionError("notifications", err.message || "Failed to load broadcast history.");
+      setBroadcastsList([]);
+    } finally {
+      setLoadingBroadcasts(false);
+    }
+  }, [setSectionError]);
 
   // ══════════════════════════════════════════════════════════════════
   // 7. DATA STATE: RESOURCES & UPLOADS
@@ -524,7 +621,8 @@ export default function AdminPanel() {
       showAddResourceModal ||
       Boolean(selectedAuditLog) ||
       Boolean(tutorRemovalModal) ||
-      Boolean(courseToDelete)
+      Boolean(courseToDelete) ||
+      Boolean(announcementToDelete)
   );
 
   const fetchAuditLogs = useCallback(async () => {
@@ -599,20 +697,24 @@ export default function AdminPanel() {
     }
   }, [setSectionError]);
 
-  // Initial Data Fetch
+  // Initial Data Fetch (re-runs if currentUser changes from null to authenticated admin)
   useEffect(() => {
+    if (!currentUser?.uid) return;
     fetchApplications();
     fetchUsers();
     fetchCourses();
     fetchAnnouncements();
+    fetchBroadcasts();
     fetchAdminResources();
     fetchAuditLogs();
     fetchPlatformSettings();
   }, [
+    currentUser?.uid,
     fetchApplications,
     fetchUsers,
     fetchCourses,
     fetchAnnouncements,
+    fetchBroadcasts,
     fetchAdminResources,
     fetchAuditLogs,
     fetchPlatformSettings,
@@ -1118,12 +1220,22 @@ export default function AdminPanel() {
       triggerToast("Please provide both title and announcement body.", "error");
       return;
     }
+    if (announcementForm.audience === "course" && !announcementForm.courseId) {
+      triggerToast("Please select a target course for course-specific announcements.", "error");
+      return;
+    }
 
     setIsProcessing(true);
     try {
       const pubFn = httpsCallable(functions, "adminPublishAnnouncement");
       await pubFn(announcementForm);
-      triggerToast("✓ Announcement published successfully!");
+      triggerToast(
+        editingAnnouncement
+          ? "✓ Announcement updated successfully!"
+          : announcementForm.status === "draft"
+            ? "✓ Announcement saved as draft!"
+            : "✓ Announcement published successfully!"
+      );
       setShowAnnouncementModal(false);
       setEditingAnnouncement(null);
       setAnnouncementForm({
@@ -1138,18 +1250,56 @@ export default function AdminPanel() {
         status: "published",
         expiresAt: "",
       });
-      await fetchAnnouncements();
-      await fetchAuditLogs();
+      await Promise.all([fetchAnnouncements(), fetchAuditLogs()]);
     } catch (err) {
       console.error("Failed to save announcement:", err);
-      triggerToast("Announcement error: " + (err.message || "Failed to publish."), "error");
+      triggerToast("Announcement error: " + (err.message || "Failed to save."), "error");
     } finally {
       setIsProcessing(false);
     }
   }
 
-  async function handleDeleteAnnouncement(announcement) {
-    if (!window.confirm(`Delete announcement "${announcement.title}"?`)) return;
+  async function handleToggleAnnouncementStatus(announcement) {
+    if (!announcement?.id) return;
+    const nextStatus = announcement.status === "published" ? "draft" : "published";
+    setIsProcessing(true);
+    try {
+      const pubFn = httpsCallable(functions, "adminPublishAnnouncement");
+      await pubFn({
+        id: announcement.id,
+        title: announcement.title,
+        body: announcement.body,
+        category: announcement.category || "General",
+        priority: announcement.priority || "normal",
+        audience: announcement.audience || "all",
+        courseId: announcement.courseId || "",
+        pinned: Boolean(announcement.pinned),
+        status: nextStatus,
+        expiresAt: announcement.expiresAtInput || "",
+      });
+      triggerToast(
+        nextStatus === "published"
+          ? `✓ Announcement "${announcement.title}" published.`
+          : `Announcement "${announcement.title}" moved to draft.`
+      );
+      setAnnouncements((prev) =>
+        prev.map((a) => (a.id === announcement.id ? { ...a, status: nextStatus } : a))
+      );
+      await Promise.all([fetchAnnouncements(), fetchAuditLogs()]);
+    } catch (err) {
+      console.error("Failed to toggle announcement status:", err);
+      triggerToast("Error updating announcement status: " + (err.message || "Failed."), "error");
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  async function handleDeleteAnnouncement(announcement, skipConfirmModal = false) {
+    if (!announcement?.id) return;
+    if (!skipConfirmModal) {
+      setAnnouncementToDelete(announcement);
+      return;
+    }
 
     setIsProcessing(true);
     try {
@@ -1158,9 +1308,10 @@ export default function AdminPanel() {
         announcementId: announcement.id,
         title: announcement.title,
       });
-      triggerToast("Announcement removed.");
+      triggerToast("✓ Announcement removed.");
+      setAnnouncementToDelete(null);
       setAnnouncements((prev) => prev.filter((a) => a.id !== announcement.id));
-      await fetchAuditLogs();
+      await Promise.all([fetchAnnouncements(), fetchAuditLogs()]);
     } catch (err) {
       console.error("Failed to delete announcement:", err);
       triggerToast("Error deleting announcement: " + (err.message || "Failed."), "error");
@@ -1170,7 +1321,7 @@ export default function AdminPanel() {
   }
 
   // ══════════════════════════════════════════════════════════════════
-  // ACTIONS: NOTIFICATIONS DISPATCH
+  // ACTIONS: NOTIFICATIONS & BROADCAST DISPATCH
   // ══════════════════════════════════════════════════════════════════
   async function handleSendNotification(e) {
     e.preventDefault();
@@ -1178,12 +1329,35 @@ export default function AdminPanel() {
       triggerToast("Please fill in both title and message.", "error");
       return;
     }
+    if (notifForm.target === "course" && !notifForm.targetId && !notifForm.courseId) {
+      triggerToast("Please choose a target course.", "error");
+      return;
+    }
+    if (notifForm.target === "single_user" && !notifForm.targetId.trim()) {
+      triggerToast("Please provide the recipient user UID.", "error");
+      return;
+    }
 
     setIsProcessing(true);
     try {
       const sendNotifFn = httpsCallable(functions, "adminSendNotification");
-      const res = await sendNotifFn(notifForm);
-      triggerToast(`✓ Dispatched notification to ${res.data?.count || 0} recipient(s)!`);
+      const res = await sendNotifFn({
+        ...notifForm,
+        idempotencyKey:
+          notifForm.idempotencyKey ||
+          `bcast_${notifForm.target}_${notifForm.targetId || "all"}_${notifForm.title.trim()}_${Math.floor(Date.now() / 60000)}`,
+      });
+      const data = res?.data || {};
+      if (data.duplicatePrevented) {
+        triggerToast("Duplicate broadcast prevented — this notification was already dispatched recently.", "info");
+      } else if (data.status === "partial_failure") {
+        triggerToast(
+          `⚠️ Partial broadcast delivery: ${data.deliveredCount || 0}/${data.totalRecipients || 0} delivered (${data.failedCount || 0} failed).`,
+          "info"
+        );
+      } else {
+        triggerToast(`✓ Dispatched notification to ${data.deliveredCount ?? data.count ?? 0} recipient(s)!`);
+      }
       setShowSendNotifModal(false);
       setNotifForm({
         target: "all_learners",
@@ -1192,8 +1366,9 @@ export default function AdminPanel() {
         body: "",
         type: "announcement",
         courseId: "",
+        idempotencyKey: "",
       });
-      await fetchAuditLogs();
+      await Promise.all([fetchBroadcasts(), fetchAuditLogs()]);
     } catch (err) {
       console.error("Failed to send notifications:", err);
       triggerToast("Dispatch error: " + (err.message || "Failed."), "error");
@@ -1524,7 +1699,10 @@ export default function AdminPanel() {
                   else if (activeTab === "learners" || activeTab === "tutors" || activeTab === "analytics") fetchUsers();
                   else if (activeTab === "courses") fetchCourses();
                   else if (activeTab === "announcements") fetchAnnouncements();
-                  else if (activeTab === "resources") fetchAdminResources();
+                  else if (activeTab === "notifications") {
+                    fetchBroadcasts();
+                    fetchAuditLogs();
+                  } else if (activeTab === "resources") fetchAdminResources();
                   else if (activeTab === "settings") fetchPlatformSettings();
                   else fetchAuditLogs();
                 }}
@@ -2260,34 +2438,46 @@ export default function AdminPanel() {
                   Create and manage targeted announcements that display on learner dashboards, tutor portals, or course classrooms.
                 </p>
               </div>
-              <button
-                className="btn btn-solid-dark btn-sm"
-                onClick={() => {
-                  setEditingAnnouncement(null);
-                  setAnnouncementForm({
-                    id: null,
-                    title: "",
-                    body: "",
-                    category: "General",
-                    priority: "normal",
-                    audience: "all",
-                    courseId: "",
-                    pinned: false,
-                    status: "published",
-                    expiresAt: "",
-                  });
-                  setShowAnnouncementModal(true);
-                }}
-              >
-                + Create Announcement
-              </button>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  disabled={loadingAnnouncements}
+                  onClick={() => fetchAnnouncements()}
+                >
+                  {loadingAnnouncements ? "Refreshing..." : "Refresh"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-solid-dark btn-sm"
+                  onClick={() => {
+                    setEditingAnnouncement(null);
+                    setAnnouncementForm({
+                      id: null,
+                      title: "",
+                      body: "",
+                      category: "General",
+                      priority: "normal",
+                      audience: "all",
+                      courseId: "",
+                      pinned: false,
+                      status: "published",
+                      expiresAt: "",
+                    });
+                    setShowAnnouncementModal(true);
+                  }}
+                >
+                  + Create Announcement
+                </button>
+              </div>
             </div>
 
             {/* Filter Tabs */}
-            <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+            <div style={{ display: "flex", gap: 8, marginBottom: 20, flexWrap: "wrap" }}>
               {["all", "published", "draft"].map((st) => (
                 <button
                   key={st}
+                  type="button"
                   className={`filter-pill-btn ${announcementFilter === st ? "active" : ""}`}
                   onClick={() => setAnnouncementFilter(st)}
                 >
@@ -2334,7 +2524,16 @@ export default function AdminPanel() {
                         <span className="pill-badge pill-tech">AUDIENCE: {(ann.audience || "all").toUpperCase()}</span>
                         {ann.pinned && <span className="pill-badge pill-creative">📌 PINNED</span>}
                         {ann.priority === "urgent" && <span className="pill-badge pill-danger">URGENT</span>}
-                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Posted {String(ann.date || "Recently")}</span>
+                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
+                          {ann.status === "published"
+                            ? `Published ${String(ann.publishedDate || ann.date || "Recently")}`
+                            : `Created ${String(ann.date || "Recently")}`}
+                        </span>
+                        {ann.expiresAt && (
+                          <span style={{ fontSize: "0.78rem", color: "var(--text-muted)" }}>
+                            • Expires {ann.expiresAt}
+                          </span>
+                        )}
                       </div>
                       <h3 style={{ margin: "0 0 6px", fontSize: "1.15rem", fontWeight: 700 }}>{ann.title}</h3>
                       <p style={{ margin: 0, fontSize: "0.875rem", color: "var(--text-secondary)", lineHeight: 1.5, whiteSpace: "pre-line" }}>
@@ -2347,9 +2546,19 @@ export default function AdminPanel() {
                       )}
                     </div>
 
-                    <div style={{ display: "flex", gap: 8 }}>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       <button
+                        type="button"
                         className="btn btn-outline btn-sm"
+                        disabled={isProcessing}
+                        onClick={() => handleToggleAnnouncementStatus(ann)}
+                      >
+                        {ann.status === "published" ? "Move to Draft" : "Publish"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-sm"
+                        disabled={isProcessing}
                         onClick={() => {
                           setEditingAnnouncement(ann);
                           setAnnouncementForm({
@@ -2362,7 +2571,7 @@ export default function AdminPanel() {
                             courseId: ann.courseId || "",
                             pinned: Boolean(ann.pinned),
                             status: ann.status || "published",
-                            expiresAt: ann.expiresAt || "",
+                            expiresAt: ann.expiresAtInput || "",
                           });
                           setShowAnnouncementModal(true);
                         }}
@@ -2370,8 +2579,10 @@ export default function AdminPanel() {
                         Edit
                       </button>
                       <button
+                        type="button"
                         className="btn btn-outline btn-sm"
                         style={{ color: "#DC2626" }}
+                        disabled={isProcessing}
                         onClick={() => handleDeleteAnnouncement(ann)}
                       >
                         Delete
@@ -2385,7 +2596,7 @@ export default function AdminPanel() {
         )}
 
         {/* ══════════════════════════════════════════════════════════════ */}
-        {/* TAB 7: NOTIFICATIONS */}
+        {/* TAB 7: NOTIFICATIONS & BROADCASTS */}
         {/* ══════════════════════════════════════════════════════════════ */}
         {activeTab === "notifications" && (
           <div>
@@ -2396,9 +2607,32 @@ export default function AdminPanel() {
                   Broadcast targeted in-app notifications directly to students, instructors, or individual accounts.
                 </p>
               </div>
-              <button className="btn btn-solid-dark btn-sm" onClick={() => setShowSendNotifModal(true)}>
-                + Send In-App Notification
-              </button>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  disabled={loadingBroadcasts || loadingLogs}
+                  onClick={() => {
+                    fetchBroadcasts();
+                    fetchAuditLogs();
+                  }}
+                >
+                  {loadingBroadcasts ? "Refreshing..." : "Refresh History"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-solid-dark btn-sm"
+                  onClick={() => {
+                    setNotifForm((prev) => ({
+                      ...prev,
+                      idempotencyKey: `bcast_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    }));
+                    setShowSendNotifModal(true);
+                  }}
+                >
+                  + Send In-App Notification
+                </button>
+              </div>
             </div>
 
             <div className="dashboard-card" style={{ padding: 24, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF", marginBottom: 24 }}>
@@ -2406,48 +2640,120 @@ export default function AdminPanel() {
               <ul style={{ margin: 0, paddingLeft: 20, fontSize: "0.875rem", color: "var(--text-secondary)", lineHeight: 1.6 }}>
                 <li>Notifications sent here are written to the target user's Firestore <code>notifications</code> subcollection.</li>
                 <li>Learners and Instructors will see a badge update in their top navigation bell menu in real time.</li>
-                <li>Mass broadcasts are executed safely in batches through trusted Cloud Functions to prevent client timeouts.</li>
+                <li>Mass broadcasts are executed safely in bounded batches through trusted Cloud Functions with server-side recipient verification and duplicate-send protection.</li>
               </ul>
             </div>
 
             {/* Notification Dispatch History */}
             <div className="dashboard-card" style={{ padding: 24, borderRadius: 12, border: "1px solid var(--border-light)", background: "#FFFFFF" }}>
               <h3 style={{ margin: "0 0 16px", fontSize: "1.1rem", fontWeight: 700 }}>Notification Dispatch History</h3>
-              {auditLogs.filter((l) => l.action === "Notification Dispatched").length === 0 ? (
-                <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)", fontStyle: "italic" }}>
-                  No recent notification dispatch records found in audit logs.
-                </div>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {auditLogs
-                    .filter((l) => l.action === "Notification Dispatched")
-                    .map((log) => (
-                      <div
-                        key={log.id}
-                        style={{
-                          padding: "12px 16px",
-                          borderRadius: 8,
-                          background: "var(--bg-main)",
-                          border: "1px solid var(--border-light)",
-                          display: "flex",
-                          justifyContent: "space-between",
-                          alignItems: "center",
-                          gap: 12,
-                        }}
-                      >
-                        <div>
-                          <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>{String(log.detail || "")}</div>
-                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-                            Target: {typeof log.target === "string" ? log.target : "All"}
+              {(() => {
+                const seenBroadcastIds = new Set(broadcastsList.map((b) => b.id));
+                const legacyAuditBroadcasts = auditLogs
+                  .filter((l) => l.action === "Notification Dispatched" && (!l.broadcastId || !seenBroadcastIds.has(l.broadcastId)))
+                  .map((l) => ({
+                    id: l.id,
+                    title: l.detail || "Notification Dispatched",
+                    body: "",
+                    target: l.target || "all_learners",
+                    targetId: l.targetId || "",
+                    deliveredCount: typeof l.deliveredCount === "number" ? l.deliveredCount : (Number(l.recipientCount) || 0),
+                    failedCount: typeof l.failedCount === "number" ? l.failedCount : 0,
+                    totalRecipients: typeof l.totalRecipients === "number" ? l.totalRecipients : (Number(l.recipientCount) || 0),
+                    status: l.status || "completed",
+                    timestamp: typeof l.timestamp === "string" ? l.timestamp : formatFirestoreDate(l.timestamp, "Recent", true),
+                    _sortTime: l._sortTime || 0,
+                  }));
+                const combinedHistory = [...broadcastsList, ...legacyAuditBroadcasts].sort(
+                  (a, b) => (b._sortTime || 0) - (a._sortTime || 0)
+                );
+
+                if (loadingBroadcasts && combinedHistory.length === 0) {
+                  return (
+                    <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)" }}>
+                      Loading broadcast history...
+                    </div>
+                  );
+                }
+
+                if (combinedHistory.length === 0) {
+                  return (
+                    <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)", fontStyle: "italic" }}>
+                      No recent notification dispatch records found.
+                    </div>
+                  );
+                }
+
+                return (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {combinedHistory.map((item) => {
+                      const statusBadge =
+                        item.status === "failed"
+                          ? "pill-danger"
+                          : item.status === "partial_failure" || item.status === "interrupted" || item.status === "sending"
+                            ? "pill-warning"
+                            : "pill-success";
+                      const statusLabel =
+                        item.status === "failed"
+                          ? "FAILED"
+                          : item.status === "partial_failure"
+                            ? "PARTIAL DELIVERY"
+                            : item.status === "interrupted"
+                              ? "INTERRUPTED"
+                              : item.status === "sending"
+                                ? "IN PROGRESS"
+                                : "DELIVERED";
+                      return (
+                        <div
+                          key={item.id}
+                          style={{
+                            padding: "14px 16px",
+                            borderRadius: 8,
+                            background: "var(--bg-main)",
+                            border: "1px solid var(--border-light)",
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "flex-start",
+                            flexWrap: "wrap",
+                            gap: 12,
+                          }}
+                        >
+                          <div style={{ flex: 1, minWidth: 240 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+                              <span className={`pill-badge ${statusBadge}`} style={{ fontSize: "0.7rem" }}>
+                                {statusLabel}
+                              </span>
+                              <span className="pill-badge pill-tech" style={{ fontSize: "0.7rem" }}>
+                                TARGET: {String(item.target || "all").toUpperCase()}
+                                {item.targetId ? ` (${item.targetId})` : ""}
+                              </span>
+                              <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
+                                • {item.deliveredCount ?? 0}/{item.totalRecipients ?? item.deliveredCount ?? 0} delivered
+                                {item.pendingCount > 0 ? ` (${item.pendingCount} pending)` : ""}
+                                {item.failedCount > 0 ? ` (${item.failedCount} failed)` : ""}
+                              </span>
+                            </div>
+                            <div style={{ fontWeight: 700, fontSize: "0.92rem", color: "var(--text-primary)" }}>
+                              {String(item.title || "Notification Dispatched")}
+                            </div>
+                            {item.body && (
+                              <div style={{ fontSize: "0.825rem", color: "var(--text-secondary)", marginTop: 2 }}>
+                                {item.body}
+                              </div>
+                            )}
+                          </div>
+                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap", textAlign: "right" }}>
+                            <div>Created: {item.createdAtFormatted || item.timestamp}</div>
+                            {item.completedAtFormatted && (
+                              <div>Completed: {item.completedAtFormatted}</div>
+                            )}
                           </div>
                         </div>
-                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
-                          {typeof log.timestamp === "string" ? log.timestamp : formatFirestoreDate(log.timestamp, "Recent", true)}
-                        </span>
-                      </div>
-                    ))}
-                </div>
-              )}
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </div>
           </div>
         )}
@@ -3611,7 +3917,13 @@ export default function AdminPanel() {
                     Cancel
                   </button>
                   <button type="submit" disabled={isProcessing} className="btn btn-solid-dark">
-                    Publish Announcement
+                    {isProcessing
+                      ? "Saving..."
+                      : editingAnnouncement
+                        ? "Save Changes"
+                        : announcementForm.status === "draft"
+                          ? "Save Draft"
+                          : "Publish Announcement"}
                   </button>
                 </div>
               </form>
@@ -3636,6 +3948,7 @@ export default function AdminPanel() {
                   >
                     <option value="all_learners">All Registered Learners</option>
                     <option value="all_tutors">All Approved Instructors</option>
+                    <option value="all_users">All Platform Users (Learners &amp; Instructors)</option>
                     <option value="course">Students in Specific Course</option>
                     <option value="single_user">Single User (by UID)</option>
                   </select>
@@ -3981,6 +4294,41 @@ export default function AdminPanel() {
                   onClick={() => handleDeleteCourse(courseToDelete, true)}
                 >
                   {isProcessing ? "Deleting Course..." : "Permanently Delete Course"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {/* MODAL 16: ANNOUNCEMENT DELETION CONFIRMATION MODAL */}
+        {/* ══════════════════════════════════════════════════════════════ */}
+        {announcementToDelete && (
+          <div className="modal-backdrop-overlay" onClick={() => !isProcessing && setAnnouncementToDelete(null)}>
+            <div className="modal-dialog-box" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+              <h3 style={{ margin: "0 0 10px", fontSize: "1.2rem", fontWeight: 800, color: "#DC2626" }}>
+                Delete Announcement
+              </h3>
+              <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", margin: "0 0 18px", lineHeight: 1.5 }}>
+                Are you sure you want to permanently delete the announcement <strong>{announcementToDelete.title}</strong>?
+              </p>
+              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  disabled={isProcessing}
+                  onClick={() => setAnnouncementToDelete(null)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  className="btn btn-solid-dark"
+                  style={{ background: "#DC2626", borderColor: "#DC2626" }}
+                  onClick={() => handleDeleteAnnouncement(announcementToDelete, true)}
+                >
+                  {isProcessing ? "Deleting..." : "Delete Announcement"}
                 </button>
               </div>
             </div>

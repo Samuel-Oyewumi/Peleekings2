@@ -18,6 +18,7 @@ import {
 } from "../contexts/userActivity";
 import { getResources, uploadResource } from "../contexts/resourcesService";
 import { useBodyScrollLock } from "../utils/scrollLock";
+import { getFarFutureExpiresAtTimestamp } from "../utils/courseCatalogue";
 
 function getYouTubeEmbedUrl(url) {
   if (!url) return null;
@@ -81,15 +82,20 @@ export default function CoursePage() {
   // Firestore-backed enrollment state (source of truth)
   const [enrollment, setEnrollment] = useState(null);
   const [isEnrolled, setIsEnrolled] = useState(false);
-  const [loadingEnrollment, setLoadingEnrollment] = useState(true);
+  const [_loadingEnrollment, setLoadingEnrollment] = useState(true);
+  const isCourseDeleting = Boolean(
+    courseData?.status === "deleting" || courseData?.deletionState === "deleting"
+  );
   const isCourseStaff = Boolean(
     isAdmin ||
       (isTutor &&
         currentUser?.uid &&
         (courseData.tutorId === currentUser.uid ||
+          courseData.tutorUid === currentUser.uid ||
+          courseData.instructorId === currentUser.uid ||
           (Array.isArray(courseData.assignedTutors) && courseData.assignedTutors.includes(currentUser.uid))))
   );
-  const hasClassroomAccess = Boolean(isEnrolled || isCourseStaff);
+  const hasClassroomAccess = Boolean(!isCourseDeleting && (isEnrolled || isCourseStaff));
   const isPendingEnrollment = Boolean(enrollment && enrollment.status === "pending" && !hasClassroomAccess);
 
   const [viewMode, setViewMode] = useState(location.state?.classroom ? "classroom" : "detail");
@@ -495,6 +501,10 @@ export default function CoursePage() {
   }
 
   async function handleEnroll(experienceType) {
+    if (isCourseDeleting) {
+      triggerToast("This course is currently unavailable.");
+      return;
+    }
     if (!currentUser) {
       navigate("/auth", { state: { from: `/course/${courseData.id}` } });
       return;
@@ -547,6 +557,12 @@ export default function CoursePage() {
     try {
       const res = await submitAssignment(currentUser.uid, courseData.id, currentLesson.id, {
         content: assignmentContent.trim(),
+        studentName:
+          userProfile?.fullName ||
+          currentUser?.displayName ||
+          currentUser?.email ||
+          "Learner",
+        studentEmail: currentUser?.email || null,
       });
       setCurrentSubmission(res);
       setAssignmentContent("");
@@ -567,20 +583,12 @@ export default function CoursePage() {
     if (e) e.preventDefault();
     setTestSubmitting(true);
     try {
-      // Calculate score
-      let correctCount = 0;
-      TEST_QUESTIONS.forEach((q, idx) => {
-        if (testAnswers[idx] === q.correctIndex) {
-          correctCount++;
-        }
-      });
-      const calculatedScore = Math.round((correctCount / TEST_QUESTIONS.length) * 100);
-      setTestScore(calculatedScore);
-
-      const res = await submitTest(currentUser.uid, courseData.id, currentLesson.id, testAnswers, calculatedScore);
+      const res = await submitTest(currentUser.uid, courseData.id, currentLesson.id, testAnswers);
+      const serverScore = typeof res?.score === "number" ? res.score : 0;
+      setTestScore(serverScore);
       setCurrentTestSubmission(res);
       await toggleLessonComplete(currentLesson.id);
-      triggerToast(`✓ Test submitted! Your score: ${calculatedScore}%`);
+      triggerToast(`✓ Test submitted! Your score: ${serverScore}%`);
     } catch (err) {
       console.error(err);
       triggerToast("Failed to submit test.");
@@ -599,6 +607,7 @@ export default function CoursePage() {
         body: announcementForm.body.trim(),
         postedBy: userProfile?.fullName || currentUser?.displayName || "Instructor",
         postedByUid: currentUser?.uid || "tutor",
+        expiresAt: getFarFutureExpiresAtTimestamp(),
         createdAt: serverTimestamp(),
       };
       const docRef = await addDoc(collection(db, "courses", courseData.id, "announcements"), newAnn);

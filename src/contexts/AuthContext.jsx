@@ -19,11 +19,15 @@ import { validatePasswordOrThrow } from "../utils/passwordPolicy";
 
 const AuthContext = createContext(null);
 
-function withTimeout(promise, ms = 3500) {
+function withTimeout(promise, ms = 20000) {
   return Promise.race([
     promise,
     new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("OPERATION_TIMEOUT")), ms)
+      setTimeout(() => {
+        const err = new Error("Slow connection, please try again");
+        err.code = "OPERATION_TIMEOUT";
+        reject(err);
+      }, ms)
     ),
   ]);
 }
@@ -31,6 +35,9 @@ function withTimeout(promise, ms = 3500) {
 // Format Firebase auth error codes into clear, user-friendly messages
 function formatAuthError(err) {
   if (!err) return "An unknown authentication error occurred.";
+  if (err.code === "OPERATION_TIMEOUT" || err.message === "Slow connection, please try again") {
+    return "Slow connection, please try again";
+  }
   const code = err.code || "";
   switch (code) {
     case "auth/invalid-credential":
@@ -106,6 +113,28 @@ export function resolveClaimsPrivilege(rawClaims) {
   };
 }
 
+export async function allocateRegistrationCode(_uid, metadata = {}) {
+  const allocateFn = httpsCallable(functions, "allocateRegistrationCode");
+  const res = await withTimeout(
+    allocateFn({
+      email: metadata.email || "",
+      fullName: metadata.fullName || metadata.displayName || "",
+      displayName: metadata.displayName || metadata.fullName || "",
+      surname: metadata.surname || "",
+      firstName: metadata.firstName || "",
+      studentType: metadata.studentType || "non_corper",
+      nyscStateCode: metadata.nyscStateCode || null,
+      phoneNumber: metadata.phoneNumber || "",
+    }),
+    20000
+  );
+  const regNumber = res?.data?.regNumber || null;
+  if (!regNumber) {
+    throw new Error("Registration code was not returned by server.");
+  }
+  return regNumber;
+}
+
 export function useAuth() {
   const context = useContext(AuthContext);
   if (!context) {
@@ -124,6 +153,7 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState(null);
   const signupInFlightRef = useRef(false);
+  const regCodeAttemptedUidRef = useRef(null);
 
   /**
    * Refreshes the ID token and custom claims from Firebase Authentication.
@@ -140,7 +170,7 @@ export function AuthProvider({ children }) {
       return {};
     }
     try {
-      const tokenResult = await withTimeout(auth.currentUser.getIdTokenResult(true), 4000);
+      const tokenResult = await withTimeout(auth.currentUser.getIdTokenResult(true), 20000);
       const userClaims = tokenResult.claims || {};
       const { isAdmin: verifiedAdmin, isTutor: verifiedTutor, role: resolvedRole } =
         resolveClaimsPrivilege(userClaims);
@@ -182,10 +212,11 @@ export function AuthProvider({ children }) {
       role: verifiedRole,
       studentType: "non_corper",
       status: "active",
+      needsRegCode: true,
     };
 
     try {
-      const docSnap = await withTimeout(getDoc(doc(db, "users", user.uid)), 3500);
+      const docSnap = await withTimeout(getDoc(doc(db, "users", user.uid)), 20000);
       if (docSnap.exists()) {
         const data = docSnap.data();
         const profile = {
@@ -195,17 +226,18 @@ export function AuthProvider({ children }) {
           displayName: data.displayName || user.displayName || user.email?.split("@")[0] || "User",
           fullName: data.fullName || data.displayName || user.displayName || user.email?.split("@")[0] || "User",
           role: verifiedRole, // Verified role from Custom Claims overrides any document role
+          needsRegCode: !data.regNumber,
         };
         setUserProfile(profile);
-        return profile;
+        return { ...profile, _firestoreExists: true };
       } else {
         setUserProfile(fallbackProfile);
-        return fallbackProfile;
+        return { ...fallbackProfile, _firestoreExists: false };
       }
     } catch (err) {
       console.warn("Firestore profile sync notice:", err);
       setUserProfile((prev) => prev || fallbackProfile);
-      return fallbackProfile;
+      return { ...fallbackProfile, _firestoreExists: false };
     }
   }, []);
 
@@ -220,7 +252,7 @@ export function AuthProvider({ children }) {
       if (isMounted) {
         setLoading(false);
       }
-    }, 4500);
+    }, 20000);
 
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (!isMounted) return;
@@ -228,7 +260,7 @@ export function AuthProvider({ children }) {
       if (user) {
         try {
           // Fetch verified claims directly from Firebase Authentication token
-          const tokenResult = await withTimeout(user.getIdTokenResult(), 3500);
+          const tokenResult = await withTimeout(user.getIdTokenResult(), 20000);
           const userClaims = tokenResult.claims || {};
           const { isAdmin: verifiedAdmin, isTutor: verifiedTutor, role: resolvedRole } =
             resolveClaimsPrivilege(userClaims);
@@ -255,7 +287,38 @@ export function AuthProvider({ children }) {
           setLoading(false);
           clearTimeout(safetyTimer);
 
-          await syncProfile(user, resolvedRole);
+          const synced = await syncProfile(user, resolvedRole);
+          if (
+            synced &&
+            synced._firestoreExists &&
+            !synced.regNumber &&
+            !signupInFlightRef.current &&
+            regCodeAttemptedUidRef.current !== user.uid
+          ) {
+            regCodeAttemptedUidRef.current = user.uid;
+            allocateRegistrationCode(user.uid, {
+              email: synced.email || user.email || "",
+              fullName: synced.fullName || user.displayName || "",
+              displayName: synced.displayName || user.displayName || "",
+              surname: synced.surname || "",
+              firstName: synced.firstName || "",
+              studentType: synced.studentType || "non_corper",
+              nyscStateCode: synced.nyscStateCode || null,
+              phoneNumber: synced.phoneNumber || "",
+            })
+              .then((regNumber) => {
+                if (isMounted && regNumber) {
+                  setUserProfile((prev) =>
+                    prev && prev.uid === user.uid
+                      ? { ...prev, regNumber, needsRegCode: false }
+                      : prev
+                  );
+                }
+              })
+              .catch((allocErr) => {
+                console.error("Background registration code allocation failed on sign-in:", allocErr);
+              });
+          }
         } catch (err) {
           console.error("Auth state claim verification failure, failing closed:", err);
           if (!isMounted) return;
@@ -265,12 +328,17 @@ export function AuthProvider({ children }) {
           setIsAdmin(false);
           setIsTutor(false);
           setRole("student");
-          setAuthError("Failed to verify authorization claims.");
+          setAuthError(
+            err?.code === "OPERATION_TIMEOUT"
+              ? "Slow connection, please try again"
+              : "Failed to verify authorization claims."
+          );
           setLoading(false);
           clearTimeout(safetyTimer);
           await syncProfile(user, "student");
         }
       } else {
+        regCodeAttemptedUidRef.current = null;
         setCurrentUser(null);
         setUserProfile(null);
         setClaims({});
@@ -293,8 +361,8 @@ export function AuthProvider({ children }) {
    * signup:
    * Standard Firebase Authentication registration.
    * Enforces strict password policy (8+ chars, >= 1 digit) before creating account.
-   * Parallelizes profile initialization and immediate registration code allocation
-   * so the registration code is returned without waiting for cold-start triggers.
+   * Uses a 20s timeout safety net, surfaces profile write or timeout errors visibly,
+   * and sets `needsRegCode: true` if registration code allocation fails so it can be retried.
    */
   async function signup(email, password, arg3, arg4) {
     if (signupInFlightRef.current) {
@@ -321,7 +389,10 @@ export function AuthProvider({ children }) {
     try {
       let userCredential;
       try {
-        userCredential = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+        userCredential = await withTimeout(
+          createUserWithEmailAndPassword(auth, cleanEmail, password),
+          20000
+        );
       } catch (authErr) {
         throw new Error(formatAuthError(authErr));
       }
@@ -353,38 +424,45 @@ export function AuthProvider({ children }) {
           })
         : Promise.resolve();
 
+      // setDoc profile write failure or timeout MUST throw a user-visible error
       const writeFirestoreProfilePromise = withTimeout(
         setDoc(doc(db, "users", user.uid), initialData, { merge: true }),
-        3500
+        20000
       ).catch((firestoreErr) => {
-        console.warn("Notice: Initial user profile write timed out or failed in Firestore:", firestoreErr);
+        if (
+          firestoreErr?.code === "OPERATION_TIMEOUT" ||
+          firestoreErr?.message === "Slow connection, please try again"
+        ) {
+          throw new Error("Slow connection, please try again");
+        }
+        throw new Error(
+          firestoreErr?.message || "Failed to save your user profile. Please try again."
+        );
       });
 
-      const tokenResultPromise = withTimeout(user.getIdTokenResult(false), 2500).catch(() => ({
-        claims: {},
-      }));
-
-      const allocateRegCodePromise = (async () => {
-        try {
-          const allocateFn = httpsCallable(functions, "allocateRegistrationCode");
-          const res = await withTimeout(
-            allocateFn({
-              email: cleanEmail,
-              fullName: initialData.fullName,
-              displayName: initialData.displayName,
-              surname: surnameClean,
-              firstName: firstNameClean,
-              studentType: initialData.studentType,
-              nyscStateCode: initialData.nyscStateCode,
-              phoneNumber: initialData.phoneNumber,
-            }),
-            3000
-          );
-          return res?.data?.regNumber || null;
-        } catch {
-          return null;
+      const tokenResultPromise = withTimeout(user.getIdTokenResult(false), 20000).catch((tokErr) => {
+        if (
+          tokErr?.code === "OPERATION_TIMEOUT" ||
+          tokErr?.message === "Slow connection, please try again"
+        ) {
+          throw new Error("Slow connection, please try again");
         }
-      })();
+        throw new Error(tokErr?.message || "Failed to verify authentication token. Please try again.");
+      });
+
+      const allocateRegCodePromise = allocateRegistrationCode(user.uid, {
+        email: cleanEmail,
+        fullName: initialData.fullName,
+        displayName: initialData.displayName,
+        surname: surnameClean,
+        firstName: firstNameClean,
+        studentType: initialData.studentType,
+        nyscStateCode: initialData.nyscStateCode,
+        phoneNumber: initialData.phoneNumber,
+      }).catch((allocErr) => {
+        console.error("Registration code allocation failed during signup; flagging needsRegCode:", allocErr);
+        return null;
+      });
 
       const [, , tokenResult, allocatedRegNumber] = await Promise.all([
         updateAuthProfilePromise,
@@ -399,7 +477,9 @@ export function AuthProvider({ children }) {
 
       const resolvedProfile = {
         ...initialData,
-        ...(allocatedRegNumber ? { regNumber: allocatedRegNumber } : {}),
+        ...(allocatedRegNumber
+          ? { regNumber: allocatedRegNumber, needsRegCode: false }
+          : { needsRegCode: true }),
         role: resolvedRole,
       };
 
@@ -428,18 +508,27 @@ export function AuthProvider({ children }) {
 
     let userCredential;
     try {
-      userCredential = await signInWithEmailAndPassword(auth, cleanEmail, password);
+      userCredential = await withTimeout(
+        signInWithEmailAndPassword(auth, cleanEmail, password),
+        20000
+      );
     } catch (authErr) {
       throw new Error(formatAuthError(authErr));
     }
 
     const user = userCredential.user;
 
-    // Force refresh ID token to get latest Custom Claims; fail closed if verification fails
+    // Force refresh ID token to get latest Custom Claims
     let tokenResult;
     try {
-      tokenResult = await withTimeout(user.getIdTokenResult(true), 3500);
-    } catch {
+      tokenResult = await withTimeout(user.getIdTokenResult(true), 20000);
+    } catch (tokErr) {
+      if (
+        tokErr?.code === "OPERATION_TIMEOUT" ||
+        tokErr?.message === "Slow connection, please try again"
+      ) {
+        throw new Error("Slow connection, please try again");
+      }
       tokenResult = { claims: {} };
     }
     const userClaims = tokenResult.claims || {};
@@ -476,48 +565,89 @@ export function AuthProvider({ children }) {
 
     let tokenResult;
     try {
-      tokenResult = await withTimeout(user.getIdTokenResult(true), 3500);
-    } catch {
-      tokenResult = { claims: {} };
+      tokenResult = await withTimeout(user.getIdTokenResult(true), 20000);
+    } catch (tokErr) {
+      if (
+        tokErr?.code === "OPERATION_TIMEOUT" ||
+        tokErr?.message === "Slow connection, please try again"
+      ) {
+        throw new Error("Slow connection, please try again");
+      }
+      throw new Error(tokErr?.message || "Failed to verify authentication token. Please try again.");
     }
     const userClaims = tokenResult.claims || {};
     const { isAdmin: verifiedAdmin, isTutor: verifiedTutor, role: resolvedRole } =
       resolveClaimsPrivilege(userClaims);
 
     // Check if Firestore profile exists; create with ONLY permitted registration fields if first-time user
+    const userRef = doc(db, "users", user.uid);
+    let docSnap;
     try {
-      const userRef = doc(db, "users", user.uid);
-      const docSnap = await withTimeout(getDoc(userRef), 3500);
-      if (!docSnap.exists()) {
-        // App convention: "Surname First" (e.g. "Oyewumi Oluwatobi").
-        // We split the Google displayName treating the first word as the surname and remainder as firstName.
-        // If empty or single-token, fallbacks ensure safe storage without breaking.
-        let gSurname = "";
-        let gFirstName = "";
-        const nameParts = (user.displayName || "").trim().split(/\s+/).filter(Boolean);
-        if (nameParts.length >= 2) {
-          gSurname = nameParts[0];
-          gFirstName = nameParts.slice(1).join(" ");
-        } else if (nameParts.length === 1) {
-          gSurname = nameParts[0];
-          gFirstName = nameParts[0];
-        }
-
-        const initialGoogleData = {
-          uid: user.uid,
-          email: user.email,
-          displayName: user.displayName || user.email?.split("@")[0] || "User",
-          fullName: user.displayName || user.email?.split("@")[0] || "User",
-          surname: gSurname || null,
-          firstName: gFirstName || null,
-          studentType: "non_corper",
-          status: "active",
-          createdAt: serverTimestamp(),
-        };
-        await withTimeout(setDoc(userRef, initialGoogleData), 3500);
+      docSnap = await withTimeout(getDoc(userRef), 20000);
+    } catch (readErr) {
+      if (
+        readErr?.code === "OPERATION_TIMEOUT" ||
+        readErr?.message === "Slow connection, please try again"
+      ) {
+        throw new Error("Slow connection, please try again");
       }
-    } catch (fsErr) {
-      console.warn("Google sign-in profile sync notice:", fsErr);
+      throw new Error(readErr?.message || "Failed to load user profile. Please try again.");
+    }
+
+    let profileData = docSnap.exists() ? docSnap.data() : null;
+    if (!docSnap.exists()) {
+      let gSurname = "";
+      let gFirstName = "";
+      const nameParts = (user.displayName || "").trim().split(/\s+/).filter(Boolean);
+      if (nameParts.length >= 2) {
+        gSurname = nameParts[0];
+        gFirstName = nameParts.slice(1).join(" ");
+      } else if (nameParts.length === 1) {
+        gSurname = nameParts[0];
+        gFirstName = nameParts[0];
+      }
+
+      const initialGoogleData = {
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName || user.email?.split("@")[0] || "User",
+        fullName: user.displayName || user.email?.split("@")[0] || "User",
+        surname: gSurname || null,
+        firstName: gFirstName || null,
+        studentType: "non_corper",
+        status: "active",
+        createdAt: serverTimestamp(),
+      };
+
+      try {
+        await withTimeout(setDoc(userRef, initialGoogleData, { merge: true }), 20000);
+      } catch (writeErr) {
+        if (
+          writeErr?.code === "OPERATION_TIMEOUT" ||
+          writeErr?.message === "Slow connection, please try again"
+        ) {
+          throw new Error("Slow connection, please try again");
+        }
+        throw new Error(writeErr?.message || "Failed to save your user profile. Please try again.");
+      }
+      profileData = initialGoogleData;
+    }
+
+    let allocatedRegNumber = profileData?.regNumber || null;
+    if (!allocatedRegNumber) {
+      allocatedRegNumber = await allocateRegistrationCode(user.uid, {
+        email: profileData?.email || user.email || "",
+        fullName: profileData?.fullName || user.displayName || "",
+        displayName: profileData?.displayName || user.displayName || "",
+        surname: profileData?.surname || "",
+        firstName: profileData?.firstName || "",
+        studentType: profileData?.studentType || "non_corper",
+        nyscStateCode: profileData?.nyscStateCode || null,
+        phoneNumber: profileData?.phoneNumber || "",
+      }).catch((allocErr) => {
+        console.error("Registration code allocation failed during Google sign-in; flagging needsRegCode:", allocErr);
+        return null;
+      });
     }
 
     setCurrentUser(user);
@@ -526,9 +656,17 @@ export function AuthProvider({ children }) {
     setIsTutor(verifiedTutor);
     setRole(resolvedRole);
 
-    const profile = await syncProfile(user, resolvedRole);
+    const synced = await syncProfile(user, resolvedRole);
+    const resolvedProfile = {
+      ...(synced || profileData || {}),
+      ...(allocatedRegNumber
+        ? { regNumber: allocatedRegNumber, needsRegCode: false }
+        : { needsRegCode: !synced?.regNumber }),
+      role: resolvedRole,
+    };
+    setUserProfile(resolvedProfile);
 
-    return { user, role: resolvedRole, profile, claims: userClaims, isAdmin: verifiedAdmin, isTutor: verifiedTutor };
+    return { user, role: resolvedRole, profile: resolvedProfile, claims: userClaims, isAdmin: verifiedAdmin, isTutor: verifiedTutor };
   }
 
   function resetPassword(email) {

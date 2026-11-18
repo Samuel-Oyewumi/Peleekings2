@@ -362,7 +362,6 @@ export async function toggleLessonCompletion(uid, courseId, lessonId, fallbackTo
 
     await updateDoc(enrollmentRef, {
       completedItemIds: updatedCompletedIds,
-      progressPercent: newProgressPercent,
       updatedAt: serverTimestamp(),
     });
 
@@ -510,13 +509,17 @@ export async function submitAssignment(uid, courseIdOrAssignment, assignmentIdOr
     fileType: submissionData.file?.type || submissionData.fileType || null,
     projectLink: submissionData.projectLink || null,
     notes: submissionData.notes || null,
-    studentName: submissionData.studentName || null,
+    studentName:
+      typeof submissionData.studentName === "string" && submissionData.studentName.trim()
+        ? submissionData.studentName.trim()
+        : "Learner",
     studentEmail: submissionData.studentEmail || null,
     status: "submitted",
     submittedAt: serverTimestamp(),
   };
 
-  // Client never sets grade, feedback, gradedAt, or gradedBy
+  // Client never sets score, grade, feedback, gradedAt, or gradedBy
+  delete payload.score;
   delete payload.grade;
   delete payload.feedback;
   delete payload.gradedAt;
@@ -587,11 +590,10 @@ export async function getAssignmentSubmission(uid, assignmentId) {
  * - Verifies course existence, active/approved enrollment, and test membership BEFORE writing to Firestore.
  * - Client never sets tutor grade or feedback.
  */
-export async function submitTest(uid, courseIdOrTestId, testIdOrAnswers, maybeAnswers, calculatedScore = null) {
+export async function submitTest(uid, courseIdOrTestId, testIdOrAnswers, maybeAnswers) {
   let courseId = "";
   let testId = "";
   let answers = {};
-  let score = calculatedScore;
 
   if (maybeAnswers !== undefined) {
     courseId = typeof courseIdOrTestId === "string" ? courseIdOrTestId.trim() : "";
@@ -620,32 +622,18 @@ export async function submitTest(uid, courseIdOrTestId, testIdOrAnswers, maybeAn
   // 2. Verify course exists and test belongs to courseId
   await verifyCourseAndAssessment(courseId, testId, "test");
 
-  const numericScore = typeof score === "number" && Number.isFinite(score)
-    ? Math.min(100, Math.max(0, Math.round(score * 10) / 10))
-    : 0;
-
   const submissionDocId = `${uid}_${testId}`;
-  const submissionRef = doc(db, "testSubmissions", submissionDocId);
-
-  const payload = {
-    uid,
-    courseId,
-    testId,
-    answers,
-    score: numericScore,
-    status: "submitted",
-    submittedAt: serverTimestamp(),
-  };
-
-  delete payload.grade;
-  delete payload.feedback;
-  delete payload.gradedAt;
-  delete payload.gradedBy;
 
   try {
-    await setDoc(submissionRef, payload, { merge: true });
+    const submitTestCallable = httpsCallable(functions, "submitTest");
+    const response = await submitTestCallable({
+      courseId,
+      testId,
+      answers,
+    });
+    const resultData = response?.data || {};
 
-    // Mark test as completed in enrollment and recompute progress
+    // Mark test as completed in enrollment
     try {
       const currentDone = new Set(enr.completedItemIds || []);
       if (!currentDone.has(testId)) {
@@ -665,9 +653,19 @@ export async function submitTest(uid, courseIdOrTestId, testIdOrAnswers, maybeAn
     // Award 15 minutes of active learning for test completion
     incrementDailyActivity(uid, 15).catch(() => {});
 
-    return { id: submissionDocId, ...payload };
+    return {
+      id: submissionDocId,
+      uid,
+      courseId,
+      testId,
+      answers,
+      score: typeof resultData.score === "number" ? resultData.score : 0,
+      passed: Boolean(resultData.passed),
+      attempt: Number(resultData.attempt) || 1,
+      status: "graded",
+    };
   } catch (err) {
-    console.error("Error submitting test to Firestore:", err);
+    console.error("Error submitting test via callable:", err);
     throw err;
   }
 }

@@ -11,6 +11,23 @@ import {
   getActiveScrollLockCount,
   getSavedScrollPosition,
 } from "../src/utils/scrollLock";
+import {
+  ANNOUNCEMENT_FAR_FUTURE_EXPIRES_AT_ISO,
+  ANNOUNCEMENT_FAR_FUTURE_MS,
+  getFarFutureExpiresAtTimestamp,
+  parseStrictAnnouncementExpiresAtMs,
+  isFarFutureExpiration,
+  buildGlobalLearnerAnnouncementsQuery,
+  buildCourseLearnerAnnouncementsQuery,
+  buildTutorAnnouncementsQuery,
+  fetchLearnerAnnouncementsFromFirestore,
+  buildAuthoritativeSearchCourses,
+  filterAndSortLearnerAnnouncements,
+} from "../src/utils/courseCatalogue";
+import {
+  classifyAnnouncementExpirationRecord,
+  runAnnouncementExpirationMigration,
+} from "../scripts/migrate-announcement-expirations.js";
 
 const require = createRequire(import.meta.url);
 const Module = require("node:module");
@@ -30,9 +47,12 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
   if (request === "firebase-functions/v2/https") {
     return {
       HttpsError: MockHttpsError,
-      onCall: (handler) => {
+      onCall: (optsOrHandler, maybeHandler) => {
+        const handler = typeof optsOrHandler === "function" ? optsOrHandler : maybeHandler;
+        const options = typeof optsOrHandler === "object" && optsOrHandler !== null ? optsOrHandler : {};
         const fn = async (req) => handler(req);
         fn.run = handler;
+        fn.__options = options;
         return fn;
       },
     };
@@ -57,11 +77,48 @@ const {
   allocateRegistrationCode,
   commitOperationsInBoundedBatches,
   deleteQueryInBoundedBatches,
-  deleteSubcollectionsRecursively,
   isAuthorizedCourseStoragePath,
   adminDeleteTutor,
   adminManageCourse,
+  adminSetAccountStatus,
+  requestCourseEnrollment,
+  adminAssignCourseTutor,
+  parseAndValidateAnnouncementExpiration,
+  migrateAnnouncementExpirations,
+  adminPublishAnnouncement,
+  adminManageAnnouncement,
+  adminSendNotification,
+  adminSendBroadcast,
+  submitTest,
+  migrateTestKeys,
+  requestCoursePublish,
+  onEnrollmentWrite,
+  onTestSubmissionWrite,
+  onAssignmentSubmissionWrite,
 } = functionsModule;
+
+function createMockTimestamp(ms) {
+  const numericMs = Number(ms);
+  const seconds = Math.floor(numericMs / 1000);
+  const nanoseconds = Math.max(0, Math.round((numericMs - seconds * 1000) * 1e6));
+  return {
+    seconds,
+    nanoseconds,
+    toDate: () => new Date(numericMs),
+    toMillis: () => numericMs,
+    valueOf: () => numericMs,
+  };
+}
+
+function toComparableValue(val) {
+  if (val && typeof val.toMillis === "function") {
+    return val.toMillis();
+  }
+  if (val instanceof Date) {
+    return val.getTime();
+  }
+  return val;
+}
 
 /**
  * Stateful in-memory Firestore, Auth, and Storage test harness for exercising the actual
@@ -89,10 +146,12 @@ function createStatefulFirebaseHarness() {
   let failTransactionError = null;
   let failBatchOnCallNumber = null;
   let batchCommitCallCount = 0;
+  let failSetDocPaths = new Set();
   let failListCollectionsForPaths = new Set();
   let disableListCollectionsMethod = false;
   let failStoragePrefixError = null;
   let failAuthDeleteError = null;
+  let txChain = Promise.resolve();
 
   function normalizePath(p) {
     return String(p || "").replace(/^\/+|\/+$/g, "");
@@ -100,8 +159,18 @@ function createStatefulFirebaseHarness() {
 
   function cloneValue(val) {
     if (val === null || val === undefined || typeof val !== "object") return val;
+    if (typeof val.toMillis === "function") {
+      return createMockTimestamp(val.toMillis());
+    }
+    if (val instanceof Date) {
+      return new Date(val.getTime());
+    }
     if (Array.isArray(val)) return val.map(cloneValue);
-    return { ...val };
+    const out = {};
+    for (const [k, v] of Object.entries(val)) {
+      out[k] = cloneValue(v);
+    }
+    return out;
   }
 
   function applyFieldTransforms(existing = {}, incoming = {}, isMerge = true) {
@@ -152,6 +221,9 @@ function createStatefulFirebaseHarness() {
         return createDocSnap(ref);
       },
       async set(data, options = {}) {
+        if (failSetDocPaths.has(path)) {
+          throw new Error(`Simulated write failure on '${path}'`);
+        }
         const merge = Boolean(options && options.merge);
         const current = docs.get(path) || {};
         docs.set(path, applyFieldTransforms(current, data, merge));
@@ -192,19 +264,53 @@ function createStatefulFirebaseHarness() {
     return ref;
   }
 
-  function createQuery(colPath, filters = [], limitCount = null) {
+  function createQuery(
+    colPath,
+    filters = [],
+    limitCount = null,
+    orderSpecs = [],
+    startAfterCursor = null
+  ) {
     const normalizedCol = normalizePath(colPath);
     const prefix = `${normalizedCol}/`;
 
     const queryObj = {
+      __colPath: normalizedCol,
+      __filters: filters,
+      __limitCount: limitCount,
+      __orderSpecs: orderSpecs,
       where(field, op, value) {
-        return createQuery(normalizedCol, [...filters, { field, op, value }], limitCount);
+        return createQuery(
+          normalizedCol,
+          [...filters, { field, op, value }],
+          limitCount,
+          orderSpecs,
+          startAfterCursor
+        );
+      },
+      orderBy(field, direction = "asc") {
+        return createQuery(
+          normalizedCol,
+          filters,
+          limitCount,
+          [...orderSpecs, { field, direction }],
+          startAfterCursor
+        );
+      },
+      startAfter(cursor) {
+        return createQuery(
+          normalizedCol,
+          filters,
+          limitCount,
+          orderSpecs,
+          cursor
+        );
       },
       limit(n) {
-        return createQuery(normalizedCol, filters, n);
+        return createQuery(normalizedCol, filters, n, orderSpecs, startAfterCursor);
       },
       async get() {
-        const matchedDocs = [];
+        let matchedDocs = [];
         for (const [docPath, docData] of docs.entries()) {
           if (!docPath.startsWith(prefix)) continue;
           const remainder = docPath.slice(prefix.length);
@@ -212,10 +318,29 @@ function createStatefulFirebaseHarness() {
           if (remainder.includes("/")) continue;
 
           const passes = filters.every(({ field, op, value }) => {
-            const fieldVal = docData[field];
-            if (op === "==") return fieldVal === value;
+            const rawFieldVal = docData[field];
+            const fieldVal = toComparableValue(rawFieldVal);
+            const targetVal = toComparableValue(value);
+
+            if (op === "==") return fieldVal === targetVal;
+            if (op === "!=") return fieldVal !== targetVal;
+            if (op === "in") {
+              return (
+                Array.isArray(value) &&
+                value.map(toComparableValue).includes(fieldVal)
+              );
+            }
             if (op === "array-contains") {
-              return Array.isArray(fieldVal) && fieldVal.includes(value);
+              return Array.isArray(rawFieldVal) && rawFieldVal.includes(value);
+            }
+            if (op === ">" || op === ">=" || op === "<" || op === "<=") {
+              // Firestore inequality queries on a field only match documents where the field is of the same comparable type
+              if (rawFieldVal === undefined || rawFieldVal === null) return false;
+              if (typeof targetVal === "number" && typeof fieldVal !== "number") return false;
+              if (op === ">") return fieldVal > targetVal;
+              if (op === ">=") return fieldVal >= targetVal;
+              if (op === "<") return fieldVal < targetVal;
+              if (op === "<=") return fieldVal <= targetVal;
             }
             return false;
           });
@@ -223,6 +348,34 @@ function createStatefulFirebaseHarness() {
           if (passes) {
             const dRef = createDocRef(docPath);
             matchedDocs.push(createDocSnap(dRef));
+          }
+        }
+
+        if (Array.isArray(orderSpecs) && orderSpecs.length > 0) {
+          matchedDocs.sort((a, b) => {
+            for (const spec of orderSpecs) {
+              const dir = spec.direction === "desc" ? -1 : 1;
+              const aRaw = spec.field === "__name__" ? a.id : a.data()?.[spec.field];
+              const bRaw = spec.field === "__name__" ? b.id : b.data()?.[spec.field];
+              const aVal = toComparableValue(aRaw);
+              const bVal = toComparableValue(bRaw);
+              if (aVal === bVal) continue;
+              return aVal > bVal ? dir : -dir;
+            }
+            return 0;
+          });
+        }
+
+        if (startAfterCursor !== null && startAfterCursor !== undefined) {
+          const cursorId =
+            typeof startAfterCursor === "string"
+              ? startAfterCursor
+              : startAfterCursor?.id;
+          if (cursorId) {
+            const idx = matchedDocs.findIndex((d) => d.id === cursorId);
+            if (idx >= 0) {
+              matchedDocs = matchedDocs.slice(idx + 1);
+            }
           }
         }
 
@@ -262,6 +415,8 @@ function createStatefulFirebaseHarness() {
         return dRef;
       },
       where: baseQuery.where,
+      orderBy: baseQuery.orderBy,
+      startAfter: baseQuery.startAfter,
       limit: baseQuery.limit,
       get: baseQuery.get,
     };
@@ -306,43 +461,49 @@ function createStatefulFirebaseHarness() {
       };
     },
     async runTransaction(updateFn) {
-      if (failTransactionError) {
-        throw failTransactionError;
-      }
-      let hasWritten = false;
-      const bufferedWrites = [];
-      const tx = {
-        async get(ref) {
-          if (hasWritten) {
-            throw new Error("Firestore transactions require all reads to be executed before all writes.");
-          }
-          return ref.get();
-        },
-        async getAll(...refs) {
-          if (hasWritten) {
-            throw new Error("Firestore transactions require all reads to be executed before all writes.");
-          }
-          return Promise.all(refs.map((r) => r.get()));
-        },
-        set(ref, data, options) {
-          hasWritten = true;
-          bufferedWrites.push(() => ref.set(data, options));
-        },
-        update(ref, data) {
-          hasWritten = true;
-          bufferedWrites.push(() => ref.update(data));
-        },
-        delete(ref) {
-          hasWritten = true;
-          bufferedWrites.push(() => ref.delete());
-        },
+      const executeTx = async () => {
+        if (failTransactionError) {
+          throw failTransactionError;
+        }
+        let hasWritten = false;
+        const bufferedWrites = [];
+        const tx = {
+          async get(ref) {
+            if (hasWritten) {
+              throw new Error("Firestore transactions require all reads to be executed before all writes.");
+            }
+            return ref.get();
+          },
+          async getAll(...refs) {
+            if (hasWritten) {
+              throw new Error("Firestore transactions require all reads to be executed before all writes.");
+            }
+            return Promise.all(refs.map((r) => r.get()));
+          },
+          set(ref, data, options) {
+            hasWritten = true;
+            bufferedWrites.push(() => ref.set(data, options));
+          },
+          update(ref, data) {
+            hasWritten = true;
+            bufferedWrites.push(() => ref.update(data));
+          },
+          delete(ref) {
+            hasWritten = true;
+            bufferedWrites.push(() => ref.delete());
+          },
+        };
+
+        const res = await updateFn(tx);
+        for (const writeOp of bufferedWrites) {
+          await writeOp();
+        }
+        return res;
       };
 
-      const res = await updateFn(tx);
-      for (const writeOp of bufferedWrites) {
-        await writeOp();
-      }
-      return res;
+      const queued = txChain.then(executeTx, executeTx);
+      txChain = queued.catch(() => {});
+      return queued;
     },
   };
 
@@ -355,7 +516,9 @@ function createStatefulFirebaseHarness() {
         arrayRemove: (...items) => new ArrayRemoveOp(items),
       },
       Timestamp: {
-        fromDate: (d) => d.toISOString(),
+        fromDate: (d) => createMockTimestamp(d instanceof Date ? d.getTime() : new Date(d).getTime()),
+        fromMillis: (ms) => createMockTimestamp(ms),
+        now: () => createMockTimestamp(Date.now()),
       },
     }),
     auth() {
@@ -459,6 +622,9 @@ function createStatefulFirebaseHarness() {
     },
     setFailBatchOnCallNumber(num) {
       failBatchOnCallNumber = num;
+    },
+    setFailSetDocPaths(paths) {
+      failSetDocPaths = new Set(paths);
     },
     setFailListCollectionsForPaths(paths) {
       failListCollectionsForPaths = new Set(paths);
@@ -1237,3 +1403,1331 @@ describe("5. Mobile Profile Scroll Lock, Direction Reversal & Position Restorati
     expect(scrollToSpy).toHaveBeenCalledWith(0, 340);
   });
 });
+
+// ============================================================================
+// 6. FINAL PRODUCTION READINESS: COURSE DELETION CHECKPOINTS, RECURSIVE TUTOR
+//    CLEANUP, ACCOUNT STATUS ROLLBACK, AND REGISTRATION NUMBER INTEGRITY
+// ============================================================================
+describe("6. Production Launch Readiness — Phase 2 & 3 Critical Verification", () => {
+  let harness;
+
+  beforeEach(() => {
+    harness = createStatefulFirebaseHarness();
+    __setTestBindings({ db: harness.db, admin: harness.admin });
+  });
+
+  it("never silently skips Storage cleanup when admin.storage or bucket methods are unavailable", async () => {
+    const courseId = "course-unavail-storage";
+    await harness.db.collection("courses").doc(courseId).set({
+      title: "Storage Validation Course",
+      status: "published",
+    });
+
+    // Simulate broken storage bucket without deleteFiles
+    const brokenAdmin = {
+      ...harness.admin,
+      storage: () => ({
+        bucket: () => ({}),
+      }),
+    };
+    __setTestBindings({ db: harness.db, admin: brokenAdmin });
+
+    await expect(
+      adminManageCourse({
+        auth: { uid: "admin_1", token: { admin: true } },
+        data: { action: "delete", courseId },
+      })
+    ).rejects.toThrow(/Storage cleanup failed/i);
+
+    const deletionSnap = await harness.db.collection("courseDeletions").doc(courseId).get();
+    expect(deletionSnap.exists).toBe(true);
+    expect(deletionSnap.data().deletionState).toBe("failed");
+    expect(deletionSnap.data().failedStage).toBe("storage_cleanup");
+    expect(deletionSnap.data().stages.storageCleanup).toBe(false);
+
+    // Course document must remain in Firestore with status: "deleting"
+    const courseSnap = await harness.db.collection("courses").doc(courseId).get();
+    expect(courseSnap.exists).toBe(true);
+    expect(courseSnap.data().status).toBe("deleting");
+  });
+
+  it("verifies completed stage checkpoints on retry and re-executes a stage if new uncleaned data is detected", async () => {
+    const courseId = "course-checkpoint-verify";
+    await harness.db.collection("courses").doc(courseId).set({
+      title: "Checkpoint Verification Course",
+      status: "deleting",
+      deletionState: "failed",
+    });
+    // Pre-populate a prior courseDeletions doc claiming enrollmentArchival was already true
+    await harness.db.collection("courseDeletions").doc(courseId).set({
+      courseId,
+      deletionState: "failed",
+      failedStage: "storage_cleanup",
+      stages: {
+        enrollmentArchival: true,
+        tutorAssignmentCleanup: true,
+        storageCleanup: false,
+        subcollectionDeletion: false,
+        courseDocumentDeletion: false,
+      },
+    });
+    // However, an unarchived active enrollment exists in Firestore
+    await harness.db.collection("enrollments").doc(`student_99_${courseId}`).set({
+      uid: "student_99",
+      courseId,
+      status: "active",
+      courseDeleted: false,
+    });
+
+    const res = await adminManageCourse({
+      auth: { uid: "admin_1", token: { admin: true } },
+      data: { action: "delete", courseId },
+    });
+
+    expect(res.success).toBe(true);
+    expect(res.stages).toEqual({
+      enrollmentArchival: true,
+      tutorAssignmentCleanup: true,
+      storageCleanup: true,
+      subcollectionDeletion: true,
+      courseDocumentDeletion: true,
+    });
+
+    // Verify the unarchived enrollment was detected and archived instead of skipped
+    const enrSnap = await harness.db.collection("enrollments").doc(`student_99_${courseId}`).get();
+    expect(enrSnap.data().courseDeleted).toBe(true);
+    expect(enrSnap.data().status).toBe("archived");
+  });
+
+  it("blocks course updates, status toggles, tutor assignments, and enrollments while course status is 'deleting'", async () => {
+    const courseId = "course-deleting-locked";
+    await harness.db.collection("courses").doc(courseId).set({
+      title: "Locked Deleting Course",
+      status: "deleting",
+      deletionState: "deleting",
+    });
+    await harness.db.collection("users").doc("student_1").set({
+      uid: "student_1",
+      status: "active",
+    });
+    await harness.db.collection("users").doc("tutor_1").set({
+      uid: "tutor_1",
+      role: "tutor",
+      status: "active",
+    });
+    harness.authUsers.set("tutor_1", {
+      uid: "tutor_1",
+      customClaims: { tutor: true },
+    });
+
+    // 1. Block course update
+    await expect(
+      adminManageCourse({
+        auth: { uid: "admin_1", token: { admin: true } },
+        data: { action: "update", courseId, courseData: { title: "Mutated Title" } },
+      })
+    ).rejects.toThrow(/deletion is in progress/i);
+
+    // 2. Block course toggleStatus
+    await expect(
+      adminManageCourse({
+        auth: { uid: "admin_1", token: { admin: true } },
+        data: { action: "toggleStatus", courseId, courseData: { status: "published" } },
+      })
+    ).rejects.toThrow(/deletion is in progress/i);
+
+    // 3. Block tutor assignment
+    await expect(
+      adminAssignCourseTutor({
+        auth: { uid: "admin_1", token: { admin: true } },
+        data: { courseId, tutorUid: "tutor_1", mode: "assign" },
+      })
+    ).rejects.toThrow(/deletion is in progress/i);
+
+    // 4. Block student and admin enrollment requests
+    await expect(
+      requestCourseEnrollment({
+        auth: { uid: "admin_1", token: { admin: true } },
+        data: { courseId, experienceType: "online" },
+      })
+    ).rejects.toThrow(/currently being deleted/i);
+  });
+
+  it("recursively discovers and deletes arbitrary and nested private user subcollections during permanent tutor deletion", async () => {
+    const tutorUid = "tutor_deep_subs";
+    harness.authUsers.set(tutorUid, {
+      uid: tutorUid,
+      email: "deepsubs@peleekings.com",
+      displayName: "Deep Subcollection Tutor",
+      disabled: false,
+      customClaims: { tutor: true },
+    });
+
+    await harness.db.collection("users").doc(tutorUid).set({
+      uid: tutorUid,
+      email: "deepsubs@peleekings.com",
+      fullName: "Deep Subcollection Tutor",
+      role: "tutor",
+      regNumber: "PK-2026-8888",
+      status: "active",
+    });
+    // Arbitrary nested subcollections under users/{tutorUid}
+    await harness.db
+      .collection("users")
+      .doc(tutorUid)
+      .collection("privateNotes")
+      .doc("note-1")
+      .set({ text: "Private draft" });
+    await harness.db
+      .collection("users")
+      .doc(tutorUid)
+      .collection("privateNotes")
+      .doc("note-1")
+      .collection("revisions")
+      .doc("rev-1")
+      .set({ diff: "v1" });
+    await harness.db
+      .collection("users")
+      .doc(tutorUid)
+      .collection("workspacePreferences")
+      .doc("pref-1")
+      .set({ theme: "light" });
+
+    // Course assigned via instructorId
+    await harness.db.collection("courses").doc("course-inst-1").set({
+      title: "Instructor Assigned Course",
+      instructorId: tutorUid,
+      tutorId: tutorUid,
+      assignedTutors: [tutorUid],
+      status: "published",
+    });
+
+    const result = await adminDeleteTutor({
+      auth: { uid: "admin_1", token: { admin: true } },
+      data: { targetUid: tutorUid, mode: "delete" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.deletionState).toBe("completed");
+    expect(harness.authUsers.has(tutorUid)).toBe(false);
+
+    // Verify all nested private user subcollections were deleted
+    expect(
+      (await harness.db.collection("users").doc(tutorUid).collection("privateNotes").doc("note-1").get()).exists
+    ).toBe(false);
+    expect(
+      (
+        await harness.db
+          .collection("users")
+          .doc(tutorUid)
+          .collection("privateNotes")
+          .doc("note-1")
+          .collection("revisions")
+          .doc("rev-1")
+          .get()
+      ).exists
+    ).toBe(false);
+    expect(
+      (await harness.db.collection("users").doc(tutorUid).collection("workspacePreferences").doc("pref-1").get()).exists
+    ).toBe(false);
+
+    // Verify instructorId, tutorId, and assignedTutors were cleared on course
+    const courseSnap = await harness.db.collection("courses").doc("course-inst-1").get();
+    expect(courseSnap.data().instructorId).toBeNull();
+    expect(courseSnap.data().tutorId).toBeNull();
+    expect(courseSnap.data().assignedTutors).toEqual([]);
+
+    // Verify archive record exists in deletedUsers
+    const archiveSnap = await harness.db.collection("deletedUsers").doc(tutorUid).get();
+    expect(archiveSnap.exists).toBe(true);
+    expect(archiveSnap.data().regNumber).toBe("PK-2026-8888");
+  });
+
+  it("rolls back Firebase Auth changes if Firestore commit fails in adminSetAccountStatus and prevents restoring tutor privileges to deactivated tutors", async () => {
+    const uid = "user_status_consistency";
+    harness.authUsers.set(uid, {
+      uid,
+      email: "user@peleekings.com",
+      disabled: false,
+      customClaims: { tutor: true, cohort: "2026B" },
+    });
+    await harness.db.collection("users").doc(uid).set({
+      uid,
+      email: "user@peleekings.com",
+      role: "tutor",
+      status: "active",
+      disabled: false,
+    });
+
+    // 1. Simulate Firestore batch failure during suspension (batch #1)
+    harness.setFailBatchOnCallNumber(1);
+    await expect(
+      adminSetAccountStatus({
+        auth: { uid: "admin_1", token: { admin: true } },
+        data: { targetUid: uid, status: "suspended" },
+      })
+    ).rejects.toThrow(/rolled back/i);
+
+    // Verify Auth state was automatically rolled back to its original enabled state + claims
+    const authAfterRollback = harness.authUsers.get(uid);
+    expect(authAfterRollback.disabled).toBe(false);
+    expect(authAfterRollback.customClaims).toEqual({ tutor: true, cohort: "2026B" });
+
+    const opAfterRollback = await harness.db.collection("accountStatusOperations").doc(uid).get();
+    expect(opAfterRollback.data().state).toBe("rolled_back");
+
+    // 2. Now succeed on suspension and verify unrelated custom claims are preserved
+    harness.setFailBatchOnCallNumber(null);
+    const suspendRes = await adminSetAccountStatus({
+      auth: { uid: "admin_1", token: { admin: true } },
+      data: { targetUid: uid, status: "suspended" },
+    });
+    expect(suspendRes.success).toBe(true);
+    expect(harness.authUsers.get(uid).disabled).toBe(true);
+    expect(harness.authUsers.get(uid).customClaims).toEqual({
+      admin: false,
+      cohort: "2026B",
+      role: "student",
+      suspended: true,
+      tutor: false,
+    });
+
+    // 3. Mark the user as a deactivated tutor and verify reactivation does NOT restore tutor claim or role
+    await harness.db.collection("users").doc(uid).set(
+      {
+        tutorStatus: "deactivated",
+        tutorDeactivationState: "completed",
+        previousRole: "tutor",
+      },
+      { merge: true }
+    );
+
+    const reactivateRes = await adminSetAccountStatus({
+      auth: { uid: "admin_1", token: { admin: true } },
+      data: { targetUid: uid, status: "active" },
+    });
+    expect(reactivateRes.success).toBe(true);
+    expect(reactivateRes.role).toBe("student");
+    expect(harness.authUsers.get(uid).disabled).toBe(false);
+    expect(harness.authUsers.get(uid).customClaims.tutor).toBe(false);
+    expect(harness.authUsers.get(uid).customClaims.cohort).toBe("2026B");
+
+    const userAfterReactivate = await harness.db.collection("users").doc(uid).get();
+    expect(userAfterReactivate.data().role).toBe("student");
+    expect(userAfterReactivate.data().status).toBe("active");
+  });
+
+  it("recovers existing authoritative regNumbers reservations and rejects unverified caller-supplied regNumber claims", async () => {
+    // 1. User already has an authoritative reservation in regNumbers, but users/{uid}.regNumber is missing
+    const uidExisting = "user_recover_reg";
+    await harness.db.collection("regNumbers").doc("BA9900A").set({
+      uid: uidExisting,
+      regNumber: "BA9900A",
+      studentType: "corper",
+    });
+    await harness.db.collection("users").doc(uidExisting).set({
+      uid: uidExisting,
+      fullName: "Adaobi Bamidele",
+      studentType: "corper",
+      nyscStateCode: "FC/26A/9900",
+    });
+
+    const recoveredResult = await ensureUserRegNumber(uidExisting, {
+      fullName: "Adaobi Bamidele",
+      studentType: "corper",
+      nyscStateCode: "FC/26A/9900",
+    });
+    expect(recoveredResult.regNumber).toBe("BA9900A");
+    expect(recoveredResult.alreadyAssigned).toBe(true);
+    expect(recoveredResult.repairedMapping).toBe(true);
+    const repairedUserSnap = await harness.db.collection("users").doc(uidExisting).get();
+    expect(repairedUserSnap.data().regNumber).toBe("BA9900A");
+
+    // 2. Unverified caller-supplied data.regNumber belonging to someone else or unreserved is rejected
+    const uidSpoof = "user_spoof_reg";
+    await harness.db.collection("users").doc(uidSpoof).set({
+      uid: uidSpoof,
+      fullName: "Chinedu Okeke",
+      studentType: "corper",
+      nyscStateCode: "LA/26B/4321",
+    });
+
+    const allocatedResult = await ensureUserRegNumber(uidSpoof, {
+      fullName: "Chinedu Okeke",
+      studentType: "corper",
+      nyscStateCode: "LA/26B/4321",
+      regNumber: "BA9900A", // Attempting to claim uidExisting's code
+    });
+    expect(allocatedResult.regNumber).not.toBe("BA9900A");
+    expect(allocatedResult.regNumber).toMatch(/^(OC|CO)4321$/);
+
+    // Verify ownership in regNumbers
+    const spoofRegSnap = await harness.db.collection("regNumbers").doc(allocatedResult.regNumber).get();
+    expect(spoofRegSnap.exists).toBe(true);
+    expect(spoofRegSnap.data().uid).toBe(uidSpoof);
+  });
+});
+
+// ============================================================================
+// 7. SECURITY RULES & PRODUCTION CONFIGURATION INVARIANTS
+// ============================================================================
+describe("7. Security Rules & Production Configuration Invariants", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+
+  it("enforces strict server-only write lockdown and custom-claim RBAC in firestore.rules and storage.rules", () => {
+    const firestoreRules = fs.readFileSync(path.resolve(process.cwd(), "firestore.rules"), "utf8");
+    const storageRules = fs.readFileSync(path.resolve(process.cwd(), "storage.rules"), "utf8");
+
+    // Custom claim verification
+    expect(firestoreRules).toContain("request.auth.token.admin == true");
+    expect(firestoreRules).toContain("request.auth.token.tutor == true");
+
+    // Server-controlled collections deny client writes
+    for (const colName of [
+      "regNumbers",
+      "auditLogs",
+      "courseDeletions",
+      "tutorDeletionOperations",
+      "deletedUsers",
+      "accountStatusOperations",
+      "broadcasts",
+    ]) {
+      expect(firestoreRules).toContain(`match /${colName}/`);
+    }
+
+    // Announcements rules support both get and list queries without failing on null expiresAt
+    expect(firestoreRules).toContain("match /announcements/{announcementId}");
+    expect(firestoreRules).toContain("allow get: if isAdmin() || (");
+    expect(firestoreRules).toContain("allow list: if isAdmin() || (");
+
+    // Deleting courses are blocked from non-admin access/mutation
+    expect(firestoreRules).toContain("status != 'deleting'");
+
+    // Storage rules enforce size limits, content-type validation, and separate delete rules
+    expect(storageRules).toContain("request.resource != null");
+    expect(storageRules).toContain("isValidSize(5)");
+    expect(storageRules).toContain("isValidSize(50)");
+  });
+
+  it("validates firebase.json, firestore.indexes.json, and .env.example production readiness", () => {
+    const firebaseJson = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), "firebase.json"), "utf8")
+    );
+    const indexesJson = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), "firestore.indexes.json"), "utf8")
+    );
+    const envExample = fs.readFileSync(path.resolve(process.cwd(), ".env.example"), "utf8");
+
+    expect(firebaseJson.firestore.rules).toBe("firestore.rules");
+    expect(firebaseJson.firestore.indexes).toBe("firestore.indexes.json");
+    expect(firebaseJson.storage.rules).toBe("storage.rules");
+    expect(firebaseJson.hosting.public).toBe("dist");
+    expect(firebaseJson.hosting.rewrites).toEqual([
+      { source: "**", destination: "/index.html" },
+    ]);
+
+    expect(Array.isArray(indexesJson.indexes)).toBe(true);
+    expect(indexesJson.indexes.length).toBeGreaterThanOrEqual(4);
+
+    expect(envExample).toContain("VITE_FIREBASE_API_KEY=");
+    expect(envExample).toContain("VITE_FIREBASE_PROJECT_ID=");
+    expect(envExample).toContain("VITE_FIREBASE_APPCHECK_SITE_KEY=");
+    expect(typeof allocateRegistrationCode.__options?.enforceAppCheck).toBe("boolean");
+    expect(typeof requestCourseEnrollment.__options?.enforceAppCheck).toBe("boolean");
+  });
+});
+
+// ============================================================================
+// 8. ANNOUNCEMENTS LIFECYCLE & BROADCAST DELIVERY REMEDIATION
+// ============================================================================
+describe("8. Announcements Lifecycle & Broadcast Delivery Remediation", () => {
+  let harness;
+
+  beforeEach(() => {
+    harness = createStatefulFirebaseHarness();
+    __setTestBindings({
+      db: harness.db,
+      admin: harness.admin,
+    });
+  });
+
+  it("supports creating, editing, unpublishing (draft), republishing, and deleting announcements via adminPublishAnnouncement / adminManageAnnouncement", async () => {
+    const adminAuth = { uid: "admin_ann", token: { admin: true, email: "admin@peleekings.com" } };
+
+    // 1. Create published announcement
+    const createRes = await adminPublishAnnouncement({
+      auth: adminAuth,
+      data: {
+        action: "create",
+        title: "Welcome to Cohort 2026B",
+        body: "Orientation starts Monday at 10:00 AM WAT.",
+        category: "Academic",
+        priority: "urgent",
+        audience: "all_learners",
+        pinned: true,
+        status: "published",
+      },
+    });
+
+    expect(createRes.success).toBe(true);
+    expect(createRes.action).toBe("create");
+    expect(createRes.status).toBe("published");
+    const annId = createRes.announcementId;
+    expect(annId).toBeTruthy();
+
+    const snapAfterCreate = await harness.db.collection("announcements").doc(annId).get();
+    expect(snapAfterCreate.exists).toBe(true);
+    expect(snapAfterCreate.data().title).toBe("Welcome to Cohort 2026B");
+    expect(snapAfterCreate.data().audience).toBe("learners");
+    expect(snapAfterCreate.data().pinned).toBe(true);
+
+    // 2. Edit announcement and toggle to draft via adminManageAnnouncement alias
+    const unpublishRes = await adminManageAnnouncement({
+      auth: adminAuth,
+      data: {
+        action: "unpublish",
+        announcementId: annId,
+      },
+    });
+    expect(unpublishRes.success).toBe(true);
+    expect(unpublishRes.status).toBe("draft");
+    expect((await harness.db.collection("announcements").doc(annId).get()).data().status).toBe("draft");
+
+    // 3. Update title & body and republish
+    const updateRes = await adminPublishAnnouncement({
+      auth: adminAuth,
+      data: {
+        action: "update",
+        announcementId: annId,
+        title: "Welcome to Cohort 2026B (Updated)",
+        body: "Orientation starts Monday at 11:00 AM WAT.",
+        status: "published",
+      },
+    });
+    expect(updateRes.success).toBe(true);
+    expect(updateRes.status).toBe("published");
+    const snapAfterUpdate = await harness.db.collection("announcements").doc(annId).get();
+    expect(snapAfterUpdate.data().title).toBe("Welcome to Cohort 2026B (Updated)");
+
+    // 4. Delete announcement
+    const deleteRes = await adminPublishAnnouncement({
+      auth: adminAuth,
+      data: {
+        action: "delete",
+        announcementId: annId,
+      },
+    });
+    expect(deleteRes.success).toBe(true);
+    expect((await harness.db.collection("announcements").doc(annId).get()).exists).toBe(false);
+  });
+
+  it("delivers broadcasts to targeted recipients, persists broadcasts/{id} history, and prevents duplicate sends within 60s", async () => {
+    const adminAuth = { uid: "admin_bc", token: { admin: true, email: "admin@peleekings.com" } };
+
+    // Seed active learners, a suspended learner, and an active tutor
+    await harness.db.collection("users").doc("learner_1").set({
+      uid: "learner_1",
+      role: "student",
+      status: "active",
+      disabled: false,
+    });
+    await harness.db.collection("users").doc("learner_2").set({
+      uid: "learner_2",
+      role: "student",
+      status: "active",
+      disabled: false,
+    });
+    await harness.db.collection("users").doc("learner_suspended").set({
+      uid: "learner_suspended",
+      role: "student",
+      status: "suspended",
+      disabled: true,
+    });
+    await harness.db.collection("users").doc("tutor_1").set({
+      uid: "tutor_1",
+      role: "tutor",
+      status: "active",
+      disabled: false,
+    });
+
+    // 1. Broadcast to all_learners
+    const bcRes = await adminSendBroadcast({
+      auth: adminAuth,
+      data: {
+        targetType: "all_learners",
+        title: "Assessment Portal Open",
+        message: "Your Week 4 assessments are now open for submission.",
+        type: "academic",
+        link: "/dashboard",
+      },
+    });
+
+    expect(bcRes.success).toBe(true);
+    expect(bcRes.recipientCount).toBe(2); // Excludes suspended learner & tutor
+    expect(bcRes.sentCount).toBe(2);
+    expect(bcRes.failedCount).toBe(0);
+    expect(bcRes.deliveryStatus).toBe("completed");
+    expect(bcRes.broadcastId).toBeTruthy();
+
+    // Verify broadcast history record in broadcasts/{broadcastId}
+    const bcSnap = await harness.db.collection("broadcasts").doc(bcRes.broadcastId).get();
+    expect(bcSnap.exists).toBe(true);
+    expect(bcSnap.data().sentCount).toBe(2);
+    expect(bcSnap.data().targetType).toBe("all_learners");
+    expect(bcSnap.data().deliveryStatus).toBe("completed");
+
+    // Verify per-user notifications were created for active learners only
+    const l1Notifs = await harness.db.collection("users").doc("learner_1").collection("notifications").get();
+    const l2Notifs = await harness.db.collection("users").doc("learner_2").collection("notifications").get();
+    const suspNotifs = await harness.db.collection("users").doc("learner_suspended").collection("notifications").get();
+    expect(l1Notifs.size).toBe(1);
+    expect(l2Notifs.size).toBe(1);
+    expect(suspNotifs.size).toBe(0);
+
+    // 2. Duplicate broadcast submission with same payload within 60s window is blocked
+    await expect(
+      adminSendNotification({
+        auth: adminAuth,
+        data: {
+          targetType: "all_learners",
+          title: "Assessment Portal Open",
+          message: "Your Week 4 assessments are now open for submission.",
+          type: "academic",
+        },
+      })
+    ).rejects.toThrow(/duplicate broadcast/i);
+  });
+
+  it("gracefully falls back to individual delivery if a batch commit fails during adminSendNotification", async () => {
+    const adminAuth = { uid: "admin_bc_fallback", token: { admin: true, email: "admin@peleekings.com" } };
+
+    await harness.db.collection("users").doc("tutor_a").set({
+      uid: "tutor_a",
+      role: "tutor",
+      status: "active",
+      disabled: false,
+    });
+    await harness.db.collection("users").doc("tutor_b").set({
+      uid: "tutor_b",
+      role: "tutor",
+      status: "active",
+      disabled: false,
+    });
+
+    // Simulate batch commit failure on batch #1 so the function falls back to individual doc sets
+    harness.setFailBatchOnCallNumber(1);
+
+    const res = await adminSendNotification({
+      auth: adminAuth,
+      data: {
+        targetType: "all_tutors",
+        title: "Grading Deadline Reminder",
+        message: "Please finalize all module grading by Friday 5 PM.",
+        type: "system",
+      },
+    });
+
+    expect(res.success).toBe(true);
+    expect(res.sentCount).toBe(2);
+    expect(res.failedCount).toBe(0);
+    expect(res.deliveryStatus).toBe("completed");
+  });
+
+  it("exports separate onEnrollmentWrite, onTestSubmissionWrite, and onAssignmentSubmissionWrite triggers and skips enrollment recompute when only updatedAt or lastAccessedLesson changed", async () => {
+    expect(typeof onEnrollmentWrite).toBe("function");
+    expect(typeof onTestSubmissionWrite).toBe("function");
+    expect(typeof onAssignmentSubmissionWrite).toBe("function");
+    expect(functionsModule.onEnrollmentOrSubmissionWrite).toBeUndefined();
+
+    const courseId = "course_trig_1";
+    await harness.db.collection("courses").doc(courseId).set({
+      id: courseId,
+      title: "Trigger Test Course",
+      status: "published",
+    });
+    await harness.db.collection("enrollments").doc("u1_course_trig_1").set({
+      uid: "u1",
+      courseId,
+      status: "active",
+      progressPercent: 20,
+      completedItemIds: ["l1"],
+      lastAccessedLesson: "l1",
+      updatedAt: "t1",
+    });
+
+    // 1. Update where ONLY updatedAt and lastAccessedLesson changed -> should skip recompute
+    harness.operationTimeline.length = 0;
+    await onEnrollmentWrite({
+      data: {
+        before: {
+          exists: true,
+          data: () => ({
+            uid: "u1",
+            courseId,
+            status: "active",
+            progressPercent: 20,
+            completedItemIds: ["l1"],
+            lastAccessedLesson: "l1",
+            updatedAt: "t1",
+          }),
+        },
+        after: {
+          exists: true,
+          data: () => ({
+            uid: "u1",
+            courseId,
+            status: "active",
+            progressPercent: 20,
+            completedItemIds: ["l1"],
+            lastAccessedLesson: "l2",
+            updatedAt: "t2",
+          }),
+        },
+      },
+    });
+    expect(
+      harness.operationTimeline.some((entry) => entry.includes(`courses/${courseId}/analytics/summary`))
+    ).toBe(false);
+
+    // 2. Update where completedItemIds changed -> should recompute progressPercent and analytics
+    await harness.db.collection("courses").doc(courseId).collection("lessons").doc("l1").set({ title: "L1" });
+    await harness.db.collection("courses").doc(courseId).collection("lessons").doc("l2").set({ title: "L2" });
+    await harness.db.collection("courses").doc(courseId).collection("lessons").doc("l3").set({ title: "L3" });
+    await harness.db.collection("courses").doc(courseId).collection("lessons").doc("l4").set({ title: "L4" });
+
+    await onEnrollmentWrite({
+      params: { docId: "u1_course_trig_1" },
+      data: {
+        before: {
+          exists: true,
+          data: () => ({
+            uid: "u1",
+            courseId,
+            status: "active",
+            progressPercent: 25,
+            completedItemIds: ["l1"],
+            lastAccessedLesson: "l1",
+            updatedAt: "t1",
+          }),
+        },
+        after: {
+          exists: true,
+          data: () => ({
+            uid: "u1",
+            courseId,
+            status: "active",
+            progressPercent: 25,
+            completedItemIds: ["l1", "l2"],
+            lastAccessedLesson: "l2",
+            updatedAt: "t2",
+          }),
+        },
+      },
+    });
+    expect(
+      harness.operationTimeline.some((entry) => entry.includes(`courses/${courseId}/analytics/summary`))
+    ).toBe(true);
+    expect(harness.docs.get("enrollments/u1_course_trig_1")?.progressPercent).toBe(50);
+
+    // 3. Subsequent trigger firing from the progressPercent write itself is skipped (no loop)
+    harness.operationTimeline.length = 0;
+    await onEnrollmentWrite({
+      params: { docId: "u1_course_trig_1" },
+      data: {
+        before: {
+          exists: true,
+          data: () => ({
+            uid: "u1",
+            courseId,
+            status: "active",
+            progressPercent: 25,
+            completedItemIds: ["l1", "l2"],
+            lastAccessedLesson: "l2",
+            updatedAt: "t2",
+          }),
+        },
+        after: {
+          exists: true,
+          data: () => ({
+            uid: "u1",
+            courseId,
+            status: "active",
+            progressPercent: 50,
+            completedItemIds: ["l1", "l2"],
+            lastAccessedLesson: "l2",
+            updatedAt: "t2",
+          }),
+        },
+      },
+    });
+    expect(harness.operationTimeline.length).toBe(0);
+  });
+
+  it("strips correctIndex/explanation into testKeys on seedCatalog and migrateTestKeys, and scores submitTest server-side without returning the answer key", async () => {
+    const adminAuth = { uid: "admin_1", token: { admin: true } };
+    // 1. Seed a course with a test via seedCatalog
+    const seedRes = await adminManageCourse({
+      auth: adminAuth,
+      data: {
+        action: "seedCatalog",
+        courses: [
+          {
+            id: "course-sec-test",
+            title: "Security Testing 101",
+            curriculum: {
+              modules: [
+                {
+                  id: "m1",
+                  title: "Module 1",
+                  order: 1,
+                  lessons: [
+                    {
+                      id: "quiz-1",
+                      title: "Quiz 1",
+                      type: "test",
+                      passingScore: 60,
+                      questions: [
+                        {
+                          question: "Q1?",
+                          options: ["A", "B", "C", "D"],
+                          correctIndex: 2,
+                          explanation: "Secret explanation 1",
+                        },
+                        {
+                          question: "Q2?",
+                          options: ["W", "X", "Y", "Z"],
+                          correctIndex: 1,
+                          explanation: "Secret explanation 2",
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    expect(seedRes.success).toBe(true);
+
+    // Verify courses/course-sec-test/tests/quiz-1 has NO correctIndex or explanation
+    const storedTest = harness.docs.get("courses/course-sec-test/tests/quiz-1");
+    expect(storedTest.questions).toHaveLength(2);
+    expect(storedTest.questions[0].correctIndex).toBeUndefined();
+    expect(storedTest.questions[0].explanation).toBeUndefined();
+
+    // Verify courses/course-sec-test/testKeys/quiz-1 holds the answer key
+    const storedKey = harness.docs.get("courses/course-sec-test/testKeys/quiz-1");
+    expect(storedKey.answers).toEqual([2, 1]);
+    expect(storedKey.passingScore).toBe(60);
+
+    // 2. Test migrateTestKeys on an existing legacy test doc that still has correctIndex
+    await harness.db.collection("courses").doc("course-sec-test").collection("tests").doc("legacy-quiz").set({
+      title: "Legacy Quiz",
+      type: "test",
+      questions: [
+        { question: "Legacy Q?", options: ["0", "1"], correctIndex: 1, explanation: "Legacy exp" },
+      ],
+    });
+    const migRes = await migrateTestKeys({
+      auth: adminAuth,
+      data: { courseId: "course-sec-test" },
+    });
+    expect(migRes.success).toBe(true);
+    expect(harness.docs.get("courses/course-sec-test/tests/legacy-quiz").questions[0].correctIndex).toBeUndefined();
+    expect(harness.docs.get("courses/course-sec-test/testKeys/legacy-quiz").answers).toEqual([1]);
+
+    // 3. Verify submitTest rejects unenrolled students and scores enrolled students server-side
+    await harness.db.collection("users").doc("student_quiz").set({
+      uid: "student_quiz",
+      fullName: "Ada Lovelace",
+      regNumber: "AL1234",
+      status: "active",
+    });
+
+    await expect(
+      submitTest({
+        auth: { uid: "student_quiz", token: {} },
+        data: { courseId: "course-sec-test", testId: "quiz-1", answers: { 0: 2, 1: 1 } },
+      })
+    ).rejects.toThrow(/enrollment/i);
+
+    await harness.db.collection("enrollments").doc("student_quiz_course-sec-test").set({
+      uid: "student_quiz",
+      courseId: "course-sec-test",
+      status: "active",
+    });
+
+    const attempt1 = await submitTest({
+      auth: { uid: "student_quiz", token: {} },
+      data: { courseId: "course-sec-test", testId: "quiz-1", answers: { 0: 2, 1: 0 } },
+    });
+    expect(attempt1).toEqual({ score: 50, passed: false, attempt: 1 });
+    expect(attempt1.answers).toBeUndefined();
+
+    const attempt2 = await submitTest({
+      auth: { uid: "student_quiz", token: {} },
+      data: { courseId: "course-sec-test", testId: "quiz-1", answers: { 0: 2, 1: 1 } },
+    });
+    expect(attempt2).toEqual({ score: 100, passed: true, attempt: 2 });
+
+    const savedSubmission = harness.docs.get("testSubmissions/student_quiz_quiz-1");
+    expect(savedSubmission).toMatchObject({
+      uid: "student_quiz",
+      courseId: "course-sec-test",
+      testId: "quiz-1",
+      score: 100,
+      passed: true,
+      attempt: 2,
+      studentName: "Ada Lovelace",
+      regNumber: "AL1234",
+      status: "graded",
+    });
+  });
+
+  it("allows assigned tutors to submit a draft course for review via requestCoursePublish and denies unassigned tutors", async () => {
+    await harness.db.collection("courses").doc("tutor-draft-1").set({
+      id: "tutor-draft-1",
+      title: "Cloud Architecture 101",
+      tutorId: "tutor_owner",
+      assignedTutors: ["tutor_owner"],
+      status: "draft",
+    });
+
+    // Unassigned tutor cannot request publish
+    await expect(
+      requestCoursePublish({
+        auth: { uid: "tutor_other", token: { tutor: true } },
+        data: { courseId: "tutor-draft-1" },
+      })
+    ).rejects.toThrow(/not an assigned tutor/i);
+
+    // Assigned tutor sets status to pending_review and writes audit log
+    const res = await requestCoursePublish({
+      auth: { uid: "tutor_owner", token: { tutor: true } },
+      data: { courseId: "tutor-draft-1" },
+    });
+    expect(res).toEqual({
+      success: true,
+      courseId: "tutor-draft-1",
+      status: "pending_review",
+    });
+    expect(harness.docs.get("courses/tutor-draft-1")?.status).toBe("pending_review");
+    expect(harness.docs.get("courses/tutor-draft-1")?.publishRequestedBy).toBe("tutor_owner");
+  });
+
+  it("enforces course-specific announcement validation on publish and filters/sorts learner announcements accurately", async () => {
+    const adminAuth = { uid: "admin_ann_course", token: { admin: true } };
+
+    // Publishing a course announcement for a non-existent or deleting course is rejected
+    await expect(
+      adminPublishAnnouncement({
+        auth: adminAuth,
+        data: {
+          title: "Missing Course Notice",
+          body: "Should fail",
+          audience: "course",
+          courseId: "non_existent_course",
+        },
+      })
+    ).rejects.toThrow(/not found|deleting/i);
+
+    await harness.db.collection("courses").doc("course_deleting").set({
+      id: "course_deleting",
+      title: "Deleting Course",
+      status: "deleting",
+    });
+
+    await expect(
+      adminPublishAnnouncement({
+        auth: adminAuth,
+        data: {
+          title: "Deleting Course Notice",
+          body: "Should fail",
+          audience: "course",
+          courseId: "course_deleting",
+        },
+      })
+    ).rejects.toThrow(/not found|deleting/i);
+
+    // Publishing for a valid course succeeds
+    await harness.db.collection("courses").doc("course_valid").set({
+      id: "course_valid",
+      title: "Valid Published Course",
+      status: "published",
+    });
+
+    const pubRes = await adminPublishAnnouncement({
+      auth: adminAuth,
+      data: {
+        title: "Course Valid Workshop",
+        body: "Starts tomorrow",
+        audience: "course",
+        courseId: "course_valid",
+        pinned: true,
+      },
+    });
+    expect(pubRes.success).toBe(true);
+
+    // Verify learner announcement filtering & sorting helper
+    const nowMs = Date.now();
+    const rawAnnouncements = [
+      {
+        id: "a_general_older",
+        title: "General Older",
+        status: "published",
+        audience: "all",
+        pinned: false,
+        createdAt: new Date(nowMs - 60000).toISOString(),
+      },
+      {
+        id: "a_course_authorized_pinned",
+        title: "Enrolled Course Pinned",
+        status: "published",
+        audience: "course",
+        courseId: "course_valid",
+        pinned: true,
+        createdAt: new Date(nowMs - 120000).toISOString(),
+      },
+      {
+        id: "a_course_unenrolled",
+        title: "Unenrolled Course",
+        status: "published",
+        audience: "course",
+        courseId: "course_other",
+        pinned: true,
+        createdAt: new Date(nowMs).toISOString(),
+      },
+      {
+        id: "a_course_invalid_id",
+        title: "Invalid Course ID",
+        status: "published",
+        audience: "course",
+        courseId: "general",
+        createdAt: new Date(nowMs).toISOString(),
+      },
+      {
+        id: "a_expired",
+        title: "Expired Notice",
+        status: "published",
+        audience: "learners",
+        expiresAt: new Date(nowMs - 1000).toISOString(),
+        createdAt: new Date(nowMs).toISOString(),
+      },
+      {
+        id: "a_draft",
+        title: "Draft Notice",
+        status: "draft",
+        audience: "learners",
+        createdAt: new Date(nowMs).toISOString(),
+      },
+    ];
+
+    const filteredForEnrolled = filterAndSortLearnerAnnouncements(
+      rawAnnouncements,
+      new Set(["course_valid"]),
+      nowMs
+    );
+    expect(filteredForEnrolled.map((a) => a.id)).toEqual([
+      "a_course_authorized_pinned",
+      "a_general_older",
+    ]);
+
+    const filteredForUnenrolled = filterAndSortLearnerAnnouncements(
+      rawAnnouncements,
+      new Set(),
+      nowMs
+    );
+    expect(filteredForEnrolled.length).toBe(2);
+    expect(filteredForUnenrolled.map((a) => a.id)).toEqual(["a_general_older"]);
+  });
+
+  it("enforces search catalogue integrity: returns empty when Firestore is empty or contains only unpublished/deleting courses, and never leaks static catalogue courses", () => {
+    const staticCatalog = [
+      { id: "ai-fundamentals", title: "Static AI Fundamentals", badgeClass: "pill-ai", rating: "4.9" },
+      { id: "ui-ux-mastery", title: "Static UI/UX Mastery", badgeClass: "pill-design", rating: "4.8" },
+    ];
+
+    // 1. Empty Firestore -> empty results (never returns staticCatalog)
+    expect(buildAuthoritativeSearchCourses([], staticCatalog)).toEqual([]);
+    expect(buildAuthoritativeSearchCourses(null, staticCatalog)).toEqual([]);
+
+    // 2. Firestore contains only draft, deleting, deleted, or pending_review courses -> empty results
+    const nonLiveDocs = [
+      { id: "ai-fundamentals", data: () => ({ status: "draft", title: "Draft AI" }) },
+      { id: "ui-ux-mastery", data: () => ({ status: "deleting", title: "Deleting UI" }) },
+      { id: "c3", data: () => ({ status: "published", deletionState: "deleting", title: "Deleting State" }) },
+      { id: "c4", data: () => ({ status: "published", deleted: true, title: "Deleted Flag" }) },
+      { id: "c5", data: () => ({ status: "pending_review", title: "Pending Review" }) },
+    ];
+    expect(buildAuthoritativeSearchCourses(nonLiveDocs, staticCatalog)).toEqual([]);
+
+    // 3. Firestore contains one published course matching static metadata + one custom published course
+    const liveDocs = [
+      { id: "ai-fundamentals", data: () => ({ status: "published", title: "Live AI Fundamentals" }) },
+      { id: "custom-cloud-101", data: () => ({ status: "published", title: "Custom Cloud 101" }) },
+      { id: "ui-ux-mastery", data: () => ({ status: "draft", title: "Unpublished UI/UX" }) },
+    ];
+    const results = buildAuthoritativeSearchCourses(liveDocs, staticCatalog);
+    expect(results.map((c) => c.id)).toEqual(["ai-fundamentals", "custom-cloud-101"]);
+    // Uses static display metadata fallback (badgeClass, rating) ONLY for verified published course
+    expect(results[0].badgeClass).toBe("pill-ai");
+    expect(results[0].rating).toBe("4.9");
+    expect(results[0].title).toBe("Live AI Fundamentals");
+  });
+
+  it("paginates broadcasts beyond 500 recipients in bounded batches (<= 350 writes) across all audience types while excluding suspended and deleted accounts", async () => {
+    const adminAuth = { uid: "admin_scale", token: { admin: true, email: "admin@peleekings.com" } };
+
+    // Seed 620 active learners, 5 suspended learners, and 5 deleted learners (> 500 recipient threshold)
+    for (let i = 1; i <= 620; i++) {
+      const uid = `student_${String(i).padStart(4, "0")}`;
+      harness.docs.set(`users/${uid}`, {
+        uid,
+        role: "student",
+        status: "active",
+        disabled: false,
+      });
+    }
+    for (let i = 1; i <= 5; i++) {
+      const uid = `student_susp_${i}`;
+      harness.docs.set(`users/${uid}`, {
+        uid,
+        role: "student",
+        status: "suspended",
+        disabled: true,
+      });
+    }
+    for (let i = 1; i <= 5; i++) {
+      const uid = `student_del_${i}`;
+      harness.docs.set(`users/${uid}`, {
+        uid,
+        role: "student",
+        status: "active",
+      });
+      harness.docs.set(`deletedUsers/${uid}`, {
+        uid,
+        deletionState: "completed",
+      });
+    }
+
+    harness.committedBatchSizes.length = 0;
+    const res = await adminSendBroadcast({
+      auth: adminAuth,
+      data: {
+        targetType: "all_learners",
+        title: "Platform-Wide Semester Kickoff",
+        message: "Welcome all 620+ active learners to the new semester!",
+        idempotencyKey: "kickoff_620_learners",
+      },
+    });
+
+    expect(res.success).toBe(true);
+    expect(res.totalRecipients).toBe(620);
+    expect(res.deliveredCount).toBe(620);
+    expect(res.failedCount).toBe(0);
+    expect(res.status).toBe("completed");
+
+    // Verify bounded Firestore batches: 620 writes must be split into 2 batches of 350 and 270 (both <= 350)
+    expect(harness.committedBatchSizes).toEqual([350, 270]);
+    harness.committedBatchSizes.forEach((size) => {
+      expect(size).toBeLessThanOrEqual(350);
+    });
+
+    // Verify first and 620th learner both received the notification, while suspended/deleted did not
+    expect(
+      harness.docs.has(`users/student_0001/notifications/bcast_${res.broadcastId}`)
+    ).toBe(true);
+    expect(
+      harness.docs.has(`users/student_0620/notifications/bcast_${res.broadcastId}`)
+    ).toBe(true);
+    expect(
+      harness.docs.has(`users/student_susp_1/notifications/bcast_${res.broadcastId}`)
+    ).toBe(false);
+    expect(
+      harness.docs.has(`users/student_del_1/notifications/bcast_${res.broadcastId}`)
+    ).toBe(false);
+
+    // Also verify course-targeted broadcast validates course existence and filters out non-active enrollments & suspended users
+    await expect(
+      adminSendBroadcast({
+        auth: adminAuth,
+        data: {
+          targetType: "course",
+          courseId: "missing_course_999",
+          title: "Course Notice",
+          message: "Body",
+        },
+      })
+    ).rejects.toThrow(/does not exist/i);
+
+    await harness.db.collection("courses").doc("course_bcast_1").set({
+      id: "course_bcast_1",
+      title: "Broadcast Course",
+      status: "published",
+    });
+    await harness.db.collection("enrollments").doc("student_0001_course_bcast_1").set({
+      uid: "student_0001",
+      courseId: "course_bcast_1",
+      status: "active",
+    });
+    await harness.db.collection("enrollments").doc("student_0002_course_bcast_1").set({
+      uid: "student_0002",
+      courseId: "course_bcast_1",
+      status: "approved",
+    });
+    await harness.db.collection("enrollments").doc("student_0003_course_bcast_1").set({
+      uid: "student_0003",
+      courseId: "course_bcast_1",
+      status: "pending",
+    });
+    await harness.db.collection("enrollments").doc("student_susp_1_course_bcast_1").set({
+      uid: "student_susp_1",
+      courseId: "course_bcast_1",
+      status: "active",
+    });
+
+    const courseBcastRes = await adminSendBroadcast({
+      auth: adminAuth,
+      data: {
+        targetType: "course",
+        courseId: "course_bcast_1",
+        title: "Course Cohort Update",
+        message: "Only active/approved eligible learners in course_bcast_1 receive this.",
+      },
+    });
+    expect(courseBcastRes.totalRecipients).toBe(2);
+    expect(courseBcastRes.deliveredCount).toBe(2);
+  });
+
+  it("prevents simultaneous duplicate broadcast submissions via atomic reservation while preserving retries and new idempotency keys", async () => {
+    const adminAuth = { uid: "admin_concurrent", token: { admin: true, email: "admin@peleekings.com" } };
+
+    await harness.db.collection("users").doc("u_conc_1").set({
+      uid: "u_conc_1",
+      role: "student",
+      status: "active",
+    });
+    await harness.db.collection("users").doc("u_conc_2").set({
+      uid: "u_conc_2",
+      role: "student",
+      status: "active",
+    });
+
+    // 1. Fire two simultaneous identical broadcast requests with the same idempotencyKey
+    const [r1, r2] = await Promise.allSettled([
+      adminSendBroadcast({
+        auth: adminAuth,
+        data: {
+          targetType: "all_learners",
+          title: "Concurrent Broadcast Test",
+          message: "Fired simultaneously",
+          idempotencyKey: "concurrent_key_1",
+        },
+      }),
+      adminSendBroadcast({
+        auth: adminAuth,
+        data: {
+          targetType: "all_learners",
+          title: "Concurrent Broadcast Test",
+          message: "Fired simultaneously",
+          idempotencyKey: "concurrent_key_1",
+        },
+      }),
+    ]);
+
+    const fulfilled = [r1, r2].filter((r) => r.status === "fulfilled");
+    const rejected = [r1, r2].filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason?.message).toMatch(/duplicate broadcast/i);
+
+    // Recipient received exactly 1 notification, not 2
+    const u1Notifs = await harness.db.collection("users").doc("u_conc_1").collection("notifications").get();
+    expect(u1Notifs.size).toBe(1);
+
+    // 2. Sending with a new idempotencyKey succeeds
+    const rNewKey = await adminSendBroadcast({
+      auth: adminAuth,
+      data: {
+        targetType: "all_learners",
+        title: "Concurrent Broadcast Test",
+        message: "Fired simultaneously",
+        idempotencyKey: "concurrent_key_2",
+      },
+    });
+    expect(rNewKey.success).toBe(true);
+
+    // 3. Partial delivery failure & idempotent retry without duplicating already-processed recipients
+    // Force batch #1 to fail so fallback runs per-user, and force u_conc_2's notification write to fail on attempt 1
+    harness.setFailBatchOnCallNumber(1);
+    // Find the deterministic reservation/broadcast ID by running attempt 1 where u_conc_2 fails
+    const originalUserDoc = harness.db.collection;
+    let failSecondUserOnce = true;
+    const origSet = harness.docs.set.bind(harness.docs);
+    harness.docs.set = (k, v) => {
+      if (failSecondUserOnce && k.startsWith("users/u_conc_2/notifications/bcast_")) {
+        throw new Error("Simulated per-recipient write error for u_conc_2");
+      }
+      return origSet(k, v);
+    };
+
+    let partialRes;
+    try {
+      partialRes = await adminSendBroadcast({
+        auth: adminAuth,
+        data: {
+          targetType: "all_learners",
+          title: "Retryable Broadcast",
+          message: "Testing partial failure recovery",
+          idempotencyKey: "retry_key_partial_1",
+        },
+      });
+    } finally {
+      failSecondUserOnce = false;
+      harness.docs.set = origSet;
+      harness.setFailBatchOnCallNumber(null);
+    }
+
+    expect(partialRes.status).toBe("partial_failure");
+    expect(partialRes.deliveredCount).toBe(1);
+    expect(partialRes.failedCount).toBe(1);
+
+    // Verify u_conc_1 got the notification on attempt 1, u_conc_2 did not
+    const bcastId = partialRes.broadcastId;
+    expect(harness.docs.has(`users/u_conc_1/notifications/bcast_${bcastId}`)).toBe(true);
+    expect(harness.docs.has(`users/u_conc_2/notifications/bcast_${bcastId}`)).toBe(false);
+
+    // Now retry with the SAME idempotencyKey: should resume the same broadcastId, skip u_conc_1, and deliver to u_conc_2
+    const retryRes = await adminSendBroadcast({
+      auth: adminAuth,
+      data: {
+        targetType: "all_learners",
+        title: "Retryable Broadcast",
+        message: "Testing partial failure recovery",
+        idempotencyKey: "retry_key_partial_1",
+      },
+    });
+
+    expect(retryRes.broadcastId).toBe(bcastId);
+    expect(retryRes.status).toBe("completed");
+    expect(retryRes.totalRecipients).toBe(2);
+    expect(retryRes.deliveredCount).toBe(2);
+    expect(retryRes.failedCount).toBe(0);
+    expect(harness.docs.has(`users/u_conc_2/notifications/bcast_${bcastId}`)).toBe(true);
+
+    // Ensure u_conc_1 still has only 1 notification for this broadcast (no duplicate created on retry)
+    const u1AllNotifs = await harness.db.collection("users").doc("u_conc_1").collection("notifications").get();
+    const matchingBcastNotifs = u1AllNotifs.docs.filter((d) => d.data()?.broadcastId === bcastId);
+    expect(matchingBcastNotifs).toHaveLength(1);
+    void originalUserDoc;
+  });
+});
+
+
+
+
+
+

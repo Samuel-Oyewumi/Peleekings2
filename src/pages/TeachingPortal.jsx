@@ -17,9 +17,16 @@ import {
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { httpsCallable } from "firebase/functions";
 import { db, storage, functions } from "../firebase";
-import { getResources, uploadResource } from "../contexts/resourcesService";
+import { getResources, uploadResource, deleteResource } from "../contexts/resourcesService";
 import { createNotification } from "../contexts/notificationsService";
 import { useBodyScrollLock } from "../utils/scrollLock";
+import {
+  buildTutorAnnouncementsQuery,
+  getFarFutureExpiresAtTimestamp,
+  parseStrictAnnouncementExpiresAtMs,
+} from "../utils/courseCatalogue";
+import brandSubmark from "../assets/brand-submark.png";
+import brandWordmarkAlt from "../assets/brand-wordmark-alt.png";
 
 const MAX_PORTRAIT_BYTES = 5 * 1024 * 1024; // 5MB matching storage.rules
 
@@ -119,10 +126,11 @@ export default function TeachingPortal() {
   const [showResourceForm, setShowResourceForm] = useState(false);
   const [resTitle, setResTitle] = useState("");
   const [resDesc, setResDesc] = useState("");
-  const [resCategory, setResCategory] = useState("Tech & Digital Skills");
+  const [resCategory, _setResCategory] = useState("Tech & Digital Skills");
   const [resFile, setResFile] = useState(null);
   const [resLink, setResLink] = useState("");
   const [isUploadingRes, setIsUploadingRes] = useState(false);
+  const [deletingResId, setDeletingResId] = useState(null);
 
   function triggerToast(msg) {
     setToastMessage(msg);
@@ -139,15 +147,19 @@ export default function TeachingPortal() {
           const snap = await getDocs(collection(db, "courses"));
           fsList = !snap.empty ? snap.docs.map((d) => ({ id: d.id, ...d.data() })) : [];
         } else {
-          const [primarySnap, assignedSnap] = await Promise.all([
+          const [primarySnap, tutorUidSnap, instructorSnap, assignedSnap] = await Promise.all([
             getDocs(query(collection(db, "courses"), where("tutorId", "==", currentUser.uid))).catch(() => ({ docs: [] })),
+            getDocs(query(collection(db, "courses"), where("tutorUid", "==", currentUser.uid))).catch(() => ({ docs: [] })),
+            getDocs(query(collection(db, "courses"), where("instructorId", "==", currentUser.uid))).catch(() => ({ docs: [] })),
             getDocs(query(collection(db, "courses"), where("assignedTutors", "array-contains", currentUser.uid))).catch(() => ({ docs: [] })),
           ]);
           const mergedMap = new Map();
-          (primarySnap.docs || []).forEach((d) => mergedMap.set(d.id, { id: d.id, ...d.data() }));
-          (assignedSnap.docs || []).forEach((d) => mergedMap.set(d.id, { id: d.id, ...d.data() }));
+          [primarySnap, tutorUidSnap, instructorSnap, assignedSnap].forEach((s) => {
+            (s.docs || []).forEach((d) => mergedMap.set(d.id, { id: d.id, ...d.data() }));
+          });
           fsList = Array.from(mergedMap.values());
         }
+        fsList = fsList.filter((c) => c.status !== "deleting" && c.deletionState !== "deleting");
         setCourses(fsList);
         setSelectedCourse((prev) => fsList.find((c) => c.id === prev?.id) || fsList[0] || null);
       } catch (err) {
@@ -411,40 +423,74 @@ export default function TeachingPortal() {
   // Load Tutor & Platform Announcements
   const [tutorAnnouncements, setTutorAnnouncements] = useState([]);
   const [loadingTutorAnnouncements, setLoadingTutorAnnouncements] = useState(false);
+  const [tutorAnnouncementsError, setTutorAnnouncementsError] = useState(null);
+
+  const loadTutorAnnouncements = useCallback(async () => {
+    setLoadingTutorAnnouncements(true);
+    setTutorAnnouncementsError(null);
+    const withQueryTimeout = (promise, ms = 5000) => {
+      let timerId;
+      const timeout = new Promise((_, reject) => {
+        timerId = setTimeout(() => reject(new Error("Request timed out loading broadcasts.")), ms);
+      });
+      return Promise.race([promise, timeout]).finally(() => clearTimeout(timerId));
+    };
+    try {
+      let snap;
+      try {
+        const q = buildTutorAnnouncementsQuery(db, undefined, true);
+        snap = await withQueryTimeout(getDocs(q), 5000);
+      } catch (err) {
+        const isIndexError =
+          err?.code === "failed-precondition" || /index/i.test(String(err?.message || ""));
+        if (isIndexError) {
+          const fallbackQ = buildTutorAnnouncementsQuery(db, undefined, false);
+          snap = await withQueryTimeout(getDocs(fallbackQ), 5000);
+        } else {
+          throw err;
+        }
+      }
+      const nowMs = Date.now();
+      const list = snap.docs
+        .map((d) => {
+          const data = d.data() || {};
+          let dateStr = "Recent";
+          let sortTime = 0;
+          if (data.createdAt?.toDate) {
+            const dt = data.createdAt.toDate();
+            dateStr = dt.toLocaleDateString();
+            sortTime = dt.getTime();
+          } else if (data.createdAt) {
+            const dt = new Date(data.createdAt);
+            if (!Number.isNaN(dt.getTime())) {
+              dateStr = dt.toLocaleDateString();
+              sortTime = dt.getTime();
+            }
+          }
+          const expMs = parseStrictAnnouncementExpiresAtMs(data.expiresAt);
+          const isExpired = expMs === null || expMs <= nowMs;
+          return { id: d.id, ...data, date: dateStr, _sortTime: sortTime, _isExpired: isExpired };
+        })
+        .filter((a) => a.status === "published" && !a._isExpired && (!a.audience || a.audience === "all" || a.audience === "tutors"))
+        .sort((a, b) => {
+          if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+          return (b._sortTime || 0) - (a._sortTime || 0);
+        });
+      setTutorAnnouncements(list);
+    } catch (err) {
+      console.warn("Notice loading instructor announcements:", err);
+      setTutorAnnouncementsError(err?.message || "Unable to load broadcasts right now.");
+      setTutorAnnouncements([]);
+    } finally {
+      setLoadingTutorAnnouncements(false);
+    }
+  }, []);
 
   useEffect(() => {
-    async function loadTutorAnnouncements() {
-      setLoadingTutorAnnouncements(true);
-      try {
-        const q = query(
-          collection(db, "announcements"),
-          where("status", "==", "published"),
-          orderBy("createdAt", "desc")
-        );
-        const snap = await getDocs(q);
-        const list = snap.docs
-          .map((d) => {
-            const data = d.data();
-            let dateStr = "Recent";
-            if (data.createdAt?.toDate) {
-              dateStr = data.createdAt.toDate().toLocaleDateString();
-            } else if (data.createdAt) {
-              dateStr = new Date(data.createdAt).toLocaleDateString();
-            }
-            return { id: d.id, ...data, date: dateStr };
-          })
-          .filter((a) => a.audience === "all" || a.audience === "tutors");
-        setTutorAnnouncements(list);
-      } catch (err) {
-        console.warn("Notice loading instructor announcements:", err);
-      } finally {
-        setLoadingTutorAnnouncements(false);
-      }
-    }
     if (isTutor && activeTab === "announcements") {
       loadTutorAnnouncements();
     }
-  }, [isTutor, activeTab]);
+  }, [isTutor, activeTab, loadTutorAnnouncements]);
 
   // ── Handle Tutor Application ─────────────────────────────────────────
   async function handleApplicationSubmit(e) {
@@ -461,7 +507,7 @@ export default function TeachingPortal() {
     try {
       let portraitUrl = portraitPreview || null;
       if (portraitFile) {
-        if (portraitFile.size > 5 * 1024 * 1024) {
+        if (portraitFile.size > MAX_PORTRAIT_BYTES) {
           throw new Error("Portrait image exceeds the 5MB maximum file size limit.");
         }
         if (!["image/jpeg", "image/png", "image/webp"].includes(portraitFile.type)) {
@@ -521,9 +567,27 @@ export default function TeachingPortal() {
     }
   }
 
-  // ── Handle Admin Course Publish/Unpublish Toggle ─────────────────────
+  // ── Handle Course Publish Request (Tutors) / Publish Toggle (Admins) ──
   async function handleToggleCourseStatus(course) {
     if (!course) return;
+    if (!isAdmin) {
+      try {
+        const requestPublishFn = httpsCallable(functions, "requestCoursePublish");
+        await requestPublishFn({ courseId: course.id });
+        triggerToast("Submitted for review");
+        setCourses((prev) =>
+          prev.map((c) => (c.id === course.id ? { ...c, status: "pending_review" } : c))
+        );
+        if (selectedCourse?.id === course.id) {
+          setSelectedCourse((prev) => ({ ...prev, status: "pending_review" }));
+        }
+      } catch (err) {
+        console.error("Failed to request course publication:", err);
+        triggerToast("Failed to submit for review: " + (err.message || "Error"));
+      }
+      return;
+    }
+
     const nextStatus = course.status === "published" ? "draft" : "published";
     try {
       const manageCourseFn = httpsCallable(functions, "adminManageCourse");
@@ -674,6 +738,7 @@ export default function TeachingPortal() {
       };
 
       let payload = { ...basePayload };
+      let validTestQuestions = [];
       if (addContentType === "note") {
         payload.fileUrl = fileUrl;
         payload.body = addContentBody.trim();
@@ -692,8 +757,15 @@ export default function TeachingPortal() {
       } else if (addContentType === "announcement") {
         payload.body = addContentBody.trim();
         payload.postedBy = userProfile?.fullName || currentUser?.email || "Instructor";
+        payload.expiresAt = getFarFutureExpiresAtTimestamp();
       } else if (addContentType === "test") {
-        payload.questions = addContentQuestions.filter((q) => q.question.trim());
+        validTestQuestions = addContentQuestions.filter((q) => q.question.trim());
+        payload.questions = validTestQuestions.map((q) => {
+          const sanitized = { ...q };
+          delete sanitized.correctIndex;
+          delete sanitized.explanation;
+          return sanitized;
+        });
         payload.dueAt = addContentDueAt || null;
         payload.type = "test";
       }
@@ -702,6 +774,16 @@ export default function TeachingPortal() {
         ...payload,
         createdAt: serverTimestamp(),
       });
+
+      if (addContentType === "test" && validTestQuestions.length > 0) {
+        await setDoc(doc(db, "courses", targetCourseId, "testKeys", docRef.id), {
+          answers: validTestQuestions.map((q) =>
+            typeof q.correctIndex === "number" ? q.correctIndex : Number(q.correctIndex) || 0
+          ),
+          passingScore: 60,
+          updatedAt: serverTimestamp(),
+        });
+      }
 
       const newItem = {
         id: docRef.id,
@@ -844,6 +926,21 @@ export default function TeachingPortal() {
       triggerToast("Failed to upload resource.");
     } finally {
       setIsUploadingRes(false);
+    }
+  }
+
+  async function handleDeleteTutorResource(resItem) {
+    if (!resItem?.id) return;
+    setDeletingResId(resItem.id);
+    try {
+      await deleteResource(resItem.id, resItem.fileUrl, resItem.storagePath);
+      setResources((prev) => prev.filter((item) => item.id !== resItem.id));
+      triggerToast(`✓ Resource "${resItem.title}" deleted.`);
+    } catch (err) {
+      console.error("Failed to delete resource:", err);
+      triggerToast("Failed to delete resource: " + (err.message || "Permission denied"));
+    } finally {
+      setDeletingResId(null);
     }
   }
 
@@ -1064,9 +1161,9 @@ export default function TeachingPortal() {
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "nowrap", minWidth: 0 }}>
           <Link to="/" style={{ display: "flex", alignItems: "center", gap: 8, textDecoration: "none", color: "#FFFFFF", minWidth: 0 }}>
             <div className="brand-logo-icon" style={{ width: 32, height: 32, borderRadius: 8, flexShrink: 0 }}>
-              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+              <img src={brandSubmark} alt="" className="brand-submark-img" />
             </div>
-            <img src="/assets/aistudio/20260925_194648_c89756b4.png" alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
+            <img src={brandWordmarkAlt} alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
             <span className="tp-brand-tag" style={{ color: "#F9EFA7", fontWeight: 700, fontSize: "0.85rem", flexShrink: 0 }}>Teaching</span>
           </Link>
           <span
@@ -1197,9 +1294,13 @@ export default function TeachingPortal() {
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                     <span className={`pill-badge ${selectedCourse.status === "published" ? "pill-success" : "pill-warning"}`}>
-                      Status: {selectedCourse.status === "published" ? "Published" : "Draft"}
+                      Status: {selectedCourse.status === "published"
+                        ? "Published"
+                        : selectedCourse.status === "pending_review"
+                          ? "Submitted for review"
+                          : "Draft"}
                     </span>
-                    {(isAdmin || isAssignedTutor) && (
+                    {isAdmin ? (
                       <button
                         type="button"
                         onClick={() => handleToggleCourseStatus(selectedCourse)}
@@ -1209,7 +1310,18 @@ export default function TeachingPortal() {
                           ? "Unpublish (Set Draft)"
                           : "Publish Course"}
                       </button>
-                    )}
+                    ) : isAssignedTutor && selectedCourse.status !== "published" ? (
+                      <button
+                        type="button"
+                        disabled={selectedCourse.status === "pending_review"}
+                        onClick={() => handleToggleCourseStatus(selectedCourse)}
+                        className="btn btn-outline btn-sm"
+                      >
+                        {selectedCourse.status === "pending_review"
+                          ? "Submitted for review"
+                          : "Publish Course"}
+                      </button>
+                    ) : null}
                     <Link to={`/course/${selectedCourse.id}`} className="btn btn-outline btn-sm">
                       View as Student &rarr;
                     </Link>
@@ -1971,15 +2083,28 @@ export default function TeachingPortal() {
                       {r.desc || r.description} &bull; {r.type} {r.fileSize && `(${r.fileSize})`}
                     </div>
                   </div>
-                  <a
-                    href={r.fileUrl || "#"}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="btn btn-outline btn-sm"
-                    style={{ textDecoration: "none" }}
-                  >
-                    Open / Download &darr;
-                  </a>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <a
+                      href={r.fileUrl || "#"}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="btn btn-outline btn-sm"
+                      style={{ textDecoration: "none" }}
+                    >
+                      Open / Download &darr;
+                    </a>
+                    {(isAdmin || isAssignedTutor) && (
+                      <button
+                        type="button"
+                        disabled={deletingResId === r.id}
+                        onClick={() => handleDeleteTutorResource(r)}
+                        className="btn btn-outline btn-sm"
+                        style={{ color: "#B91C1C", borderColor: "#FECACA" }}
+                      >
+                        {deletingResId === r.id ? "Deleting..." : "Delete"}
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -1989,12 +2114,47 @@ export default function TeachingPortal() {
         {/* ── TAB: ANNOUNCEMENTS & BROADCASTS ────────────────────────── */}
         {activeTab === "announcements" && (
           <div>
-            <div style={{ marginBottom: 20 }}>
-              <h2 style={{ fontSize: "clamp(1.2rem, 3.5vw, 1.45rem)", fontWeight: 800 }}>Faculty &amp; Academic Broadcasts</h2>
-              <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginTop: 4 }}>
-                Platform notices, academic schedules, and messages broadcast to instructors.
-              </p>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 20 }}>
+              <div>
+                <h2 style={{ fontSize: "clamp(1.2rem, 3.5vw, 1.45rem)", fontWeight: 800, margin: 0 }}>Faculty &amp; Academic Broadcasts</h2>
+                <p style={{ fontSize: "0.85rem", color: "var(--text-muted)", marginTop: 4 }}>
+                  Platform notices, academic schedules, and messages broadcast to instructors.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="btn btn-outline btn-sm"
+                disabled={loadingTutorAnnouncements}
+                onClick={() => loadTutorAnnouncements()}
+              >
+                {loadingTutorAnnouncements ? "Refreshing..." : "Refresh"}
+              </button>
             </div>
+
+            {tutorAnnouncementsError && (
+              <div
+                role="alert"
+                style={{
+                  marginBottom: 16,
+                  padding: "12px 16px",
+                  borderRadius: 10,
+                  background: "#FEF2F2",
+                  border: "1px solid #FECACA",
+                  color: "#991B1B",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 12,
+                  flexWrap: "wrap",
+                  fontSize: "0.875rem",
+                }}
+              >
+                <span>{tutorAnnouncementsError}</span>
+                <button type="button" className="btn btn-outline btn-sm" onClick={() => loadTutorAnnouncements()}>
+                  Retry
+                </button>
+              </div>
+            )}
 
             {loadingTutorAnnouncements ? (
               <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading broadcasts...</div>

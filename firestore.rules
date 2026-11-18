@@ -113,8 +113,19 @@ service cloud.firestore {
     // Classroom subcollections require an active/approved enrollment, assigned tutor, or admin.
     match /courses/{courseId} {
       allow read: if resource.data.status == 'published' || isAdmin() || (resource.data.status != 'deleting' && isAssignedTutor(resource.data));
-      allow create: if isAdmin() || (isTutor() && (request.resource.data.tutorId == request.auth.uid || request.resource.data.tutorUid == request.auth.uid));
-      allow update: if isAdmin() || (isTutor() && resource.data.status != 'deleting' && isAssignedTutor(resource.data));
+      allow create: if isAdmin() || (
+        isTutor() &&
+        request.resource.data.status == 'draft' &&
+        (request.resource.data.tutorId == request.auth.uid || request.resource.data.tutorUid == request.auth.uid)
+      );
+      allow update: if isAdmin() || (
+        isTutor() &&
+        resource.data.status != 'deleting' &&
+        isAssignedTutor(resource.data) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'status', 'tutorId', 'tutorUid', 'instructorId', 'assignedTutors'
+        ])
+      );
       allow delete: if isAdmin();
 
       match /modules/{moduleId} {
@@ -154,6 +165,10 @@ service cloud.firestore {
         allow create, update, delete: if canManageCourse(courseId);
       }
 
+      match /testKeys/{testId} {
+        allow read, write: if canManageCourse(courseId);
+      }
+
       match /resources/{resourceId} {
         allow read: if canAccessCourseMaterials(courseId);
         allow create, update, delete: if canManageCourse(courseId);
@@ -191,17 +206,17 @@ service cloud.firestore {
         ]);
 
       // Student enrollment progress updates: learning-progress fields ONLY when enrollment is already active/approved.
-      // Tutors and students cannot directly mutate enrollment status from the client; status transitions go through Cloud Functions.
+      // Tutors and students cannot directly mutate enrollment status or progressPercent from the client.
       allow update: if isAdmin() || (
         isOwner(resource.data.uid) &&
         resource.data.status in ['active', 'approved'] &&
         request.resource.data.status == resource.data.status &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'completedItemIds', 'completedLessonIds', 'lastAccessedLesson',
-          'currentModule', 'progressPercent', 'notes', 'updatedAt'
+          'currentModule', 'notes', 'updatedAt'
         ]) &&
         !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-          'status', 'role', 'userRole', 'admin', 'tutor',
+          'status', 'progressPercent', 'role', 'userRole', 'admin', 'tutor',
           'isPaid', 'paymentStatus', 'paymentId', 'amountPaid',
           'approvedAt', 'approvedBy', 'rejectedAt', 'rejectedBy',
           'accessGrantedBy', 'accessLevel',
@@ -222,8 +237,9 @@ service cloud.firestore {
       allow create: if isSignedIn() &&
         request.resource.data.uid == request.auth.uid &&
         request.resource.data.courseId is string &&
+        request.resource.data.studentName is string &&
         isEnrolled(request.resource.data.courseId, request.auth.uid) &&
-        !request.resource.data.keys().hasAny(['grade', 'feedback', 'gradedAt', 'gradedBy']);
+        !request.resource.data.keys().hasAny(['score', 'grade', 'feedback', 'gradedAt', 'gradedBy']);
 
       // Grading restricted exclusively to Admins and assigned course Tutors
       allow update: if isAdmin() || (
@@ -239,11 +255,8 @@ service cloud.firestore {
     match /testSubmissions/{submissionId} {
       allow read: if isOwner(resource.data.uid) || isAdmin() || isAssignedCourseTutor(resource.data.courseId);
 
-      allow create: if isSignedIn() &&
-        request.resource.data.uid == request.auth.uid &&
-        request.resource.data.courseId is string &&
-        isEnrolled(request.resource.data.courseId, request.auth.uid) &&
-        !request.resource.data.keys().hasAny(['grade', 'feedback', 'gradedAt', 'gradedBy']);
+      // Test submissions are scored and written exclusively server-side via the submitTest callable
+      allow create: if false;
 
       // Grading restricted exclusively to Admins and assigned course Tutors
       allow update: if isAdmin() || (
@@ -269,7 +282,7 @@ service cloud.firestore {
     // ── 6. Milestones & Celebrations Collection ───────────────────────
     match /milestones/{milestoneId} {
       allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
-      allow read: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin() || isTutor());
+      allow read: if isSignedIn() && (isOwner(resource.data.uid) || isAdmin());
       allow update, delete: if isAdmin();
     }
 
@@ -294,7 +307,7 @@ service cloud.firestore {
     // ── 9. User Daily Activity Subcollection ─────────────────────────
     match /users/{uid}/dailyActivity/{dayId} {
       allow read, write: if isOwner(uid);
-      allow read: if isAdmin() || isTutor();
+      allow read: if isAdmin();
     }
 
     // ── 10. Platform & Course Resources Collection ───────────────────
@@ -322,21 +335,76 @@ service cloud.firestore {
 
     // ── 11. Platform Announcements Collection ────────────────────────
     match /announcements/{announcementId} {
-      // Admins can read all announcements (drafts, scheduled, expired).
-      // Regular users can only read published, non-expired announcements matching their audience.
-      allow read: if isAdmin() || (
+      // Admins can read all announcements (drafts, scheduled, expired, or legacy).
+      // Signed-in users can read published announcements only when expiresAt is a valid future Timestamp
+      // and the user is authorized for the target audience.
+      allow get: if isAdmin() || (
         isSignedIn() &&
         resource.data.status == 'published' &&
-        (!('expiresAt' in resource.data) || resource.data.expiresAt > request.time) &&
+        'expiresAt' in resource.data &&
+        resource.data.expiresAt is timestamp &&
+        resource.data.expiresAt > request.time &&
         (
+          !('audience' in resource.data) ||
           resource.data.audience == 'all' ||
           (resource.data.audience == 'learners' && !isTutor()) ||
           (resource.data.audience == 'tutors' && isTutor()) ||
-          (resource.data.courseId != null && isEnrolled(resource.data.courseId, request.auth.uid))
+          (
+            resource.data.audience == 'course' &&
+            'courseId' in resource.data &&
+            resource.data.courseId is string &&
+            resource.data.courseId != '' &&
+            resource.data.courseId != 'general' &&
+            resource.data.courseId != 'platform' &&
+            (
+              isEnrolled(resource.data.courseId, request.auth.uid) ||
+              isAssignedCourseTutor(resource.data.courseId)
+            )
+          )
+        )
+      );
+
+      allow list: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.status == 'published' &&
+        'expiresAt' in resource.data &&
+        resource.data.expiresAt is timestamp &&
+        resource.data.expiresAt > request.time - duration.value(5, 's') &&
+        (
+          resource.data.audience in ['all', 'learners'] ||
+          (isTutor() && resource.data.audience in ['all', 'tutors']) ||
+          (
+            resource.data.audience == 'course' &&
+            'courseId' in resource.data &&
+            resource.data.courseId is string &&
+            resource.data.courseId != '' &&
+            resource.data.courseId != 'general' &&
+            resource.data.courseId != 'platform' &&
+            (
+              isEnrolled(resource.data.courseId, request.auth.uid) ||
+              isAssignedCourseTutor(resource.data.courseId)
+            )
+          )
         )
       );
 
       allow create, update, delete: if isAdmin();
+    }
+
+    // ── 11b. Broadcast Dispatch History & Per-Recipient Tracking (Server-Written) ──
+    match /broadcasts/{broadcastId} {
+      allow read: if isAdmin();
+      allow write: if false;
+
+      match /recipients/{uid} {
+        allow read: if isAdmin();
+        allow write: if false;
+      }
+    }
+
+    match /broadcastReservations/{reservationId} {
+      allow read: if isAdmin();
+      allow write: if false;
     }
 
     // ── 12. Platform Settings Collection ─────────────────────────────
@@ -350,7 +418,28 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // ── 14. Default Deny ─────────────────────────────────────────────
+    // ── 14. Server-Controlled Operation & Archive Collections ───────
+    match /courseDeletions/{courseId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /tutorDeletionOperations/{uid} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /deletedUsers/{uid} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /accountStatusOperations/{uid} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ── 15. Default Deny ─────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;
     }

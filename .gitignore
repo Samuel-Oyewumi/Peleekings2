@@ -31,3 +31,5 @@ dist-ssr
 *firebase-adminsdk*.json
 application_default_credentials.json
 credentials.json
+*.zip
+.aistudio/

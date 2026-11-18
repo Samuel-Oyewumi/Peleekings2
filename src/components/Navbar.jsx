@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Home as HomeIcon,
@@ -18,10 +18,17 @@ import {
   X,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
+import brandSubmark from "../assets/brand-submark.png";
+import brandWordmark from "../assets/brand-wordmark.png";
 import { useBodyScrollLock } from "../utils/scrollLock";
 import { COURSES_CATALOG } from "../data/courses";
+import { collection, getDocs, query, where } from "firebase/firestore";
+import { db } from "../firebase";
 import { getResources, uploadResource } from "../contexts/resourcesService";
 import { subscribeToNotifications, markNotificationAsRead, markAllNotificationsAsRead } from "../contexts/notificationsService";
+import { buildAuthoritativeSearchCourses } from "../utils/courseCatalogue";
+
+export { buildAuthoritativeSearchCourses };
 
 export default function Navbar() {
   const { currentUser, userProfile, logout, isAdmin, isTutor, role } = useAuth();
@@ -47,10 +54,13 @@ export default function Navbar() {
   const [isUploadingResource, setIsUploadingResource] = useState(false);
   const [resourceUploadSuccess, setResourceUploadSuccess] = useState("");
 
-  // Active search modal state
+  // Active search modal state (authoritative from Firestore published courses only)
   const [showSearchModal, setShowSearchModal] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchCategory, setSearchCategory] = useState("All");
+  const [searchableCourses, setSearchableCourses] = useState([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState(null);
 
   // Notifications state (server-authoritative from Firestore)
   const [notifications, setNotifications] = useState([]);
@@ -207,7 +217,43 @@ export default function Navbar() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  const filteredSearchCourses = COURSES_CATALOG.filter(course => {
+  // Load authoritative live published Firestore courses when search modal opens
+  const loadLiveSearchCourses = useCallback(async () => {
+    setSearchLoading(true);
+    setSearchError(null);
+    try {
+      const q = query(collection(db, "courses"), where("status", "==", "published"));
+      const snap = await getDocs(q);
+      const authoritativeCourses = buildAuthoritativeSearchCourses(snap?.docs || [], COURSES_CATALOG);
+      setSearchableCourses(authoritativeCourses);
+    } catch (err) {
+      console.warn("Unable to load live search courses from Firestore:", err);
+      setSearchableCourses([]);
+      setSearchError(
+        err?.message || "Unable to reach the course catalogue right now. Please check your connection and retry."
+      );
+    } finally {
+      setSearchLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!showSearchModal) return;
+    loadLiveSearchCourses();
+  }, [showSearchModal, loadLiveSearchCourses]);
+
+  const filteredSearchCourses = searchableCourses.filter((course) => {
+    if (
+      !course ||
+      typeof course.id !== "string" ||
+      !course.id.trim() ||
+      course.status !== "published" ||
+      course.deletionState ||
+      course.deleted === true ||
+      course.isDeleted === true
+    ) {
+      return false;
+    }
     const matchesCategory =
       searchCategory === "All" ||
       course.category === searchCategory ||
@@ -215,9 +261,10 @@ export default function Navbar() {
     const q = searchQuery.toLowerCase().trim();
     const matchesQuery =
       !q ||
-      course.title.toLowerCase().includes(q) ||
-      course.description.toLowerCase().includes(q) ||
-      course.badge.toLowerCase().includes(q);
+      (course.title || "").toLowerCase().includes(q) ||
+      (course.description || "").toLowerCase().includes(q) ||
+      (course.category || "").toLowerCase().includes(q) ||
+      (course.badge || "").toLowerCase().includes(q);
     return matchesCategory && matchesQuery;
   });
 
@@ -263,9 +310,9 @@ export default function Navbar() {
       {/* Brand Logo */}
       <Link to="/" className="brand-wrapper" id="nav-brand">
         <div className="brand-logo-icon">
-          <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+          <img src={brandSubmark} alt="" className="brand-submark-img" />
         </div>
-        <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" />
+        <img src={brandWordmark} alt="Peleekings" className="brand-wordmark-img" />
       </Link>
 
       {/* Desktop Navigation Links */}
@@ -342,8 +389,8 @@ export default function Navbar() {
         {/* Active Search Button Trigger */}
         <button
           type="button"
-          className="btn-ghost nav-search-trigger"
-          style={{ width: 38, height: 38, padding: 0, flexShrink: 0, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+          className="btn-ghost nav-search-trigger touch-target-44"
+          style={{ minWidth: 44, minHeight: 44, width: 44, height: 44, padding: 0, flexShrink: 0, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
           onClick={() => setShowSearchModal(true)}
           title="Search courses (Ctrl+K)"
           aria-label="Search courses"
@@ -1068,131 +1115,203 @@ export default function Navbar() {
 
       {/* ── Active Search Modal Dialog (Ctrl+K) ───────────────────── */}
       {showSearchModal && (
-        <div className="modal-backdrop-overlay" onClick={() => setShowSearchModal(false)}>
+        <div
+          className="modal-backdrop-overlay search-modal-backdrop"
+          onClick={() => setShowSearchModal(false)}
+        >
           <div
-            className="modal-dialog-box"
-            style={{ maxWidth: 640, width: "92%", padding: "24px", maxHeight: "85vh", display: "flex", flexDirection: "column" }}
-            onClick={e => e.stopPropagation()}
+            className="modal-dialog-box search-modal-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Search courses"
+            onClick={(e) => e.stopPropagation()}
           >
             {/* Search Input Bar */}
-            <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 16px", background: "#F8FAFC", border: "1.5px solid var(--primary-learner)", borderRadius: "var(--radius-md)", marginBottom: 14 }}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--primary-learner)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="11" cy="11" r="8"></circle>
-                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-              </svg>
-              <input
-                type="text"
-                autoFocus
-                placeholder="Search courses, skills, tools (e.g. AI, Figma, Video)..."
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-                style={{ flex: 1, border: "none", background: "transparent", fontSize: "1rem", outline: "none", color: "var(--text-primary)" }}
-              />
-              {searchQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSearchQuery("")}
-                  style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: "1.1rem", padding: "0 4px" }}
-                  title="Clear search"
-                >
-                  ✕
-                </button>
-              )}
-              <kbd style={{ fontSize: "0.72rem", background: "#E2E8F0", padding: "2px 6px", borderRadius: 4, color: "var(--text-muted)", fontWeight: 600 }}>ESC</kbd>
+            <div className="search-modal-header-row">
+              <div className="search-modal-input-bar">
+                <Search
+                  size={20}
+                  strokeWidth={2.2}
+                  color="var(--primary-learner)"
+                  aria-hidden="true"
+                  className="search-modal-leading-icon"
+                />
+                <input
+                  type="search"
+                  autoFocus
+                  className="search-modal-input"
+                  aria-label="Search courses, skills, or tools"
+                  placeholder="Search courses, skills, tools (e.g. AI, Figma, Video)..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    className="search-modal-clear-btn touch-target-44"
+                    onClick={() => setSearchQuery("")}
+                    title="Clear search query"
+                    aria-label="Clear search query"
+                  >
+                    <X size={18} aria-hidden="true" />
+                  </button>
+                )}
+                <kbd className="search-modal-esc-kbd" aria-hidden="true">
+                  ESC
+                </kbd>
+              </div>
+              <button
+                type="button"
+                className="search-modal-top-close-btn touch-target-44"
+                onClick={() => setShowSearchModal(false)}
+                title="Close search"
+                aria-label="Close search modal"
+              >
+                <X size={20} aria-hidden="true" />
+              </button>
             </div>
 
             {/* Quick Category Filter Chips */}
-            <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 8, marginBottom: 12 }}>
-              {["All", "Tech & Digital Skills", "Professional Skills"].map(cat => (
-                <button
-                  key={cat}
-                  type="button"
-                  onClick={() => setSearchCategory(cat)}
-                  className={`btn btn-sm ${searchCategory === cat ? "btn-solid-dark" : "btn-outline"}`}
-                  style={{ fontSize: "0.78rem", padding: "4px 12px", borderRadius: "99px", whiteSpace: "nowrap" }}
-                >
-                  {cat}
-                </button>
-              ))}
+            <div
+              className="search-modal-categories"
+              role="group"
+              aria-label="Filter courses by category"
+            >
+              {[
+                "All",
+                "Tech & Digital Skills",
+                "Professional Skills",
+                "Creative & Design",
+                "NYSC Guides",
+              ].map((cat) => {
+                const isSelected = searchCategory === cat;
+                return (
+                  <button
+                    key={cat}
+                    type="button"
+                    aria-pressed={isSelected}
+                    onClick={() => setSearchCategory(cat)}
+                    className={`search-category-pill touch-target-44 ${
+                      isSelected ? "active" : ""
+                    }`}
+                  >
+                    {cat}
+                  </button>
+                );
+              })}
             </div>
 
             {/* Results List */}
             <div
               data-scroll-lock-scrollable="true"
-              style={{ overflowY: "auto", overscrollBehavior: "contain", flex: 1, display: "flex", flexDirection: "column", gap: 10, paddingRight: 4, minHeight: 180 }}
+              className="search-modal-results-list"
+              role="region"
+              aria-label="Course search results"
             >
-              {filteredSearchCourses.length > 0 ? (
-                filteredSearchCourses.map(course => (
-                  <div
+              {searchLoading ? (
+                <div className="search-modal-empty" role="status" aria-live="polite">
+                  <div className="search-modal-empty-icon">
+                    <Search size={32} aria-hidden="true" />
+                  </div>
+                  <div className="search-modal-empty-title">Loading live courses...</div>
+                  <div className="search-modal-empty-sub">
+                    Verifying published course catalogue from server.
+                  </div>
+                </div>
+              ) : searchError ? (
+                <div className="search-modal-empty" role="alert">
+                  <div className="search-modal-empty-icon">
+                    <Search size={32} aria-hidden="true" />
+                  </div>
+                  <div className="search-modal-empty-title">Unable to load course catalogue</div>
+                  <div className="search-modal-empty-sub">{searchError}</div>
+                  <div style={{ marginTop: 12 }}>
+                    <button
+                      type="button"
+                      className="btn btn-outline btn-sm touch-target-44"
+                      onClick={loadLiveSearchCourses}
+                    >
+                      Retry
+                    </button>
+                  </div>
+                </div>
+              ) : filteredSearchCourses.length > 0 ? (
+                filteredSearchCourses.map((course) => (
+                  <button
                     key={course.id}
+                    type="button"
+                    className="search-result-card"
                     onClick={() => {
+                      const validId = typeof course?.id === "string" ? course.id.trim() : "";
+                      if (
+                        !validId ||
+                        course.status !== "published" ||
+                        course.deletionState ||
+                        course.deleted === true ||
+                        course.isDeleted === true
+                      ) {
+                        return;
+                      }
                       setShowSearchModal(false);
-                      navigate(`/course/${course.id}`);
-                    }}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 14,
-                      padding: "10px 14px",
-                      border: "1px solid var(--border-light)",
-                      borderRadius: "var(--radius-sm)",
-                      cursor: "pointer",
-                      transition: "background 0.15s, border-color 0.15s",
-                      background: "#FFFFFF"
-                    }}
-                    onMouseEnter={e => {
-                      e.currentTarget.style.background = "#F8FAFC";
-                      e.currentTarget.style.borderColor = "var(--primary-learner)";
-                    }}
-                    onMouseLeave={e => {
-                      e.currentTarget.style.background = "#FFFFFF";
-                      e.currentTarget.style.borderColor = "var(--border-light)";
+                      navigate(`/course/${encodeURIComponent(validId)}`);
                     }}
                   >
                     <img
                       src={course.image}
                       alt={course.title}
-                      style={{ width: 48, height: 48, borderRadius: 8, objectFit: "cover", flexShrink: 0 }}
+                      className="search-result-thumb"
+                      loading="lazy"
                     />
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
-                        <span className={`pill-badge ${course.badgeClass || "pill-tech"}`} style={{ fontSize: "0.65rem", padding: "1px 6px" }}>
-                          {course.badge}
+                    <div className="search-result-body">
+                      <div className="search-result-meta">
+                        <span
+                          className={`pill-badge ${
+                            course.badgeClass || "pill-tech"
+                          } search-result-badge`}
+                        >
+                          {course.category || course.badge || "Course"}
                         </span>
-                        <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>★ {course.rating} • {course.duration}</span>
+                        <span className="search-result-stats">
+                          ★ {course.rating || "4.8"} &bull;{" "}
+                          {course.duration || "Self-paced"}
+                          {course.level ? ` • ${course.level}` : ""}
+                        </span>
                       </div>
-                      <div style={{ fontWeight: 700, fontSize: "0.925rem", color: "var(--text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {course.title}
-                      </div>
-                      <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {course.description}
-                      </div>
+                      <div className="search-result-title">{course.title}</div>
+                      {course.description && (
+                        <div className="search-result-desc">
+                          {course.description}
+                        </div>
+                      )}
                     </div>
-                    <span style={{ fontSize: "0.85rem", color: "var(--primary-learner)", fontWeight: 600, flexShrink: 0 }}>
+                    <span className="search-result-action touch-target-44" aria-hidden="true">
                       View &rarr;
                     </span>
-                  </div>
+                  </button>
                 ))
               ) : (
-                <div style={{ padding: "36px 16px", textAlign: "center", color: "var(--text-muted)" }}>
-                  <div style={{ display: "flex", justifyContent: "center", marginBottom: 8, color: "var(--text-light)" }}>
+                <div className="search-modal-empty">
+                  <div className="search-modal-empty-icon">
                     <Search size={32} aria-hidden="true" />
                   </div>
-                  <div style={{ fontWeight: 600, fontSize: "1rem", color: "var(--text-primary)", marginBottom: 4 }}>
-                    No courses found
-                  </div>
-                  <div style={{ fontSize: "0.85rem" }}>
-                    No results for "{searchQuery}". Try searching for "AI", "Design", "Video", or "Broadcasting".
+                  <div className="search-modal-empty-title">No courses found</div>
+                  <div className="search-modal-empty-sub">
+                    {searchQuery
+                      ? `No published results for "${searchQuery}". Try searching for "AI", "Design", "Video", or "Broadcasting".`
+                      : `No published courses found in "${searchCategory}". Try selecting "All".`}
                   </div>
                 </div>
               )}
             </div>
 
             {/* Footer with Hint and Close Button */}
-            <div style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--border-light)", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.8rem", color: "var(--text-muted)" }}>
-              <span>Tip: Press <kbd style={{ background: "#E2E8F0", padding: "2px 5px", borderRadius: 3 }}>Ctrl</kbd> + <kbd style={{ background: "#E2E8F0", padding: "2px 5px", borderRadius: 3 }}>K</kbd> to open search anywhere</span>
+            <div className="search-modal-footer">
+              <span className="search-modal-shortcut-hint">
+                Tip: Press <kbd>Ctrl</kbd> + <kbd>K</kbd> to open search anywhere
+              </span>
               <button
-                className="btn btn-outline btn-sm"
+                type="button"
+                className="btn btn-outline btn-sm search-modal-close-btn touch-target-44"
                 onClick={() => setShowSearchModal(false)}
               >
                 Close

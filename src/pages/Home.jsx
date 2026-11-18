@@ -5,6 +5,8 @@ import { useAuth } from "../contexts/AuthContext";
 import { getUserActivity } from "../contexts/userActivity";
 import { useBodyScrollLock } from "../utils/scrollLock";
 import { COURSES_CATALOG } from "../data/courses";
+import brandSubmark from "../assets/brand-submark.png";
+import brandWordmark from "../assets/brand-wordmark.png";
 export { COURSES_CATALOG };
 
 // Swap in a local image by placing your file at public/assets/hero-photo.jpg
@@ -158,7 +160,7 @@ export default function Home() {
               <div className="hero-photo-frame">
                 <div className="hero-photo-fallback" aria-hidden="true">
                   <img
-                    src="/assets/aistudio/20260925_194828_31921ef2.png"
+                    src={brandSubmark}
                     alt=""
                     className="hero-photo-fallback-logo"
                   />
@@ -517,9 +519,9 @@ export default function Home() {
         <div style={{ maxWidth: 1280, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16 }}>
           <div className="brand-wrapper" style={{ fontSize: "1.1rem" }}>
             <div className="brand-logo-icon" style={{ width: 28, height: 28, fontSize: "0.85rem" }}>
-              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+              <img src={brandSubmark} alt="" className="brand-submark-img" />
             </div>
-            <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
+            <img src={brandWordmark} alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
           </div>
           <div style={{ fontSize: "0.85rem", color: "var(--text-muted)" }}>
             &copy; {new Date().getFullYear()} Peleekings Inc. Learn &bull; Practice &bull; Prove &bull; Progress

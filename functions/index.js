@@ -286,6 +286,24 @@ async function ensureUserRegNumber(uid, data = {}, options = {}) {
   const userRef = db.collection("users").doc(effectiveUid);
   let lastError = null;
 
+  // Discover any existing authoritative reservation in regNumbers owned by effectiveUid
+  let authoritativeOwnedCode = "";
+  try {
+    const ownedSnap = await db
+      .collection("regNumbers")
+      .where("uid", "==", effectiveUid)
+      .limit(1)
+      .get();
+    if (ownedSnap && !ownedSnap.empty) {
+      const ownedDoc = ownedSnap.docs[0];
+      if (ownedDoc && isValidRegNumberFormat(ownedDoc.id) && ownedDoc.data()?.uid === effectiveUid) {
+        authoritativeOwnedCode = ownedDoc.id.trim();
+      }
+    }
+  } catch {
+    // Proceed into transaction verification
+  }
+
   for (let round = 0; round < maxRounds; round++) {
     const { candidates } = buildRegNumberCandidates(data, batchSize, round * batchSize);
 
@@ -300,21 +318,28 @@ async function ensureUserRegNumber(uid, data = {}, options = {}) {
         const callerReg =
           typeof data.regNumber === "string" ? data.regNumber.trim() : "";
 
-        const existingCandidate = isValidRegNumberFormat(docReg)
-          ? docReg
-          : isValidRegNumberFormat(callerReg)
-            ? callerReg
-            : "";
+        const validDocReg = isValidRegNumberFormat(docReg) ? docReg : "";
+        const validAuthCode = isValidRegNumberFormat(authoritativeOwnedCode)
+          ? authoritativeOwnedCode
+          : "";
+        const validCallerReg = isValidRegNumberFormat(callerReg) ? callerReg : "";
+
+        const existingCandidate = validDocReg || validAuthCode || validCallerReg;
+        const isFromTrustedDocOrReservation = Boolean(validDocReg || validAuthCode);
 
         let conflictedCode = null;
 
         if (round === 0 && existingCandidate) {
           const existingRegRef = db.collection("regNumbers").doc(existingCandidate);
           const existingRegSnap = await transaction.get(existingRegRef);
+          const existingRegOwner = existingRegSnap.exists
+            ? existingRegSnap.data()?.uid
+            : null;
 
-          if (existingRegSnap.exists && existingRegSnap.data()?.uid === effectiveUid) {
+          if (existingRegSnap.exists && existingRegOwner === effectiveUid) {
             // Verified owner in regNumbers/{existingCandidate}
-            if (options.updateUserDoc !== false) {
+            const repairedFromReservation = userDocData.regNumber !== existingCandidate;
+            if (options.updateUserDoc !== false || repairedFromReservation) {
               const needsDocSync =
                 !userSnap.exists ||
                 userDocData.regNumber !== existingCandidate ||
@@ -339,12 +364,17 @@ async function ensureUserRegNumber(uid, data = {}, options = {}) {
               regNumber: existingCandidate,
               alreadyAssigned: true,
               verifiedOwnership: true,
-              repairedMapping: false,
+              repairedMapping: Boolean(repairedFromReservation && !validDocReg),
             };
           }
 
-          if (!existingRegSnap.exists) {
-            // Missing regNumbers/{existingCandidate} reservation — atomically claim/repair for effectiveUid
+          const isUnclaimedOrCorruptedMissingUid =
+            !existingRegSnap.exists ||
+            typeof existingRegOwner !== "string" ||
+            !existingRegOwner.trim();
+
+          if (isUnclaimedOrCorruptedMissingUid && isFromTrustedDocOrReservation) {
+            // Missing or corrupted regNumbers/{existingCandidate} reservation for a code already recorded on users/{effectiveUid}
             transaction.set(existingRegRef, {
               uid: effectiveUid,
               studentType: mergedData.studentType || "non_corper",
@@ -375,7 +405,7 @@ async function ensureUserRegNumber(uid, data = {}, options = {}) {
             };
           }
 
-          // Ownership conflict: regNumbers/{existingCandidate} is owned by a different uid!
+          // Ownership conflict or unverified caller-supplied code: allocate a fresh verified code
           conflictedCode = existingCandidate;
         }
 
@@ -390,7 +420,15 @@ async function ensureUserRegNumber(uid, data = {}, options = {}) {
 
         let chosenCode = null;
         let chosenRef = null;
+        let reusedExistingOwnedReservation = false;
+
         for (let i = 0; i < regSnaps.length; i++) {
+          if (regSnaps[i].exists && regSnaps[i].data()?.uid === effectiveUid) {
+            chosenCode = filteredCandidates[i];
+            chosenRef = candidateRefs[i];
+            reusedExistingOwnedReservation = true;
+            break;
+          }
           if (!regSnaps[i].exists) {
             chosenCode = filteredCandidates[i];
             chosenRef = candidateRefs[i];
@@ -402,13 +440,19 @@ async function ensureUserRegNumber(uid, data = {}, options = {}) {
           throw new Error("ALL_CANDIDATES_TAKEN");
         }
 
-        transaction.set(chosenRef, {
-          uid: effectiveUid,
-          studentType: mergedData.studentType || "non_corper",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+        if (!reusedExistingOwnedReservation) {
+          transaction.set(chosenRef, {
+            uid: effectiveUid,
+            studentType: mergedData.studentType || "non_corper",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
 
-        if (options.updateUserDoc !== false || (conflictedCode && userSnap && userSnap.exists)) {
+        if (
+          options.updateUserDoc !== false ||
+          reusedExistingOwnedReservation ||
+          (conflictedCode && userSnap && userSnap.exists)
+        ) {
           const userUpdates = {
             ...(options.initialUserFields || {}),
             regNumber: chosenCode,
@@ -425,13 +469,19 @@ async function ensureUserRegNumber(uid, data = {}, options = {}) {
 
         return {
           regNumber: chosenCode,
-          alreadyAssigned: false,
+          alreadyAssigned: reusedExistingOwnedReservation,
           verifiedOwnership: true,
+          ...(reusedExistingOwnedReservation ? { repairedMapping: true } : {}),
           replacedConflictingRegNumber: Boolean(conflictedCode),
         };
       });
 
-      if (result && result.regNumber) {
+      if (result && result.regNumber && isValidRegNumberFormat(result.regNumber)) {
+        // Post-transaction authoritative verification
+        const verifyRegSnap = await db.collection("regNumbers").doc(result.regNumber).get();
+        if (!verifyRegSnap.exists || verifyRegSnap.data()?.uid !== effectiveUid) {
+          throw new Error("REG_NUMBER_OWNERSHIP_VERIFICATION_FAILED");
+        }
         return result;
       }
     } catch (txErr) {
@@ -468,10 +518,12 @@ exports.generateUniqueRegNumber = generateUniqueRegNumber;
  * unique Registration Number in a single fast round-trip without waiting for background
  * trigger cold starts. Idempotent with onUserCreated.
  */
-exports.allocateRegistrationCode = onCall(async (request) => {
-  if (!request.auth) {
-    throw new HttpsError("unauthenticated", "Authentication required to allocate registration code.");
-  }
+exports.allocateRegistrationCode = onCall(
+  { enforceAppCheck: process.env.ENFORCE_APP_CHECK === "true" },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Authentication required to allocate registration code.");
+    }
 
   const uid = request.auth.uid;
   const payload = request.data || {};
@@ -659,7 +711,7 @@ exports.promoteToTutor = onCall(async (request) => {
   try {
     const applicantUser = await admin.auth().getUser(applicantUid);
     previousClaims = applicantUser.customClaims || {};
-  } catch (userErr) {
+  } catch {
     throw new HttpsError("not-found", `Applicant user account '${applicantUid}' not found in Firebase Auth.`);
   }
 
@@ -797,7 +849,7 @@ exports.assignAdminRole = onCall(async (request) => {
   let targetUser;
   try {
     targetUser = await admin.auth().getUser(targetUid);
-  } catch (err) {
+  } catch {
     throw new HttpsError("not-found", `Target user '${targetUid}' does not exist in Firebase Authentication.`);
   }
 
@@ -905,13 +957,23 @@ exports.manageEnrollmentStatus = onCall(async (request) => {
   const enrollmentData = enrollmentSnap.data();
   const courseId = enrollmentData.courseId;
 
+  const courseSnap = await db.collection("courses").doc(courseId).get();
+  if (courseSnap.exists) {
+    const cData = courseSnap.data() || {};
+    if (cData.status === "deleting" || cData.deletionState === "deleting") {
+      throw new HttpsError(
+        "failed-precondition",
+        `Course '${courseId}' is currently being deleted and cannot accept enrollment modifications.`
+      );
+    }
+  }
+
   // Verify course tutor assignment if caller is not an admin
   if (!isCallerAdmin) {
     if (!isCallerTutor) {
       throw new HttpsError("permission-denied", "Only administrators or assigned course instructors may update enrollment status.");
     }
 
-    const courseSnap = await db.collection("courses").doc(courseId).get();
     if (!courseSnap.exists) {
       throw new HttpsError("not-found", `Associated course '${courseId}' not found.`);
     }
@@ -1061,9 +1123,9 @@ exports.rejectTutorApplication = onCall(async (request) => {
 
 /**
  * 6. Callable Function: adminSetAccountStatus
- * - Admin-only callable to suspend or reactivate a learner/tutor account.
- * - Suspended accounts are disabled in Firebase Auth, refresh tokens revoked, and Firestore user doc updated.
- * - Prevents an administrator from suspending their own account.
+ * - Admin-only callable to suspend or reactivate a learner/tutor account with persistent operation
+ *   tracking (`accountStatusOperations/{targetUid}`), automatic Auth rollback on Firestore failure,
+ *   deactivated-tutor privilege protection, and final Auth + Firestore verification.
  */
 exports.adminSetAccountStatus = onCall(async (request) => {
   if (!request.auth || request.auth.token.admin !== true) {
@@ -1096,54 +1158,118 @@ exports.adminSetAccountStatus = onCall(async (request) => {
   }
 
   const userRef = db.collection("users").doc(targetUid);
-  const userSnap = await userRef.get();
-  const userData = userSnap.exists ? userSnap.data() : {};
-  const existingClaims = authUser?.customClaims || {};
+  const opRef = db.collection("accountStatusOperations").doc(targetUid);
+  const [userSnap, priorOpSnap] = await Promise.all([
+    userRef.get(),
+    opRef.get(),
+  ]);
+  const userData = userSnap.exists ? (userSnap.data() || {}) : {};
+  const priorOp = priorOpSnap.exists ? (priorOpSnap.data() || {}) : null;
+  const existingClaims = authUser?.customClaims ? { ...authUser.customClaims } : {};
+  const previousAuthDisabled = Boolean(authUser?.disabled);
 
-  if (userData.role === "admin" || existingClaims.admin === true) {
+  if (userData.role === "admin" || existingClaims.admin === true || existingClaims.role === "admin") {
     throw new HttpsError("failed-precondition", "Security Protection: Cannot suspend another administrator account.");
   }
 
-  const wasTutor =
-    userData.role === "tutor" ||
-    userData.previousRole === "tutor" ||
-    existingClaims.tutor === true;
+  // Strictly prevent restoring tutor privileges to a deactivated tutor even if previousRole === "tutor"
+  const isDeactivatedTutor =
+    userData.tutorStatus === "deactivated" ||
+    userData.tutorDeactivationState === "completed" ||
+    existingClaims.role === "deactivated";
 
-  // 2. Update Firebase Authentication disabled state and synchronize custom claims
-  try {
-    await admin.auth().updateUser(targetUid, { disabled: isSuspended });
-    if (isSuspended) {
-      if (existingClaims.tutor === true || existingClaims.role === "tutor") {
-        await admin.auth().setCustomUserClaims(targetUid, {
+  const wasActiveTutor =
+    !isDeactivatedTutor &&
+    (userData.role === "tutor" ||
+      (userData.status === "suspended" && userData.previousRole === "tutor") ||
+      existingClaims.tutor === true ||
+      existingClaims.role === "tutor" ||
+      (priorOp?.state === "in_progress" && priorOp?.wasActiveTutor === true));
+
+  const targetRole = wasActiveTutor ? "tutor" : "student";
+  const nextClaims = isSuspended
+    ? {
+        ...existingClaims,
+        admin: false,
+        tutor: false,
+        role: "student",
+        suspended: true,
+      }
+    : wasActiveTutor
+      ? {
+          ...existingClaims,
+          admin: false,
+          tutor: true,
+          role: "tutor",
+          suspended: false,
+        }
+      : {
           ...existingClaims,
           admin: false,
           tutor: false,
           role: "student",
-          suspended: true,
-        });
-      }
+          suspended: false,
+        };
+
+  // Record persistent operation state before mutating Auth or Firestore
+  await opRef.set(
+    {
+      targetUid,
+      targetStatus: status,
+      targetRole,
+      wasActiveTutor,
+      isDeactivatedTutor,
+      state: "in_progress",
+      previousAuthDisabled,
+      previousClaims: existingClaims,
+      previousFirestoreStatus: userData.status || "active",
+      previousFirestoreRole: userData.role || "student",
+      adminUid: callerUid,
+      startedAt: priorOp?.startedAt || admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  // 2. Update Firebase Authentication disabled state and synchronize custom claims (preserving unrelated claims)
+  try {
+    await admin.auth().updateUser(targetUid, { disabled: isSuspended });
+    await admin.auth().setCustomUserClaims(targetUid, nextClaims);
+    if (isSuspended) {
       await admin.auth().revokeRefreshTokens(targetUid);
-    } else if (wasTutor && userData.tutorStatus !== "deactivated") {
-      await admin.auth().setCustomUserClaims(targetUid, {
-        ...existingClaims,
-        admin: false,
-        tutor: true,
-        role: "tutor",
-        suspended: false,
-      });
     }
   } catch (disableErr) {
     console.error("Failed to update Firebase Auth user disabled state:", disableErr);
+    // Attempt best-effort rollback of partial Auth changes
+    try {
+      await admin.auth().updateUser(targetUid, { disabled: previousAuthDisabled });
+      await admin.auth().setCustomUserClaims(targetUid, existingClaims);
+    } catch {
+      // Ignore rollback secondary errors
+    }
+    await opRef.set(
+      {
+        state: "failed",
+        failedStage: "auth_update",
+        lastError: disableErr.message || String(disableErr),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
     throw new HttpsError("internal", "Failed to update authentication account state.");
   }
 
-  // 3. Update Firestore user profile
+  // 3. Update Firestore user profile, operation state, and audit log atomically
   const updates = {
     status,
+    role: targetRole,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
-  if (wasTutor && userData.tutorStatus !== "deactivated") {
+  if (isDeactivatedTutor) {
+    updates.role = "student";
+    updates.tutorStatus = "deactivated";
+  } else if (wasActiveTutor) {
     updates.previousRole = "tutor";
     updates.tutorStatus = isSuspended ? "suspended" : "active";
   }
@@ -1164,13 +1290,13 @@ exports.adminSetAccountStatus = onCall(async (request) => {
   batch.set(userRef, updates, { merge: true });
 
   const auditRef = db.collection("auditLogs").doc();
-  const roleLabel = wasTutor ? "Tutor" : "Learner";
+  const roleLabel = wasActiveTutor ? "Tutor" : "Learner";
   batch.set(auditRef, {
     action: isSuspended ? `${roleLabel} Suspended` : `${roleLabel} Reactivated`,
     detail: `${roleLabel} ${userData.email || targetUid} account status set to '${status}' by admin ${callerUid}.${isSuspended ? ` Reason: ${updates.suspensionReason}` : ""}`,
     targetUid,
     targetEmail: userData.email || "",
-    targetRole: wasTutor ? "tutor" : "student",
+    targetRole,
     status,
     reason: isSuspended ? updates.suspensionReason : null,
     adminUid: callerUid,
@@ -1178,8 +1304,90 @@ exports.adminSetAccountStatus = onCall(async (request) => {
     timestamp: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  await batch.commit();
-  return { success: true, targetUid, status, role: wasTutor ? "tutor" : (userData.role || "student") };
+  try {
+    await batch.commit();
+  } catch (fsErr) {
+    console.error("Firestore update failed in adminSetAccountStatus; rolling back Firebase Auth state:", fsErr);
+    let rollbackState = "rolled_back";
+    let rollbackErrorMsg = null;
+    try {
+      await admin.auth().updateUser(targetUid, { disabled: previousAuthDisabled });
+      await admin.auth().setCustomUserClaims(targetUid, existingClaims);
+    } catch (rbErr) {
+      rollbackState = "rollback_failed";
+      rollbackErrorMsg = rbErr.message || String(rbErr);
+      console.error("CRITICAL: Failed to roll back Auth state after Firestore failure:", rbErr);
+    }
+    try {
+      await opRef.set(
+        {
+          state: rollbackState,
+          failedStage: "firestore_commit",
+          lastError: fsErr.message || String(fsErr),
+          ...(rollbackErrorMsg ? { rollbackError: rollbackErrorMsg } : {}),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } catch {
+      // If Firestore is completely unreachable, opRef remains in_progress from step 1 for recovery
+    }
+    throw new HttpsError(
+      "internal",
+      `Failed to persist account status in Firestore (authentication state ${rollbackState === "rolled_back" ? "was safely rolled back" : "requires retry"}): ${fsErr.message}`
+    );
+  }
+
+  // 4. Verify final state in both Firebase Auth and Firestore before returning success
+  const [verifiedAuth, verifiedUserSnap] = await Promise.all([
+    admin.auth().getUser(targetUid),
+    userRef.get(),
+  ]);
+  const verifiedUserData = verifiedUserSnap.exists ? (verifiedUserSnap.data() || {}) : {};
+  const verifiedClaims = verifiedAuth?.customClaims || {};
+
+  const authMatches =
+    Boolean(verifiedAuth?.disabled) === isSuspended &&
+    Boolean(verifiedClaims.tutor) === Boolean(wasActiveTutor && !isSuspended);
+  const firestoreMatches =
+    verifiedUserSnap.exists &&
+    verifiedUserData.status === status &&
+    verifiedUserData.role === targetRole &&
+    (!isDeactivatedTutor || (verifiedUserData.role === "student" && verifiedClaims.tutor !== true));
+
+  if (!authMatches || !firestoreMatches) {
+    await opRef.set(
+      {
+        state: "failed",
+        failedStage: "post_verification",
+        lastError: "Post-update verification mismatch between Firebase Auth and Firestore.",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    throw new HttpsError(
+      "internal",
+      "Verification failed: Account state in Firebase Auth and Firestore did not match expected target state."
+    );
+  }
+
+  await opRef.set(
+    {
+      state: "completed",
+      failedStage: admin.firestore.FieldValue.delete(),
+      lastError: admin.firestore.FieldValue.delete(),
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  return {
+    success: true,
+    targetUid,
+    status,
+    role: targetRole,
+  };
 });
 
 /**
@@ -1262,6 +1470,13 @@ exports.adminAssignCourseTutor = onCall(async (request) => {
 
   const courseData = courseSnap.data();
   const isAssign = action !== "remove" && action !== "unassign";
+
+  if (isAssign && (courseData.status === "deleting" || courseData.deletionState === "deleting")) {
+    throw new HttpsError(
+      "failed-precondition",
+      `Cannot assign a tutor to course '${courseId}' while course deletion is in progress.`
+    );
+  }
 
   let tutorName = "Assigned Instructor";
   let tutorData = {};
@@ -1530,16 +1745,46 @@ exports.adminDeleteTutor = onCall(async (request) => {
 
   // Helper to discover all courses currently referencing targetUid
   const findAssignedCourseDocs = async () => {
-    const [byTutorIdSnap, byTutorUidSnap, byAssignedArraySnap] = await Promise.all([
+    const [byTutorIdSnap, byTutorUidSnap, byInstructorIdSnap, byAssignedArraySnap] = await Promise.all([
       db.collection("courses").where("tutorId", "==", targetUid).get(),
       db.collection("courses").where("tutorUid", "==", targetUid).get(),
+      db.collection("courses").where("instructorId", "==", targetUid).get(),
       db.collection("courses").where("assignedTutors", "array-contains", targetUid).get(),
     ]);
     const courseMap = new Map();
-    [byTutorIdSnap, byTutorUidSnap, byAssignedArraySnap].forEach((snap) => {
+    [byTutorIdSnap, byTutorUidSnap, byInstructorIdSnap, byAssignedArraySnap].forEach((snap) => {
       snap.docs.forEach((d) => courseMap.set(d.id, d));
     });
     return courseMap;
+  };
+
+  // Helper to verify that all private subcollections under users/{targetUid} are completely empty
+  const verifyUserSubcollectionsDeleted = async () => {
+    const [notifSnap, activitySnap] = await Promise.all([
+      userRef.collection("notifications").limit(1).get(),
+      userRef.collection("dailyActivity").limit(1).get(),
+    ]);
+    if (!notifSnap.empty || !activitySnap.empty) {
+      return false;
+    }
+    if (typeof userRef.listCollections !== "function") {
+      throw new Error(
+        `Subcollection verification failed for '${userRef.path}': listCollections() is required.`
+      );
+    }
+    const subCols = await userRef.listCollections();
+    if (!Array.isArray(subCols)) {
+      throw new Error(
+        `Subcollection verification failed for '${userRef.path}': listCollections() did not return an array.`
+      );
+    }
+    for (const col of subCols) {
+      const snap = await (typeof col.limit === "function" ? col.limit(1) : col).get();
+      if (!snap.empty) {
+        return false;
+      }
+    }
+    return true;
   };
 
   // 1. Discover all courses and tutorApplications associated with this tutor
@@ -1579,11 +1824,17 @@ exports.adminDeleteTutor = onCall(async (request) => {
           : "Assigned Instructor";
         courseUpdates.tutorId = nextTutorUid;
         courseUpdates.tutorUid = nextTutorUid;
+        if (cData.instructorId === targetUid) {
+          courseUpdates.instructorId = nextTutorUid;
+        }
         courseUpdates.tutorName = nextTutorName;
         courseUpdates.needsTutorReassignment = false;
       } else {
         courseUpdates.tutorId = null;
         courseUpdates.tutorUid = null;
+        if (cData.instructorId === targetUid) {
+          courseUpdates.instructorId = null;
+        }
         courseUpdates.tutorName = null;
         courseUpdates.needsTutorReassignment = true;
         courseUpdates.previousTutorUid = targetUid;
@@ -1739,22 +1990,30 @@ exports.adminDeleteTutor = onCall(async (request) => {
   // mode === "delete": Safe, Resumable Permanent Tutor Deletion State Machine
   // ══════════════════════════════════════════════════════════════════════════
 
-  // If this is a retry of an already completed deletion and nothing remains to clean up, return idempotently
+  // Verify completed state before returning idempotently on retry
   if (
     priorDeletion?.deletionState === "completed" &&
     !userSnap.exists &&
     !authUser &&
     stageOperations.length === 0
   ) {
-    return {
-      success: true,
-      targetUid,
-      mode: "delete",
-      deletionState: "completed",
-      idempotentRetry: true,
-      unassignedCourseIds,
-      coursesNeedingReassignment,
-    };
+    let subcollectionsVerifiedClean = false;
+    try {
+      subcollectionsVerifiedClean = await verifyUserSubcollectionsDeleted();
+    } catch {
+      subcollectionsVerifiedClean = false;
+    }
+    if (subcollectionsVerifiedClean) {
+      return {
+        success: true,
+        targetUid,
+        mode: "delete",
+        deletionState: "completed",
+        idempotentRetry: true,
+        unassignedCourseIds,
+        coursesNeedingReassignment,
+      };
+    }
   }
 
   // Stage 1: Archive user metadata & record deletion operation state (`in_progress`) BEFORE mutating courses or Auth
@@ -1907,8 +2166,9 @@ exports.adminDeleteTutor = onCall(async (request) => {
     { merge: true }
   );
 
-  // Stage 3: Delete user-private subcollections in bounded batches (<= 350) and delete users/{targetUid}
+  // Stage 3: Discover and recursively delete ALL user-private subcollections in bounded batches (<= 350) and delete users/{targetUid}
   try {
+    await deleteSubcollectionsRecursively(userRef, 350);
     await deleteQueryInBoundedBatches(userRef.collection("notifications"), 350);
     await deleteQueryInBoundedBatches(userRef.collection("dailyActivity"), 350);
     await userRef.delete();
@@ -1928,13 +2188,28 @@ exports.adminDeleteTutor = onCall(async (request) => {
     );
   }
 
-  // Verify Stage 3: Confirm users/{targetUid} and private subcollections are removed
-  const [afterUserSnap, afterNotifSnap, afterActivitySnap] = await Promise.all([
-    userRef.get(),
-    userRef.collection("notifications").limit(1).get(),
-    userRef.collection("dailyActivity").limit(1).get(),
-  ]);
-  if (afterUserSnap.exists || !afterNotifSnap.empty || !afterActivitySnap.empty) {
+  // Verify Stage 3: Confirm users/{targetUid} and ALL discovered private subcollections are removed
+  let subcollectionsClean = false;
+  try {
+    subcollectionsClean = await verifyUserSubcollectionsDeleted();
+  } catch (verifySubErr) {
+    await deletedUserRef.set(
+      {
+        deletionState: "failed",
+        failedStage: "verify_firestore_user_deletion",
+        lastError: verifySubErr.message || String(verifySubErr),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    throw new HttpsError(
+      "internal",
+      `Verification failed: ${verifySubErr.message}`
+    );
+  }
+
+  const afterUserSnap = await userRef.get();
+  if (afterUserSnap.exists || !subcollectionsClean) {
     await deletedUserRef.set(
       {
         deletionState: "failed",
@@ -1981,6 +2256,45 @@ exports.adminDeleteTutor = onCall(async (request) => {
         `Firestore records were archived and cleaned, but Firebase Authentication deletion failed (retry to complete): ${authDelErr.message}`
       );
     }
+  }
+
+  // Verify Stage 4: Confirm the Firebase Authentication account no longer exists
+  let authStillExists = false;
+  try {
+    await admin.auth().getUser(targetUid);
+    authStillExists = true;
+  } catch (verifyAuthErr) {
+    if (verifyAuthErr?.code !== "auth/user-not-found") {
+      await deletedUserRef.set(
+        {
+          deletionState: "failed",
+          failedStage: "verify_auth_user_deletion",
+          lastError: verifyAuthErr.message || String(verifyAuthErr),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      throw new HttpsError(
+        "internal",
+        `Failed to verify Firebase Authentication account removal: ${verifyAuthErr.message}`
+      );
+    }
+  }
+
+  if (authStillExists) {
+    await deletedUserRef.set(
+      {
+        deletionState: "failed",
+        failedStage: "verify_auth_user_deletion",
+        lastError: `Firebase Auth account '${targetUid}' still exists after deleteUser().`,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    throw new HttpsError(
+      "internal",
+      `Verification failed: Firebase Authentication account '${targetUid}' still exists after deletion.`
+    );
   }
 
   // Stage 5: Finalize deletion state to `completed` and write authoritative audit log
@@ -2031,18 +2345,20 @@ exports.adminDeleteTutor = onCall(async (request) => {
 });
 
 /**
- * 9. Callable Function: adminPublishAnnouncement
- * - Admin-only callable to create, publish, or edit an announcement.
+ * 9. Callable Function: adminPublishAnnouncement (also exported as adminManageAnnouncement)
+ * - Admin-only callable to create, publish, unpublish, edit, or delete an announcement.
  * - Supports audience targeting ('all', 'learners', 'tutors', 'course') and pinned status.
  */
-exports.adminPublishAnnouncement = onCall(async (request) => {
+const adminPublishAnnouncementHandler = onCall(async (request) => {
   if (!request.auth || request.auth.token.admin !== true) {
     throw new HttpsError("permission-denied", "Access denied: Verified administrator privileges required.");
   }
 
   const callerUid = request.auth.uid;
   const {
+    action,
     id,
+    announcementId: rawAnnouncementId,
     title,
     body,
     category,
@@ -2054,39 +2370,194 @@ exports.adminPublishAnnouncement = onCall(async (request) => {
     expiresAt,
   } = request.data || {};
 
-  if (!title || typeof title !== "string" || !title.trim()) {
+  const targetId = id || rawAnnouncementId || null;
+
+  if (action === "delete") {
+    if (!targetId || typeof targetId !== "string") {
+      throw new HttpsError("invalid-argument", "Valid announcementId is required for deletion.");
+    }
+    const annRef = db.collection("announcements").doc(targetId);
+    const existingSnap = await annRef.get();
+    const existingTitle = existingSnap.exists ? existingSnap.data()?.title : (title || targetId);
+
+    const delBatch = db.batch();
+    delBatch.delete(annRef);
+    delBatch.set(db.collection("auditLogs").doc(), {
+      action: "Announcement Deleted",
+      detail: `Deleted announcement '${existingTitle || targetId}' (${targetId}) by admin ${callerUid}`,
+      announcementId: targetId,
+      adminUid: callerUid,
+      badge: "pill-danger",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await delBatch.commit();
+    return { success: true, announcementId: targetId, action: "delete" };
+  }
+
+  const announcementId = targetId || `ann_${Date.now()}`;
+  const announcementRef = db.collection("announcements").doc(announcementId);
+
+  const existingSnap = targetId ? await announcementRef.get() : { exists: false };
+  const isNew = !existingSnap.exists;
+  const existingData = existingSnap.exists ? (existingSnap.data() || {}) : {};
+
+  if ((action === "publish" || action === "unpublish" || action === "update") && isNew) {
+    throw new HttpsError("not-found", `Announcement '${announcementId}' does not exist.`);
+  }
+
+  const resolvedTitle = typeof title === "string" && title.trim() ? title.trim() : existingData.title;
+  const resolvedBody = typeof body === "string" && body.trim() ? body.trim() : existingData.body;
+
+  if (!resolvedTitle || typeof resolvedTitle !== "string" || !resolvedTitle.trim()) {
     throw new HttpsError("invalid-argument", "Announcement title is required.");
   }
 
-  if (!body || typeof body !== "string" || !body.trim()) {
+  if (!resolvedBody || typeof resolvedBody !== "string" || !resolvedBody.trim()) {
     throw new HttpsError("invalid-argument", "Announcement body content is required.");
   }
 
+  const rawAudience = audience !== undefined ? audience : (existingData.audience || "all");
+  const audienceAliasMap = {
+    all_learners: "learners",
+    all_tutors: "tutors",
+    all_users: "all",
+  };
+  const mappedAudience = audienceAliasMap[rawAudience] || rawAudience;
   const validAudiences = ["all", "learners", "tutors", "course"];
-  const selectedAudience = validAudiences.includes(audience) ? audience : "all";
-  const pubStatus = status === "draft" ? "draft" : "published";
+  const selectedAudience = validAudiences.includes(mappedAudience) ? mappedAudience : "all";
+  const resolvedCourseId = courseId !== undefined ? courseId : existingData.courseId;
 
-  const announcementId = id || `ann_${Date.now()}`;
-  const announcementRef = db.collection("announcements").doc(announcementId);
+  if (selectedAudience === "course") {
+    const trimmedCourseId = typeof resolvedCourseId === "string" ? resolvedCourseId.trim() : "";
+    if (!trimmedCourseId || trimmedCourseId === "general" || trimmedCourseId === "platform") {
+      throw new HttpsError("invalid-argument", "Target courseId is required for course-specific announcements.");
+    }
+    const courseCheckSnap = await db.collection("courses").doc(trimmedCourseId).get();
+    if (
+      !courseCheckSnap.exists ||
+      courseCheckSnap.data()?.status === "deleting" ||
+      courseCheckSnap.data()?.status === "deleted" ||
+      courseCheckSnap.data()?.deletionState === "deleting"
+    ) {
+      throw new HttpsError("not-found", `Target course '${trimmedCourseId}' was not found or is being deleted.`);
+    }
+  }
+
+  let pubStatus = "published";
+  if (action === "unpublish") {
+    pubStatus = "draft";
+  } else if (action === "publish") {
+    pubStatus = "published";
+  } else if (status !== undefined) {
+    pubStatus = status === "draft" ? "draft" : "published";
+  } else if (existingData.status) {
+    pubStatus = existingData.status === "draft" ? "draft" : "published";
+  }
+
+  const resolvedAction = action || (isNew ? "create" : "update");
+  const resolvedPriority = priority !== undefined ? priority : existingData.priority;
+  const resolvedPinned = pinned !== undefined ? Boolean(pinned) : Boolean(existingData.pinned);
 
   const payload = {
-    title: title.trim(),
-    body: body.trim(),
-    category: (category || "General").trim(),
-    priority: priority === "high" || priority === "urgent" ? priority : "normal",
+    id: announcementId,
+    title: resolvedTitle.trim(),
+    body: resolvedBody.trim(),
+    category: (category || existingData.category || "General").trim(),
+    priority: resolvedPriority === "high" || resolvedPriority === "urgent" ? resolvedPriority : "normal",
     audience: selectedAudience,
-    courseId: selectedAudience === "course" && courseId ? courseId : null,
-    pinned: Boolean(pinned),
+    courseId: selectedAudience === "course" && resolvedCourseId ? resolvedCourseId.trim() : null,
+    pinned: resolvedPinned,
     status: pubStatus,
-    authorUid: callerUid,
+    authorUid: existingData.authorUid || callerUid,
+    updatedBy: callerUid,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
-  if (expiresAt) {
-    payload.expiresAt = admin.firestore.Timestamp.fromDate(new Date(expiresAt));
+  if (pubStatus === "published" && (!existingData.publishedAt || existingData.status !== "published")) {
+    payload.publishedAt = admin.firestore.FieldValue.serverTimestamp();
   }
 
-  const isNew = !id;
+  const FAR_FUTURE_EXPIRES_DATE = new Date("9999-12-31T23:59:59.000Z");
+
+  function parseAndValidateAnnouncementExpiration(val) {
+    if (val === null || val === "") {
+      return {
+        timestamp: admin.firestore.Timestamp.fromDate(FAR_FUTURE_EXPIRES_DATE),
+        hasExplicitExpiration: false,
+      };
+    }
+    if (typeof val === "string") {
+      const trimmed = val.trim();
+      if (!trimmed || !/^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$/.test(trimmed)) {
+        throw new HttpsError(
+          "invalid-argument",
+          "Invalid expiresAt value. Provide a valid YYYY-MM-DD or ISO-8601 date string, or leave blank."
+        );
+      }
+      const normalizedIso = /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+        ? `${trimmed}T23:59:59.999Z`
+        : trimmed;
+      const parsedDate = new Date(normalizedIso);
+      if (
+        Number.isNaN(parsedDate.getTime()) ||
+        parsedDate.getUTCFullYear() < 1970 ||
+        parsedDate.getUTCFullYear() > 9999
+      ) {
+        throw new HttpsError("invalid-argument", "Invalid expiresAt date value.");
+      }
+      return {
+        timestamp: admin.firestore.Timestamp.fromDate(parsedDate),
+        hasExplicitExpiration: parsedDate.getUTCFullYear() < 9000,
+      };
+    }
+    if (val && typeof val === "object" && typeof val.toDate === "function") {
+      const dt = val.toDate();
+      if (!(dt instanceof Date) || Number.isNaN(dt.getTime())) {
+        throw new HttpsError("invalid-argument", "Invalid expiresAt Timestamp value.");
+      }
+      return {
+        timestamp: admin.firestore.Timestamp.fromDate(dt),
+        hasExplicitExpiration: dt.getUTCFullYear() < 9000,
+      };
+    }
+    if (
+      val &&
+      typeof val === "object" &&
+      typeof val.seconds === "number" &&
+      Number.isFinite(val.seconds)
+    ) {
+      const dt = new Date(val.seconds * 1000);
+      if (Number.isNaN(dt.getTime())) {
+        throw new HttpsError("invalid-argument", "Invalid expiresAt Timestamp seconds.");
+      }
+      return {
+        timestamp: admin.firestore.Timestamp.fromDate(dt),
+        hasExplicitExpiration: dt.getUTCFullYear() < 9000,
+      };
+    }
+    throw new HttpsError(
+      "invalid-argument",
+      "Invalid expiresAt value. Must be a valid date string, Timestamp, or empty for no expiration."
+    );
+  }
+
+  if (expiresAt !== undefined) {
+    const resolvedExp = parseAndValidateAnnouncementExpiration(expiresAt);
+    payload.expiresAt = resolvedExp.timestamp;
+    payload.hasExplicitExpiration = resolvedExp.hasExplicitExpiration;
+  } else if (
+    existingData.expiresAt === undefined ||
+    existingData.expiresAt === null ||
+    existingData.expiresAt === ""
+  ) {
+    payload.expiresAt = admin.firestore.Timestamp.fromDate(FAR_FUTURE_EXPIRES_DATE);
+    payload.hasExplicitExpiration = false;
+  } else {
+    const existingExp = parseAndValidateAnnouncementExpiration(existingData.expiresAt);
+    payload.expiresAt = existingExp.timestamp;
+    payload.hasExplicitExpiration = existingExp.hasExplicitExpiration;
+  }
+
   if (isNew) {
     payload.createdAt = admin.firestore.FieldValue.serverTimestamp();
   }
@@ -2097,33 +2568,293 @@ exports.adminPublishAnnouncement = onCall(async (request) => {
   const auditRef = db.collection("auditLogs").doc();
   batch.set(auditRef, {
     action: isNew ? "Announcement Created" : "Announcement Updated",
-    detail: `Announcement '${title.trim()}' (${pubStatus}, audience: ${selectedAudience}) by admin ${callerUid}`,
+    detail: `Announcement '${resolvedTitle.trim()}' (${pubStatus}, audience: ${selectedAudience}) by admin ${callerUid}`,
     announcementId,
-    title: title.trim(),
+    title: resolvedTitle.trim(),
     status: pubStatus,
     audience: selectedAudience,
+    courseId: payload.courseId,
     adminUid: callerUid,
     badge: pubStatus === "published" ? "pill-success" : "pill-tech",
     timestamp: admin.firestore.FieldValue.serverTimestamp(),
   });
 
   await batch.commit();
-  return { success: true, announcementId, status: pubStatus };
+  return {
+    success: true,
+    announcementId,
+    action: resolvedAction,
+    status: pubStatus,
+    isNew,
+  };
 });
+exports.adminPublishAnnouncement = adminPublishAnnouncementHandler;
+exports.adminManageAnnouncement = adminPublishAnnouncementHandler;
 
 /**
- * 10. Callable Function: adminSendNotification
- * - Admin-only callable to dispatch notifications to targeted audiences.
- * - Targets: 'all_learners', 'all_tutors', 'course', 'single_user'.
- * - When target === 'course', strictly filters enrollments to active/approved only.
+ * Controlled Migration Callable: migrateAnnouncementExpirations
+ * - Normalizes legacy announcements with missing, null, empty-string, or ISO-string `expiresAt`
+ *   to a consistent Firestore Timestamp (`9999-12-31T23:59:59.000Z` when no expiration was set).
+ * - Flags any malformed `expiresAt` values and quarantines them to `draft` status so malformed
+ *   expiration values are never treated as valid published announcements.
  */
-exports.adminSendNotification = onCall(async (request) => {
+exports.migrateAnnouncementExpirations = onCall(async (request) => {
   if (!request.auth || request.auth.token.admin !== true) {
     throw new HttpsError("permission-denied", "Access denied: Verified administrator privileges required.");
   }
 
   const callerUid = request.auth.uid;
-  const { target, targetId, title, body, type, courseId } = request.data || {};
+  const { dryRun = false, quarantineMalformed = true } = request.data || {};
+  const farFutureDate = new Date("9999-12-31T23:59:59.000Z");
+  const farFutureTs = admin.firestore.Timestamp.fromDate(farFutureDate);
+
+  const pageRes = await paginateBroadcastQuery(db.collection("announcements"), 250);
+  let migratedCount = 0;
+  let alreadyValidCount = 0;
+  let malformedCount = 0;
+  const migratedIds = [];
+  const malformedIds = [];
+  const pendingWrites = [];
+
+  for (const d of pageRes.docs) {
+    const data = d.data() || {};
+    const rawExp = data.expiresAt;
+
+    if (rawExp === undefined || rawExp === null || rawExp === "") {
+      migratedCount++;
+      migratedIds.push(d.id);
+      pendingWrites.push({
+        ref: db.collection("announcements").doc(d.id),
+        data: {
+          expiresAt: farFutureTs,
+          hasExplicitExpiration: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      });
+      continue;
+    }
+
+    if (rawExp && typeof rawExp === "object" && typeof rawExp.toDate === "function") {
+      const dt = rawExp.toDate();
+      if (dt instanceof Date && !Number.isNaN(dt.getTime())) {
+        alreadyValidCount++;
+        continue;
+      }
+    }
+
+    if (typeof rawExp === "string") {
+      const trimmed = rawExp.trim();
+      if (/^\d{4}-\d{2}-\d{2}(?:[T\s].*)?$/.test(trimmed)) {
+        const normalizedIso = /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+          ? `${trimmed}T23:59:59.999Z`
+          : trimmed;
+        const parsedDate = new Date(normalizedIso);
+        if (
+          !Number.isNaN(parsedDate.getTime()) &&
+          parsedDate.getUTCFullYear() >= 1970 &&
+          parsedDate.getUTCFullYear() <= 9999
+        ) {
+          migratedCount++;
+          migratedIds.push(d.id);
+          pendingWrites.push({
+            ref: db.collection("announcements").doc(d.id),
+            data: {
+              expiresAt: admin.firestore.Timestamp.fromDate(parsedDate),
+              hasExplicitExpiration: parsedDate.getUTCFullYear() < 9000,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+          });
+          continue;
+        }
+      }
+    }
+
+    // Malformed expiration value detected
+    malformedCount++;
+    malformedIds.push(d.id);
+    if (quarantineMalformed && data.status === "published") {
+      pendingWrites.push({
+        ref: db.collection("announcements").doc(d.id),
+        data: {
+          status: "draft",
+          malformedExpirationQuarantined: true,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      });
+    }
+  }
+
+  if (!dryRun && pendingWrites.length > 0) {
+    const chunkSize = 350;
+    for (let i = 0; i < pendingWrites.length; i += chunkSize) {
+      const chunk = pendingWrites.slice(i, i + chunkSize);
+      const batch = db.batch();
+      for (const op of chunk) {
+        batch.set(op.ref, op.data, { merge: true });
+      }
+      await batch.commit();
+    }
+
+    await db.collection("auditLogs").add({
+      action: "Announcement Expirations Migrated",
+      detail: `Normalized ${migratedCount} announcement(s), quarantined ${malformedCount} malformed announcement(s) by admin ${callerUid}`,
+      migratedCount,
+      alreadyValidCount,
+      malformedCount,
+      malformedIds,
+      adminUid: callerUid,
+      badge: "pill-tech",
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+
+  return {
+    success: true,
+    dryRun: Boolean(dryRun),
+    migratedCount,
+    alreadyValidCount,
+    malformedCount,
+    migratedIds,
+    malformedIds,
+  };
+});
+
+/**
+ * Helper: Safely paginate through an entire Firestore collection/query without a 500-document cap.
+ * Tracks whether all pages succeeded so callers never claim complete delivery if a page failed.
+ */
+async function paginateBroadcastQuery(baseQuery, pageSize = 250) {
+  const allDocs = [];
+  const seenDocIds = new Set();
+  let lastDoc = null;
+  let pagesRead = 0;
+  let paginationIncomplete = false;
+  let paginationError = null;
+  const orderedQuery =
+    baseQuery && typeof baseQuery.orderBy === "function" ? baseQuery.orderBy("__name__") : baseQuery;
+
+  while (true) {
+    let pageQuery = orderedQuery;
+    if (lastDoc && pageQuery && typeof pageQuery.startAfter === "function") {
+      pageQuery = pageQuery.startAfter(lastDoc);
+    }
+    if (pageQuery && typeof pageQuery.limit === "function") {
+      pageQuery = pageQuery.limit(pageSize);
+    }
+    let snap;
+    try {
+      snap = await pageQuery.get();
+    } catch (err) {
+      paginationIncomplete = true;
+      paginationError = err?.message || String(err);
+      break;
+    }
+    pagesRead++;
+    const pageDocs = snap?.docs || [];
+    if (pageDocs.length === 0) {
+      break;
+    }
+
+    let newDocsInPage = 0;
+    for (const d of pageDocs) {
+      if (d && d.id && !seenDocIds.has(d.id)) {
+        seenDocIds.add(d.id);
+        allDocs.push(d);
+        newDocsInPage++;
+      }
+    }
+
+    if (pageDocs.length < pageSize || newDocsInPage === 0) {
+      break;
+    }
+    lastDoc = pageDocs[pageDocs.length - 1];
+  }
+
+  return {
+    docs: allDocs,
+    pagesRead,
+    paginationIncomplete,
+    paginationError,
+  };
+}
+
+/**
+ * Helper: Determine whether a user account is eligible to receive broadcasts.
+ * Excludes suspended, deleted, disabled, archived, or missing accounts.
+ */
+function isBroadcastRecipientEligible(userData, uid, deletedUserIdsSet) {
+  if (!uid || typeof uid !== "string" || !uid.trim()) return false;
+  if (deletedUserIdsSet && deletedUserIdsSet.has(uid)) return false;
+  if (!userData || typeof userData !== "object") return false;
+  const ineligibleStatuses = new Set(["suspended", "deleted", "disabled", "inactive", "banned", "revoked"]);
+  if (typeof userData.status === "string" && ineligibleStatuses.has(userData.status.trim().toLowerCase())) {
+    return false;
+  }
+  if (
+    userData.deleted === true ||
+    userData.isDeleted === true ||
+    userData.disabled === true ||
+    userData.suspended === true ||
+    Boolean(userData.deletionState)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Helper: Build a deterministic reservation document ID scoped to the administrator and broadcast key/content.
+ */
+function buildBroadcastReservationId(callerUid, signature) {
+  let h1 = 0xdeadbeef ^ signature.length;
+  let h2 = 0x41c6ce57 ^ signature.length;
+  for (let i = 0; i < signature.length; i++) {
+    const ch = signature.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  const hashHex = (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
+  const safeCaller = String(callerUid || "admin").replace(/[^a-zA-Z0-9_-]/g, "_");
+  return `bcast_res_${safeCaller}_${hashHex}`;
+}
+
+/**
+ * 10. Callable Function: adminSendNotification (also exported as adminSendBroadcast)
+ * - Admin-only callable to dispatch notifications/broadcasts to targeted audiences.
+ * - Targets: 'all_learners', 'all_tutors', 'all_users', 'course', 'single_user'.
+ * - Uses atomic Firestore transaction reservations with worker leases and lease expiry.
+ * - Tracks per-recipient delivery state in `broadcasts/{broadcastId}/recipients/{uid}`.
+ * - Checkpoints progress after every notification batch (<= 350 ops per batch).
+ * - Preserves existing notification `read` state and recognizes notifications created before a checkpoint crash.
+ */
+const DEFAULT_BROADCAST_LEASE_DURATION_MS = 60000;
+
+const adminSendNotificationHandler = onCall(async (request) => {
+  if (!request.auth || request.auth.token.admin !== true) {
+    throw new HttpsError("permission-denied", "Access denied: Verified administrator privileges required.");
+  }
+
+  const callerUid = request.auth.uid;
+  const {
+    target: rawTargetParam,
+    targetType: rawTargetTypeParam,
+    targetId,
+    title,
+    body: rawBodyParam,
+    message: rawMessageParam,
+    type,
+    courseId,
+    link,
+    idempotencyKey,
+    __leaseDurationMs,
+    __simulateTerminateAfterBatch,
+    __simulateTerminateBeforeCheckpointBatch,
+  } = request.data || {};
+
+  const target = rawTargetParam || rawTargetTypeParam || "all_learners";
+  const body = rawBodyParam !== undefined ? rawBodyParam : rawMessageParam;
 
   if (!title || typeof title !== "string" || !title.trim()) {
     throw new HttpsError("invalid-argument", "Notification title is required.");
@@ -2133,78 +2864,730 @@ exports.adminSendNotification = onCall(async (request) => {
     throw new HttpsError("invalid-argument", "Notification body is required.");
   }
 
-  let recipientUids = [];
-
-  if (target === "single_user") {
-    if (!targetId) throw new HttpsError("invalid-argument", "targetId (user UID) is required.");
-    recipientUids = [targetId];
-  } else if (target === "course") {
-    const targetCourse = targetId || courseId;
-    if (!targetCourse) throw new HttpsError("invalid-argument", "courseId is required for course targeting.");
-    const enrSnap = await db.collection("enrollments").where("courseId", "==", targetCourse).limit(500).get();
-    recipientUids = Array.from(
-      new Set(
-        enrSnap.docs
-          .filter((d) => ["active", "approved"].includes(d.data()?.status))
-          .map((d) => d.data()?.uid)
-          .filter(Boolean)
-      )
+  const validTargets = ["all_learners", "all_tutors", "all_users", "course", "single_user"];
+  if (!validTargets.includes(target)) {
+    throw new HttpsError(
+      "invalid-argument",
+      `Invalid target audience '${target}'. Must be one of: ${validTargets.join(", ")}.`
     );
-  } else if (target === "all_tutors") {
-    const tutorSnap = await db.collection("users").where("role", "==", "tutor").limit(200).get();
-    recipientUids = tutorSnap.docs.map((d) => d.id);
-  } else {
-    // all_learners (limit batch to 500 for safety)
-    const learnerSnap = await db.collection("users").where("role", "==", "student").limit(500).get();
-    recipientUids = learnerSnap.docs.map((d) => d.id);
   }
 
-  let writtenCount = 0;
-  const batches = [];
-  let currentBatch = db.batch();
-  let opCount = 0;
+  const cleanTitle = title.trim();
+  const cleanBody = body.trim();
+  const resolvedCourseId =
+    (typeof courseId === "string" && courseId.trim() ? courseId.trim() : null) ||
+    (target === "course" && typeof targetId === "string" && targetId.trim() ? targetId.trim() : null) ||
+    null;
+  const resolvedTargetId =
+    (typeof targetId === "string" && targetId.trim() ? targetId.trim() : null) || resolvedCourseId || null;
 
-  for (const uid of recipientUids) {
-    const notifRef = db.collection("users").doc(uid).collection("notifications").doc();
-    currentBatch.set(notifRef, {
-      title: title.trim(),
-      body: body.trim(),
-      type: type || "announcement",
-      courseId: courseId || (target === "course" ? targetId : null) || null,
-      read: false,
-      senderUid: callerUid,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    opCount++;
-    writtenCount++;
-
-    if (opCount >= 400) {
-      batches.push(currentBatch.commit());
-      currentBatch = db.batch();
-      opCount = 0;
+  // Validate target course or single_user parameters before acquiring an idempotency reservation
+  if (target === "single_user") {
+    if (!resolvedTargetId) {
+      throw new HttpsError("invalid-argument", "targetId (user UID) is required.");
+    }
+    const [targetUserSnap, deletedUserSnap] = await Promise.all([
+      db.collection("users").doc(resolvedTargetId).get(),
+      db.collection("deletedUsers").doc(resolvedTargetId).get(),
+    ]);
+    if (!targetUserSnap.exists) {
+      throw new HttpsError("not-found", `Recipient user '${resolvedTargetId}' was not found.`);
+    }
+    const singleDeletedSet = deletedUserSnap.exists ? new Set([resolvedTargetId]) : new Set();
+    if (!isBroadcastRecipientEligible(targetUserSnap.data(), resolvedTargetId, singleDeletedSet)) {
+      throw new HttpsError(
+        "failed-precondition",
+        `Recipient user '${resolvedTargetId}' is suspended, deleted, or ineligible to receive broadcasts.`
+      );
+    }
+  } else if (target === "course") {
+    if (!resolvedCourseId || resolvedCourseId === "general" || resolvedCourseId === "platform") {
+      throw new HttpsError("invalid-argument", "A valid courseId is required for course targeting.");
+    }
+    const targetCourseSnap = await db.collection("courses").doc(resolvedCourseId).get();
+    if (!targetCourseSnap.exists) {
+      throw new HttpsError("not-found", `Target course '${resolvedCourseId}' does not exist.`);
+    }
+    const targetCourseData = targetCourseSnap.data() || {};
+    if (
+      targetCourseData.status === "deleting" ||
+      targetCourseData.status === "deleted" ||
+      targetCourseData.deletionState === "deleting" ||
+      targetCourseData.deleted === true
+    ) {
+      throw new HttpsError(
+        "failed-precondition",
+        `Target course '${resolvedCourseId}' is being deleted or is unavailable.`
+      );
     }
   }
 
-  if (opCount > 0) {
-    batches.push(currentBatch.commit());
+  const cleanIdempotencyKey =
+    typeof idempotencyKey === "string" && idempotencyKey.trim() ? idempotencyKey.trim() : null;
+  const dedupeSignature = cleanIdempotencyKey
+    ? `${callerUid}::idemp::${cleanIdempotencyKey}`
+    : `${callerUid}::${target}::${resolvedTargetId || ""}::${cleanTitle}::${cleanBody}`;
+  const reservationId = buildBroadcastReservationId(callerUid, dedupeSignature);
+  const reservationRef = db.collection("broadcastReservations").doc(reservationId);
+
+  const leaseDurationMs =
+    typeof __leaseDurationMs === "number" && __leaseDurationMs > 0
+      ? __leaseDurationMs
+      : DEFAULT_BROADCAST_LEASE_DURATION_MS;
+  const nowMs = Date.now();
+  const workerId = `wrk_${nowMs}_${Math.random().toString(36).slice(2, 8)}`;
+  let broadcastId = null;
+  let isRetryAttempt = false;
+  let attemptNumber = 1;
+
+  // Atomic transactional reservation & worker lease acquisition
+  await db.runTransaction(async (tx) => {
+    const resSnap = await tx.get(reservationRef);
+    if (resSnap.exists) {
+      const resData = resSnap.data() || {};
+      const resStatus = resData.status;
+      const createdMs = typeof resData.createdAtMs === "number" ? resData.createdAtMs : 0;
+      const updatedMs = typeof resData.updatedAtMs === "number" ? resData.updatedAtMs : createdMs;
+      const existingLeaseExpiresAtMs =
+        typeof resData.leaseExpiresAtMs === "number"
+          ? resData.leaseExpiresAtMs
+          : updatedMs + DEFAULT_BROADCAST_LEASE_DURATION_MS;
+
+      if (resStatus === "sending" && existingLeaseExpiresAtMs > nowMs) {
+        throw new HttpsError(
+          "already-exists",
+          "Duplicate broadcast detected: an identical broadcast is currently in progress by an active worker."
+        );
+      }
+
+      if (resStatus === "completed") {
+        if (cleanIdempotencyKey || (createdMs > 0 && nowMs - createdMs < 60000)) {
+          throw new HttpsError(
+            "already-exists",
+            "Duplicate broadcast detected: an identical notification was already sent within the last 60 seconds."
+          );
+        }
+      }
+
+      // Recover/resume if previous attempt failed, had partial_failure, was interrupted, or its worker lease expired
+      if (
+        resData.broadcastId &&
+        (resStatus === "failed" ||
+          resStatus === "partial_failure" ||
+          resStatus === "interrupted" ||
+          (resStatus === "sending" && existingLeaseExpiresAtMs <= nowMs))
+      ) {
+        broadcastId = resData.broadcastId;
+        isRetryAttempt = true;
+        attemptNumber = (typeof resData.attemptNumber === "number" ? resData.attemptNumber : 1) + 1;
+      }
+    }
+
+    if (!broadcastId) {
+      broadcastId = `bcast_${nowMs}_${Math.random().toString(36).slice(2, 7)}`;
+    }
+
+    tx.set(
+      reservationRef,
+      {
+        id: reservationId,
+        broadcastId,
+        callerUid,
+        dedupeSignature,
+        idempotencyKey: cleanIdempotencyKey,
+        target,
+        targetId: resolvedTargetId,
+        courseId: resolvedCourseId,
+        title: cleanTitle,
+        status: "sending",
+        isRetryAttempt,
+        attemptNumber,
+        leaseOwner: workerId,
+        leaseExpiresAtMs: nowMs + leaseDurationMs,
+        createdAtMs: isRetryAttempt && resSnap.exists ? resSnap.data()?.createdAtMs || nowMs : nowMs,
+        updatedAtMs: nowMs,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  });
+
+  // Paginate deletedUsers collection so archived/deleted accounts are never targeted
+  const deletedUsersResult = await paginateBroadcastQuery(db.collection("deletedUsers"), 250);
+  const deletedUserIdsSet = new Set(deletedUsersResult.docs.map((d) => d.id));
+
+  let recipientUids = [];
+  let audiencePaginationIncomplete = deletedUsersResult.paginationIncomplete;
+  let audiencePaginationError = deletedUsersResult.paginationError;
+
+  if (target === "single_user") {
+    recipientUids = [resolvedTargetId];
+  } else if (target === "course") {
+    const enrPageRes = await paginateBroadcastQuery(
+      db.collection("enrollments").where("courseId", "==", resolvedCourseId),
+      250
+    );
+    if (enrPageRes.paginationIncomplete) {
+      audiencePaginationIncomplete = true;
+      audiencePaginationError = enrPageRes.paginationError;
+    }
+
+    const candidateUids = Array.from(
+      new Set(
+        enrPageRes.docs
+          .filter((d) => {
+            const data = d.data() || {};
+            return ["active", "approved"].includes(data.status) && !data.courseDeleted && !data.deleted;
+          })
+          .map((d) => d.data()?.uid)
+          .filter((uid) => typeof uid === "string" && uid.trim() && !deletedUserIdsSet.has(uid.trim()))
+          .map((uid) => uid.trim())
+      )
+    );
+
+    const eligibleCourseUids = [];
+    const checkChunkSize = 100;
+    for (let i = 0; i < candidateUids.length; i += checkChunkSize) {
+      const uidChunk = candidateUids.slice(i, i + checkChunkSize);
+      const userSnaps = await Promise.all(
+        uidChunk.map((uid) =>
+          db
+            .collection("users")
+            .doc(uid)
+            .get()
+            .catch((err) => {
+              audiencePaginationIncomplete = true;
+              audiencePaginationError = err?.message || String(err);
+              return null;
+            })
+        )
+      );
+      for (let j = 0; j < uidChunk.length; j++) {
+        const uid = uidChunk[j];
+        const uSnap = userSnaps[j];
+        if (uSnap && uSnap.exists && isBroadcastRecipientEligible(uSnap.data(), uid, deletedUserIdsSet)) {
+          eligibleCourseUids.push(uid);
+        }
+      }
+    }
+    recipientUids = eligibleCourseUids;
+  } else if (target === "all_tutors") {
+    const tutorPageRes = await paginateBroadcastQuery(
+      db.collection("users").where("role", "==", "tutor"),
+      250
+    );
+    if (tutorPageRes.paginationIncomplete) {
+      audiencePaginationIncomplete = true;
+      audiencePaginationError = tutorPageRes.paginationError;
+    }
+    recipientUids = tutorPageRes.docs
+      .filter((d) => isBroadcastRecipientEligible(d.data(), d.id, deletedUserIdsSet))
+      .map((d) => d.id);
+  } else if (target === "all_users") {
+    const allUsersPageRes = await paginateBroadcastQuery(db.collection("users"), 250);
+    if (allUsersPageRes.paginationIncomplete) {
+      audiencePaginationIncomplete = true;
+      audiencePaginationError = allUsersPageRes.paginationError;
+    }
+    recipientUids = allUsersPageRes.docs
+      .filter((d) => isBroadcastRecipientEligible(d.data(), d.id, deletedUserIdsSet))
+      .map((d) => d.id);
+  } else {
+    // all_learners
+    const learnerPageRes = await paginateBroadcastQuery(
+      db.collection("users").where("role", "==", "student"),
+      250
+    );
+    if (learnerPageRes.paginationIncomplete) {
+      audiencePaginationIncomplete = true;
+      audiencePaginationError = learnerPageRes.paginationError;
+    }
+    recipientUids = learnerPageRes.docs
+      .filter((d) => isBroadcastRecipientEligible(d.data(), d.id, deletedUserIdsSet))
+      .map((d) => d.id);
   }
 
-  await Promise.all(batches);
+  recipientUids = Array.from(new Set(recipientUids.filter(Boolean)));
+  const totalRecipients = recipientUids.length;
+  const broadcastRef = db.collection("broadcasts").doc(broadcastId);
+  const recipientsSubcol = broadcastRef.collection("recipients");
+
+  // Load persisted recipient tracking records from broadcasts/{broadcastId}/recipients/{uid}
+  const existingRecipientsPageRes = await paginateBroadcastQuery(recipientsSubcol, 250);
+  if (existingRecipientsPageRes.paginationIncomplete) {
+    audiencePaginationIncomplete = true;
+    audiencePaginationError = existingRecipientsPageRes.paginationError;
+  }
+
+  const recipientStateMap = new Map();
+  for (const rDoc of existingRecipientsPageRes.docs) {
+    if (rDoc && rDoc.id) {
+      recipientStateMap.set(rDoc.id, rDoc.data() || {});
+    }
+  }
+
+  const newlyDiscoveredUids = [];
+  for (const uid of recipientUids) {
+    if (!recipientStateMap.has(uid)) {
+      const initialRec = {
+        uid,
+        status: "pending",
+        attemptCount: 0,
+        deliveredAt: null,
+        lastAttemptAt: null,
+        lastError: null,
+      };
+      recipientStateMap.set(uid, initialRec);
+      newlyDiscoveredUids.push(uid);
+    }
+  }
+
+  // Persist initial "pending" records for newly discovered recipients in bounded batches (<= 350 ops)
+  const seedChunkSize = 350;
+  for (let i = 0; i < newlyDiscoveredUids.length; i += seedChunkSize) {
+    const seedChunk = newlyDiscoveredUids.slice(i, i + seedChunkSize);
+    const seedBatch = db.batch();
+    for (const uid of seedChunk) {
+      seedBatch.set(recipientsSubcol.doc(uid), recipientStateMap.get(uid), { merge: true });
+    }
+    try {
+      await seedBatch.commit();
+    } catch {
+      // If seeding batch fails, individual checkpoints during delivery will still persist state
+    }
+  }
+
+  // Determine already-delivered vs pending/failed work queue from durable recipient state
+  let deliveredCount = 0;
+  const workQueueUids = [];
+  for (const uid of recipientUids) {
+    const rState = recipientStateMap.get(uid) || {};
+    if (rState.status === "delivered") {
+      deliveredCount++;
+    } else {
+      workQueueUids.push(uid);
+    }
+  }
+
+  const chunkSize = 348; // <= 348 recipients + 2 parent checkpoint docs = <= 350 writes per batch
+  const totalBatches = Math.ceil(workQueueUids.length / chunkSize);
+  const initialPendingCount = Math.max(0, totalRecipients - deliveredCount);
+
+  // Record initial/resumed broadcast dispatch state without storing unbounded recipient arrays
+  await broadcastRef.set(
+    {
+      id: broadcastId,
+      title: cleanTitle,
+      body: cleanBody,
+      type: type || "announcement",
+      target,
+      targetType: target,
+      targetId: resolvedTargetId,
+      courseId: resolvedCourseId,
+      link: link || null,
+      senderUid: callerUid,
+      dedupeSignature,
+      idempotencyKey: cleanIdempotencyKey,
+      totalRecipients,
+      recipientCount: totalRecipients,
+      deliveredCount,
+      sentCount: deliveredCount,
+      failedCount: 0,
+      pendingCount: initialPendingCount,
+      completedBatches: 0,
+      totalBatches,
+      leaseOwner: workerId,
+      leaseExpiresAtMs: Date.now() + leaseDurationMs,
+      status: "sending",
+      deliveryStatus: "sending",
+      createdAtMs: nowMs,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  let failedCount = 0;
+  const deliveryErrors = [];
+  const deterministicNotifDocId = `bcast_${broadcastId}`;
+  let completedBatches = 0;
+
+  for (let i = 0; i < workQueueUids.length; i += chunkSize) {
+    const batchNumber = Math.floor(i / chunkSize) + 1;
+    const chunk = workQueueUids.slice(i, i + chunkSize);
+
+    // Verify our worker lease is still active before processing this batch
+    const currentResSnap = await reservationRef.get();
+    if (
+      currentResSnap.exists &&
+      currentResSnap.data()?.leaseOwner &&
+      currentResSnap.data()?.leaseOwner !== workerId
+    ) {
+      throw new HttpsError(
+        "aborted",
+        "Broadcast worker lease was superseded by another recovery worker."
+      );
+    }
+
+    // Check which recipients in this chunk already have the deterministic notification document
+    // (recovers safely from the failure window between notification creation and checkpoint persistence
+    // without overwriting existing notifications or resetting their `read: true` state)
+    const preExistingNotifUids = new Set();
+    const uidsNeedingNotificationWrite = [];
+
+    const notifExistenceSnaps = await Promise.all(
+      chunk.map((uid) =>
+        db
+          .collection("users")
+          .doc(uid)
+          .collection("notifications")
+          .doc(deterministicNotifDocId)
+          .get()
+          .catch(() => ({ exists: false }))
+      )
+    );
+
+    for (let j = 0; j < chunk.length; j++) {
+      const uid = chunk[j];
+      if (notifExistenceSnaps[j] && notifExistenceSnaps[j].exists) {
+        preExistingNotifUids.add(uid);
+      } else {
+        uidsNeedingNotificationWrite.push(uid);
+      }
+    }
+
+    const chunkDeliveredSet = new Set(preExistingNotifUids);
+    const chunkFailedErrorsMap = new Map();
+
+    if (uidsNeedingNotificationWrite.length > 0) {
+      const notifBatch = db.batch();
+      uidsNeedingNotificationWrite.forEach((uid) => {
+        const notifRef = db
+          .collection("users")
+          .doc(uid)
+          .collection("notifications")
+          .doc(deterministicNotifDocId);
+        notifBatch.set(notifRef, {
+          id: deterministicNotifDocId,
+          title: cleanTitle,
+          body: cleanBody,
+          type: type || "announcement",
+          courseId: resolvedCourseId,
+          link: link || null,
+          broadcastId,
+          read: false,
+          senderUid: callerUid,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+
+      try {
+        await notifBatch.commit();
+        uidsNeedingNotificationWrite.forEach((uid) => chunkDeliveredSet.add(uid));
+      } catch (batchErr) {
+        // Fallback to individual delivery so partial failures are isolated and recorded
+        for (const uid of uidsNeedingNotificationWrite) {
+          try {
+            const notifRef = db
+              .collection("users")
+              .doc(uid)
+              .collection("notifications")
+              .doc(deterministicNotifDocId);
+            const checkSnap = await notifRef.get().catch(() => ({ exists: false }));
+            if (!checkSnap.exists) {
+              await notifRef.set({
+                id: deterministicNotifDocId,
+                title: cleanTitle,
+                body: cleanBody,
+                type: type || "announcement",
+                courseId: resolvedCourseId,
+                link: link || null,
+                broadcastId,
+                read: false,
+                senderUid: callerUid,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            }
+            chunkDeliveredSet.add(uid);
+          } catch (singleErr) {
+            const errMsg = singleErr?.message || String(singleErr);
+            chunkFailedErrorsMap.set(uid, errMsg);
+            deliveryErrors.push(`${uid}: ${errMsg}`);
+          }
+        }
+        if (chunkFailedErrorsMap.size === 0 && batchErr) {
+          deliveryErrors.push(batchErr?.message || String(batchErr));
+        }
+      }
+    }
+
+    // Optional fault-injection hook for testing crash window between notification write and checkpoint write
+    if (
+      typeof __simulateTerminateBeforeCheckpointBatch === "number" &&
+      __simulateTerminateBeforeCheckpointBatch === batchNumber
+    ) {
+      throw new Error(`SIMULATED_CRASH_BEFORE_CHECKPOINT_BATCH_${batchNumber}`);
+    }
+
+    // Update in-memoryrecipient state and aggregate counters for this completed batch
+    for (const uid of chunk) {
+      const prevRec = recipientStateMap.get(uid) || { uid, attemptCount: 0 };
+      const nextAttempts =
+        (typeof prevRec.attemptCount === "number" ? prevRec.attemptCount : 0) +
+        (preExistingNotifUids.has(uid) && prevRec.attemptCount > 0 ? 0 : 1);
+
+      if (chunkDeliveredSet.has(uid)) {
+        recipientStateMap.set(uid, {
+          uid,
+          status: "delivered",
+          attemptCount: nextAttempts,
+          deliveredAt: prevRec.deliveredAt || admin.firestore.FieldValue.serverTimestamp(),
+          lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastError: null,
+        });
+      } else {
+        const errMsg = chunkFailedErrorsMap.get(uid) || "Delivery failed";
+        recipientStateMap.set(uid, {
+          uid,
+          status: "failed",
+          attemptCount: nextAttempts,
+          deliveredAt: null,
+          lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastError: errMsg,
+        });
+      }
+    }
+
+    deliveredCount = 0;
+    failedCount = 0;
+    for (const uid of recipientUids) {
+      const st = recipientStateMap.get(uid)?.status;
+      if (st === "delivered") deliveredCount++;
+      else if (st === "failed") failedCount++;
+    }
+    const currentPendingCount = Math.max(0, totalRecipients - deliveredCount - failedCount);
+    completedBatches = batchNumber;
+    const checkpointLeaseExpiresAtMs = Date.now() + leaseDurationMs;
+
+    // Persist durable per-batch checkpoint (<= 348 recipient docs + broadcastRef + reservationRef <= 350 writes)
+    const checkpointBatch = db.batch();
+    for (const uid of chunk) {
+      checkpointBatch.set(recipientsSubcol.doc(uid), recipientStateMap.get(uid), { merge: true });
+    }
+    checkpointBatch.set(
+      broadcastRef,
+      {
+        totalRecipients,
+        recipientCount: totalRecipients,
+        deliveredCount,
+        sentCount: deliveredCount,
+        failedCount,
+        pendingCount: currentPendingCount,
+        completedBatches,
+        totalBatches,
+        leaseOwner: workerId,
+        leaseExpiresAtMs: checkpointLeaseExpiresAtMs,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    checkpointBatch.set(
+      reservationRef,
+      {
+        totalRecipients,
+        deliveredCount,
+        failedCount,
+        pendingCount: currentPendingCount,
+        completedBatches,
+        totalBatches,
+        leaseOwner: workerId,
+        leaseExpiresAtMs: checkpointLeaseExpiresAtMs,
+        updatedAtMs: Date.now(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    try {
+      await checkpointBatch.commit();
+    } catch {
+      // Fallback: persist recipient checkpoints and parent progress individually if batch fails
+      await Promise.all(
+        chunk.map((uid) =>
+          recipientsSubcol
+            .doc(uid)
+            .set(recipientStateMap.get(uid), { merge: true })
+            .catch(() => {})
+        )
+      );
+      await Promise.all([
+        broadcastRef
+          .set(
+            {
+              totalRecipients,
+              recipientCount: totalRecipients,
+              deliveredCount,
+              sentCount: deliveredCount,
+              failedCount,
+              pendingCount: currentPendingCount,
+              completedBatches,
+              totalBatches,
+              leaseOwner: workerId,
+              leaseExpiresAtMs: checkpointLeaseExpiresAtMs,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          )
+          .catch(() => {}),
+        reservationRef
+          .set(
+            {
+              totalRecipients,
+              deliveredCount,
+              failedCount,
+              pendingCount: currentPendingCount,
+              completedBatches,
+              totalBatches,
+              leaseOwner: workerId,
+              leaseExpiresAtMs: checkpointLeaseExpiresAtMs,
+              updatedAtMs: Date.now(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          )
+          .catch(() => {}),
+      ]);
+    }
+
+    // Optional fault-injection hook for testing crash after batch checkpoint
+    if (
+      typeof __simulateTerminateAfterBatch === "number" &&
+      __simulateTerminateAfterBatch === batchNumber
+    ) {
+      throw new Error(`SIMULATED_CRASH_AFTER_BATCH_${batchNumber}`);
+    }
+  }
+
+  // Final recount across all eligible recipients
+  deliveredCount = 0;
+  failedCount = 0;
+  for (const uid of recipientUids) {
+    const st = recipientStateMap.get(uid)?.status;
+    if (st === "delivered") deliveredCount++;
+    else if (st === "failed") failedCount++;
+  }
+  const finalPendingCount = Math.max(0, totalRecipients - deliveredCount - failedCount);
+
+  if (audiencePaginationIncomplete) {
+    failedCount = Math.max(failedCount, 1);
+    deliveryErrors.push(
+      `Pagination incomplete: ${audiencePaginationError || "One or more recipient pages could not be read."}`
+    );
+  }
+
+  const allEligibleDelivered =
+    deliveredCount === totalRecipients &&
+    failedCount === 0 &&
+    finalPendingCount === 0 &&
+    !audiencePaginationIncomplete;
+
+  const finalStatus = allEligibleDelivered
+    ? "completed"
+    : deliveredCount > 0
+      ? "partial_failure"
+      : "failed";
+
+  await Promise.all([
+    broadcastRef.set(
+      {
+        totalRecipients,
+        recipientCount: totalRecipients,
+        deliveredCount,
+        sentCount: deliveredCount,
+        failedCount,
+        pendingCount: finalPendingCount,
+        completedBatches,
+        totalBatches,
+        paginationIncomplete: audiencePaginationIncomplete,
+        deliveryErrors: deliveryErrors.slice(0, 20),
+        leaseOwner: null,
+        leaseExpiresAtMs: 0,
+        status: finalStatus,
+        deliveryStatus: finalStatus,
+        completedAt:
+          finalStatus === "completed" ? admin.firestore.FieldValue.serverTimestamp() : null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    ),
+    reservationRef.set(
+      {
+        status: finalStatus,
+        deliveryStatus: finalStatus,
+        totalRecipients,
+        deliveredCount,
+        failedCount,
+        pendingCount: finalPendingCount,
+        completedBatches,
+        totalBatches,
+        leaseOwner: null,
+        leaseExpiresAtMs: 0,
+        updatedAtMs: Date.now(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    ),
+  ]);
 
   // Record audit log
   await db.collection("auditLogs").add({
     action: "Notification Dispatched",
-    detail: `Notification '${title.trim()}' sent to target '${target}' (${writtenCount} recipients) by admin ${callerUid}`,
+    detail: `Notification '${cleanTitle}' sent to target '${target}' (${deliveredCount}/${totalRecipients} delivered${failedCount > 0 ? `, ${failedCount} failed` : ""}${finalPendingCount > 0 ? `, ${finalPendingCount} pending` : ""}) by admin ${callerUid}`,
+    broadcastId,
     target,
-    targetId: targetId || null,
-    recipientCount: writtenCount,
+    targetType: target,
+    targetId: resolvedTargetId,
+    courseId: resolvedCourseId,
+    idempotencyKey: cleanIdempotencyKey,
+    recipientCount: totalRecipients,
+    deliveredCount,
+    sentCount: deliveredCount,
+    failedCount,
+    pendingCount: finalPendingCount,
+    totalRecipients,
+    status: finalStatus,
+    deliveryStatus: finalStatus,
     adminUid: callerUid,
-    badge: "pill-tech",
+    badge: finalStatus === "completed" ? "pill-tech" : finalStatus === "partial_failure" ? "pill-warning" : "pill-danger",
     timestamp: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  return { success: true, count: writtenCount };
+  if (finalStatus === "failed" && (totalRecipients > 0 || audiencePaginationIncomplete)) {
+    throw new HttpsError(
+      "internal",
+      "Broadcast delivery failed for all " + totalRecipients + " recipient(s): " + (deliveryErrors[0] || "Unknown error")
+    );
+  }
+
+  return {
+    success: finalStatus === "completed",
+    partialSuccess: finalStatus === "partial_failure",
+    broadcastId,
+    count: deliveredCount,
+    deliveredCount,
+    sentCount: deliveredCount,
+    failedCount,
+    pendingCount: finalPendingCount,
+    totalRecipients,
+    recipientCount: totalRecipients,
+    completedBatches,
+    totalBatches,
+    status: finalStatus,
+    deliveryStatus: finalStatus,
+  };
 });
+exports.adminSendNotification = adminSendNotificationHandler;
+exports.adminSendBroadcast = adminSendNotificationHandler;
 
 /**
  * 11. Callable Function: adminManageEnrollment
@@ -2229,6 +3612,17 @@ exports.adminManageEnrollment = onCall(async (request) => {
   const isGrant = action !== "revoke";
 
   if (isGrant) {
+    const courseSnap = await db.collection("courses").doc(courseId).get();
+    if (courseSnap.exists) {
+      const cData = courseSnap.data() || {};
+      if (cData.status === "deleting" || cData.deletionState === "deleting") {
+        throw new HttpsError(
+          "failed-precondition",
+          `Cannot grant enrollment for course '${courseId}' while course deletion is in progress.`
+        );
+      }
+    }
+
     const existingSnap = await enrollmentRef.get();
     const existingData = existingSnap.exists ? existingSnap.data() : {};
     batch.set(
@@ -2505,7 +3899,22 @@ exports.adminManageCourse = onCall(async (request) => {
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
               };
               if (item.type === "test" && (Array.isArray(item.questions) || Array.isArray(curr.quizQuestions))) {
-                itemPayload.questions = item.questions || curr.quizQuestions;
+                const rawQuestions = item.questions || curr.quizQuestions;
+                itemPayload.questions = rawQuestions.map((q) => {
+                  const sanitized = { ...(q || {}) };
+                  delete sanitized.correctIndex;
+                  delete sanitized.explanation;
+                  return sanitized;
+                });
+                const keyRef = cRef.collection("testKeys").doc(itemId);
+                seedBatch.set(keyRef, {
+                  answers: rawQuestions.map((q) =>
+                    typeof q?.correctIndex === "number" ? q.correctIndex : Number(q?.correctIndex) || 0
+                  ),
+                  passingScore: typeof item.passingScore === "number" ? item.passingScore : 60,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                await commitBatchIfNeeded();
               }
               seedBatch.set(itemRef, itemPayload);
               await commitBatchIfNeeded();
@@ -2541,6 +3950,11 @@ exports.adminManageCourse = onCall(async (request) => {
     });
 
     return { success: true, action: "seedCatalog", seededCount, skippedCount, seededIds };
+  }
+
+  if (action === "migrateTestKeys") {
+    const result = await runMigrateTestKeys({ courseId, adminUid: callerUid });
+    return { success: true, action: "migrateTestKeys", ...result };
   }
 
   const batch = db.batch();
@@ -2613,6 +4027,13 @@ exports.adminManageCourse = onCall(async (request) => {
     }
     const existing = existingSnap.data() || {};
 
+    if (existing.status === "deleting" || existing.deletionState === "deleting") {
+      throw new HttpsError(
+        "failed-precondition",
+        `Cannot update course '${courseId}' while course deletion is in progress.`
+      );
+    }
+
     const hasTutorId = courseData && Object.prototype.hasOwnProperty.call(courseData, "tutorId");
     const hasTutorName = courseData && Object.prototype.hasOwnProperty.call(courseData, "tutorName");
     const hasAssignedTutors = courseData && Array.isArray(courseData.assignedTutors);
@@ -2675,6 +4096,13 @@ exports.adminManageCourse = onCall(async (request) => {
     }
     const existing = existingSnap.exists ? existingSnap.data() : {};
 
+    if (existing.status === "deleting" || existing.deletionState === "deleting") {
+      throw new HttpsError(
+        "failed-precondition",
+        `Cannot toggle status of course '${courseId}' while course deletion is in progress.`
+      );
+    }
+
     if (!isCallerAdmin) {
       const isAssigned =
         existing.tutorId === callerUid ||
@@ -2736,20 +4164,6 @@ exports.adminManageCourse = onCall(async (request) => {
       throw new HttpsError("not-found", `Course '${cleanCourseId}' does not exist.`);
     }
 
-    if (!existingSnap.exists && priorDeletion?.deletionState === "completed") {
-      return {
-        success: true,
-        courseId: cleanCourseId,
-        deletionState: "completed",
-        idempotentRetry: true,
-        deletedSubDocs: priorDeletion.deletedSubDocs || 0,
-        deletedResources: priorDeletion.deletedResources || 0,
-        archivedEnrollmentsCount: priorDeletion.archivedEnrollmentsCount || 0,
-        deletedStorageFilesCount: priorDeletion.deletedStorageFilesCount || 0,
-        action: "delete",
-      };
-    }
-
     const existing = existingSnap.exists ? (existingSnap.data() || {}) : {};
     const title = courseData?.title || existing?.title || priorDeletion?.title || cleanCourseId;
 
@@ -2765,12 +4179,111 @@ exports.adminManageCourse = onCall(async (request) => {
       });
     }
 
-    // Stage 1: Prevent student access immediately when deletion begins & record resumable deletion state
+    const stages = {
+      enrollmentArchival: Boolean(priorDeletion?.stages?.enrollmentArchival),
+      tutorAssignmentCleanup: Boolean(priorDeletion?.stages?.tutorAssignmentCleanup),
+      storageCleanup: Boolean(priorDeletion?.stages?.storageCleanup),
+      subcollectionDeletion: Boolean(priorDeletion?.stages?.subcollectionDeletion),
+      courseDocumentDeletion: Boolean(priorDeletion?.stages?.courseDocumentDeletion),
+    };
+
+    // Verification helpers for each of the 5 stages
+    const verifyEnrollmentArchival = async () => {
+      const enrSnap = await db.collection("enrollments").where("courseId", "==", cleanCourseId).get();
+      return enrSnap.docs.every((d) => {
+        const data = d.data() || {};
+        return data.status === "archived" && data.courseDeleted === true;
+      });
+    };
+
+    const verifyTutorAssignmentCleanup = async () => {
+      for (const tUid of assignedTutorIds) {
+        const tSnap = await db.collection("users").doc(tUid).get();
+        if (tSnap.exists) {
+          const assigned = tSnap.data()?.assignedCourses;
+          if (Array.isArray(assigned) && assigned.includes(cleanCourseId)) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    const verifyStorageReady = () => {
+      if (!admin.storage || typeof admin.storage !== "function") return false;
+      try {
+        const b = admin.storage().bucket();
+        return Boolean(b && typeof b.deleteFiles === "function");
+      } catch {
+        return false;
+      }
+    };
+
+    const verifySubcollectionDeletion = async () => {
+      if (typeof courseRef.listCollections !== "function") {
+        throw new Error(
+          `Subcollection verification failed for '${courseRef.path}': listCollections() is required.`
+        );
+      }
+      const cols = await courseRef.listCollections();
+      if (!Array.isArray(cols)) {
+        throw new Error(
+          `Subcollection verification failed for '${courseRef.path}': listCollections() did not return a collection list.`
+        );
+      }
+      for (const col of cols) {
+        const s = await (typeof col.limit === "function" ? col.limit(1) : col).get();
+        if (!s.empty) return false;
+      }
+      const [topResRemaining, topAnnRemaining] = await Promise.all([
+        db.collection("resources").where("courseId", "==", cleanCourseId).limit(1).get(),
+        db.collection("announcements").where("courseId", "==", cleanCourseId).limit(1).get(),
+      ]);
+      return topResRemaining.empty && topAnnRemaining.empty;
+    };
+
+    // If priorDeletion was marked completed and course doc is gone, verify all stages before returning idempotently
+    if (!existingSnap.exists && priorDeletion?.deletionState === "completed") {
+      let allStagesVerified = false;
+      try {
+        const [enrOk, tutOk, subOk] = await Promise.all([
+          verifyEnrollmentArchival(),
+          verifyTutorAssignmentCleanup(),
+          verifySubcollectionDeletion(),
+        ]);
+        allStagesVerified = enrOk && tutOk && subOk && verifyStorageReady();
+      } catch {
+        allStagesVerified = false;
+      }
+      if (allStagesVerified) {
+        return {
+          success: true,
+          courseId: cleanCourseId,
+          deletionState: "completed",
+          idempotentRetry: true,
+          stages: {
+            enrollmentArchival: true,
+            tutorAssignmentCleanup: true,
+            storageCleanup: true,
+            subcollectionDeletion: true,
+            courseDocumentDeletion: true,
+          },
+          deletedSubDocs: priorDeletion.deletedSubDocs || 0,
+          deletedResources: priorDeletion.deletedResources || 0,
+          archivedEnrollmentsCount: priorDeletion.archivedEnrollmentsCount || 0,
+          deletedStorageFilesCount: priorDeletion.deletedStorageFilesCount || 0,
+          action: "delete",
+        };
+      }
+    }
+
+    // Prevent student access immediately when deletion begins & record resumable deletion state
     await courseDeletionRef.set(
       {
         courseId: cleanCourseId,
         title,
         deletionState: "deleting",
+        stages,
         assignedTutorIds: Array.from(assignedTutorIds),
         startedBy: priorDeletion?.startedBy || callerUid,
         startedAt: priorDeletion?.startedAt || admin.firestore.FieldValue.serverTimestamp(),
@@ -2792,58 +4305,123 @@ exports.adminManageCourse = onCall(async (request) => {
       );
     }
 
-    // Stage 2: Archive active/approved/pending enrollments in bounded batches (<= 350 writes) so students
-    // immediately lose active enrollment access while preserving academic history and submissions.
-    const enrSnap = await db.collection("enrollments").where("courseId", "==", cleanCourseId).get();
-    const enrollmentOps = [];
-    enrSnap.docs.forEach((enrDoc) => {
-      const enrData = enrDoc.data() || {};
-      if (enrData.status !== "archived") {
-        enrollmentOps.push({
-          type: "update",
-          ref: enrDoc.ref,
-          data: {
-            status: "archived",
-            previousStatus: enrData.status || "active",
-            courseDeleted: true,
-            courseTitle: enrData.courseTitle || title,
-            archivedAt: admin.firestore.FieldValue.serverTimestamp(),
-            archivedBy: callerUid,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        });
-      }
-    });
-    await commitOperationsInBoundedBatches(enrollmentOps, 350);
-    const archivedEnrollmentsCount =
-      (priorDeletion?.archivedEnrollmentsCount || 0) + enrollmentOps.length;
-
-    // Stage 3: Clean up `assignedCourses` array on any tutors assigned to this course in bounded batches (<= 350)
-    const tutorOps = [];
-    for (const tUid of assignedTutorIds) {
-      const tRef = db.collection("users").doc(tUid);
-      const tSnap = await tRef.get();
-      if (tSnap.exists) {
-        tutorOps.push({
-          type: "update",
-          ref: tRef,
-          data: {
-            assignedCourses: admin.firestore.FieldValue.arrayRemove(cleanCourseId),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        });
-      }
+    // ── Stage 1 Checkpoint: enrollmentArchival ──────────────────────────────
+    let archivedNewCount = 0;
+    const isEnrollmentAlreadyVerified =
+      stages.enrollmentArchival && (await verifyEnrollmentArchival());
+    if (!isEnrollmentAlreadyVerified) {
+      const enrSnap = await db.collection("enrollments").where("courseId", "==", cleanCourseId).get();
+      const enrollmentOps = [];
+      enrSnap.docs.forEach((enrDoc) => {
+        const enrData = enrDoc.data() || {};
+        if (enrData.status !== "archived" || enrData.courseDeleted !== true) {
+          enrollmentOps.push({
+            type: "update",
+            ref: enrDoc.ref,
+            data: {
+              status: "archived",
+              previousStatus: enrData.status || "active",
+              courseDeleted: true,
+              courseTitle: enrData.courseTitle || title,
+              archivedAt: admin.firestore.FieldValue.serverTimestamp(),
+              archivedBy: callerUid,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+          });
+        }
+      });
+      await commitOperationsInBoundedBatches(enrollmentOps, 350);
+      archivedNewCount = enrollmentOps.length;
     }
-    await commitOperationsInBoundedBatches(tutorOps, 350);
 
-    // Stage 4: Collect explicit Storage paths from course resources and restrict strictly to authorized course prefixes
+    if (!(await verifyEnrollmentArchival())) {
+      await courseDeletionRef.set(
+        {
+          deletionState: "failed",
+          failedStage: "enrollment_archival",
+          stages,
+          deletionErrors: ["Verification failed: Some enrollments for this course were not archived."],
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      throw new HttpsError(
+        "internal",
+        `Verification failed: Could not confirm archival of all enrollments for course '${cleanCourseId}'.`
+      );
+    }
+
+    const archivedEnrollmentsCount =
+      (priorDeletion?.archivedEnrollmentsCount || 0) + archivedNewCount;
+    stages.enrollmentArchival = true;
+    await courseDeletionRef.set(
+      {
+        stages,
+        archivedEnrollmentsCount,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // ── Stage 2 Checkpoint: tutorAssignmentCleanup ──────────────────────────
+    const isTutorCleanupAlreadyVerified =
+      stages.tutorAssignmentCleanup && (await verifyTutorAssignmentCleanup());
+    if (!isTutorCleanupAlreadyVerified) {
+      const tutorOps = [];
+      for (const tUid of assignedTutorIds) {
+        const tRef = db.collection("users").doc(tUid);
+        const tSnap = await tRef.get();
+        if (tSnap.exists) {
+          tutorOps.push({
+            type: "update",
+            ref: tRef,
+            data: {
+              assignedCourses: admin.firestore.FieldValue.arrayRemove(cleanCourseId),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+          });
+        }
+      }
+      await commitOperationsInBoundedBatches(tutorOps, 350);
+    }
+
+    if (!(await verifyTutorAssignmentCleanup())) {
+      await courseDeletionRef.set(
+        {
+          deletionState: "failed",
+          failedStage: "tutor_assignment_cleanup",
+          stages,
+          deletionErrors: ["Verification failed: Tutor course assignment references remain."],
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+      throw new HttpsError(
+        "internal",
+        `Verification failed: Tutor assignment cleanup for course '${cleanCourseId}' did not complete.`
+      );
+    }
+
+    stages.tutorAssignmentCleanup = true;
+    await courseDeletionRef.set(
+      {
+        stages,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // ── Stage 3 Checkpoint: storageCleanup ──────────────────────────────────
+    // Collect explicit Storage paths from course resources and curriculum subcollections
     const [courseResSnap, topResSnap] = await Promise.all([
       courseRef.collection("resources").get(),
       db.collection("resources").where("courseId", "==", cleanCourseId).get(),
     ]);
 
     const explicitStoragePaths = new Set();
-    const skippedUnauthorizedStoragePaths = [];
+    const skippedUnauthorizedStoragePaths = Array.isArray(priorDeletion?.skippedUnauthorizedStoragePaths)
+      ? [...priorDeletion.skippedUnauthorizedStoragePaths]
+      : [];
 
     [...courseResSnap.docs, ...topResSnap.docs].forEach((docSnap) => {
       const rData = docSnap.data() || {};
@@ -2851,7 +4429,7 @@ exports.adminManageCourse = onCall(async (request) => {
         const candidatePath = rData.storagePath.trim().replace(/^\/+/, "");
         if (isAuthorizedCourseStoragePath(cleanCourseId, candidatePath)) {
           explicitStoragePaths.add(candidatePath);
-        } else {
+        } else if (!skippedUnauthorizedStoragePaths.includes(rData.storagePath.trim())) {
           skippedUnauthorizedStoragePaths.push(rData.storagePath.trim());
         }
       }
@@ -2861,21 +4439,32 @@ exports.adminManageCourse = onCall(async (request) => {
     let deletedStorageFilesCount = 0;
     const authorizedPrefixes = [`courses/${cleanCourseId}/`, `resources/${cleanCourseId}/`];
 
-    if (admin.storage && typeof admin.storage === "function") {
+    // Never silently skip Storage cleanup when the Storage API or deletion methods are unavailable!
+    if (!admin.storage || typeof admin.storage !== "function") {
+      storageErrors.push(
+        "Firebase Storage API (admin.storage) is unavailable; Storage cleanup could not be verified."
+      );
+    } else {
       let bucket = null;
       try {
         bucket = admin.storage().bucket();
       } catch (bucketErr) {
-        storageErrors.push(`Storage bucket initialization failed: ${bucketErr.message}`);
+        storageErrors.push(`Storage bucket initialization failed: ${bucketErr?.message || bucketErr}`);
       }
 
-      if (bucket) {
-        for (const prefix of authorizedPrefixes) {
-          if (!isAuthorizedCourseStoragePath(cleanCourseId, `${prefix}placeholder`)) {
-            storageErrors.push(`Refused unauthorized Storage prefix '${prefix}'.`);
-            continue;
-          }
-          if (typeof bucket.deleteFiles === "function") {
+      if (!bucket) {
+        storageErrors.push("Storage bucket instance is unavailable; Storage cleanup could not be verified.");
+      } else {
+        if (typeof bucket.deleteFiles !== "function") {
+          storageErrors.push(
+            "Storage bucket.deleteFiles() method is unavailable; prefix Storage cleanup could not be verified."
+          );
+        } else {
+          for (const prefix of authorizedPrefixes) {
+            if (!isAuthorizedCourseStoragePath(cleanCourseId, `${prefix}placeholder`)) {
+              storageErrors.push(`Refused unauthorized Storage prefix '${prefix}'.`);
+              continue;
+            }
             try {
               await bucket.deleteFiles({ prefix });
               deletedStorageFilesCount += 1;
@@ -2888,19 +4477,34 @@ exports.adminManageCourse = onCall(async (request) => {
           }
         }
 
-        if (typeof bucket.file === "function") {
-          for (const storagePath of explicitStoragePaths) {
-            if (!isAuthorizedCourseStoragePath(cleanCourseId, storagePath)) {
-              skippedUnauthorizedStoragePaths.push(storagePath);
-              continue;
-            }
-            try {
-              await bucket.file(storagePath).delete();
-              deletedStorageFilesCount += 1;
-            } catch (err) {
-              const code = err?.code || err?.status;
-              if (code !== 404 && code !== "ENOENT" && !String(err?.message || "").includes("No such object")) {
-                storageErrors.push(`Failed deleting file '${storagePath}': ${err.message || err}`);
+        if (explicitStoragePaths.size > 0) {
+          if (typeof bucket.file !== "function") {
+            storageErrors.push(
+              "Storage bucket.file() method is unavailable; explicit course resource files could not be deleted."
+            );
+          } else {
+            for (const storagePath of explicitStoragePaths) {
+              if (!isAuthorizedCourseStoragePath(cleanCourseId, storagePath)) {
+                if (!skippedUnauthorizedStoragePaths.includes(storagePath)) {
+                  skippedUnauthorizedStoragePaths.push(storagePath);
+                }
+                continue;
+              }
+              try {
+                const fileHandle = bucket.file(storagePath);
+                if (!fileHandle || typeof fileHandle.delete !== "function") {
+                  storageErrors.push(
+                    `Storage file('${storagePath}').delete() method is unavailable.`
+                  );
+                  continue;
+                }
+                await fileHandle.delete();
+                deletedStorageFilesCount += 1;
+              } catch (err) {
+                const code = err?.code || err?.status;
+                if (code !== 404 && code !== "ENOENT" && !String(err?.message || "").includes("No such object")) {
+                  storageErrors.push(`Failed deleting file '${storagePath}': ${err.message || err}`);
+                }
               }
             }
           }
@@ -2909,10 +4513,12 @@ exports.adminManageCourse = onCall(async (request) => {
     }
 
     if (storageErrors.length > 0) {
+      stages.storageCleanup = false;
       await courseDeletionRef.set(
         {
           deletionState: "failed",
           failedStage: "storage_cleanup",
+          stages,
           deletionErrors: storageErrors,
           skippedUnauthorizedStoragePaths,
           archivedEnrollmentsCount,
@@ -2947,7 +4553,17 @@ exports.adminManageCourse = onCall(async (request) => {
       );
     }
 
-    // Stage 5: Recursively discover and delete all subcollections under courses/{courseId} in bounded batches (<= 350)
+    stages.storageCleanup = true;
+    await courseDeletionRef.set(
+      {
+        stages,
+        skippedUnauthorizedStoragePaths,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // ── Stage 4 Checkpoint: subcollectionDeletion ───────────────────────────
     let deletedSubDocs = 0;
     let deletedResources = 0;
     try {
@@ -2960,12 +4576,20 @@ exports.adminManageCourse = onCall(async (request) => {
         db.collection("announcements").where("courseId", "==", cleanCourseId),
         350
       );
+      const verifiedSubs = await verifySubcollectionDeletion();
+      if (!verifiedSubs) {
+        throw new Error(
+          `Verification failed: Subcollection or resource documents remain for course '${cleanCourseId}'.`
+        );
+      }
     } catch (subErr) {
       const errMsg = subErr?.message || String(subErr);
+      stages.subcollectionDeletion = false;
       await courseDeletionRef.set(
         {
           deletionState: "failed",
           failedStage: "subcollection_cleanup",
+          stages,
           deletionErrors: [errMsg],
           archivedEnrollmentsCount,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2999,14 +4623,33 @@ exports.adminManageCourse = onCall(async (request) => {
       );
     }
 
-    // Stage 6: Delete top-level course document, verify removal, and finalize courseDeletions state + audit log
+    const totalDeletedSubDocs = (priorDeletion?.deletedSubDocs || 0) + deletedSubDocs;
+    const totalDeletedResources = (priorDeletion?.deletedResources || 0) + deletedResources;
+    const totalDeletedStorageFiles =
+      (priorDeletion?.deletedStorageFilesCount || 0) + deletedStorageFilesCount;
+
+    stages.subcollectionDeletion = true;
+    await courseDeletionRef.set(
+      {
+        stages,
+        deletedSubDocs: totalDeletedSubDocs,
+        deletedResources: totalDeletedResources,
+        deletedStorageFilesCount: totalDeletedStorageFiles,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    // ── Stage 5 Checkpoint: courseDocumentDeletion ──────────────────────────
     await courseRef.delete();
     const afterCourseSnap = await courseRef.get();
     if (afterCourseSnap.exists) {
+      stages.courseDocumentDeletion = false;
       await courseDeletionRef.set(
         {
           deletionState: "failed",
           failedStage: "verify_course_document_deletion",
+          stages,
           deletionErrors: ["Course document still exists after deletion."],
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         },
@@ -3018,10 +4661,7 @@ exports.adminManageCourse = onCall(async (request) => {
       );
     }
 
-    const totalDeletedSubDocs = (priorDeletion?.deletedSubDocs || 0) + deletedSubDocs;
-    const totalDeletedResources = (priorDeletion?.deletedResources || 0) + deletedResources;
-    const totalDeletedStorageFiles =
-      (priorDeletion?.deletedStorageFilesCount || 0) + deletedStorageFilesCount;
+    stages.courseDocumentDeletion = true;
 
     batch.set(
       courseDeletionRef,
@@ -3029,6 +4669,7 @@ exports.adminManageCourse = onCall(async (request) => {
         courseId: cleanCourseId,
         title,
         deletionState: "completed",
+        stages,
         failedStage: admin.firestore.FieldValue.delete(),
         deletionErrors: admin.firestore.FieldValue.delete(),
         deletedSubDocs: totalDeletedSubDocs,
@@ -3061,6 +4702,7 @@ exports.adminManageCourse = onCall(async (request) => {
       success: true,
       courseId: cleanCourseId,
       deletionState: "completed",
+      stages,
       deletedSubDocs: totalDeletedSubDocs,
       deletedResources: totalDeletedResources,
       archivedEnrollmentsCount,
@@ -3298,10 +4940,12 @@ exports.sendCourseNotification = onCall(async (request) => {
  *   5. Initializes progressPercent: 0, completedItemIds: [], totalLessons from curriculum subcollections.
  *   6. Records server-side audit log and user notification, and triggers analytics recomputation.
  */
-exports.requestCourseEnrollment = onCall(async (request) => {
-  if (!request.auth || !request.auth.uid) {
-    throw new HttpsError("unauthenticated", "You must be signed in to enroll in a course.");
-  }
+exports.requestCourseEnrollment = onCall(
+  { enforceAppCheck: process.env.ENFORCE_APP_CHECK === "true" },
+  async (request) => {
+    if (!request.auth || !request.auth.uid) {
+      throw new HttpsError("unauthenticated", "You must be signed in to enroll in a course.");
+    }
 
   const uid = request.auth.uid;
   const { courseId, experienceType = "online", totalLessons } = request.data || {};
@@ -3330,6 +4974,10 @@ exports.requestCourseEnrollment = onCall(async (request) => {
   }
 
   const courseData = courseSnap.data() || {};
+  if (courseData.status === "deleting" || courseData.deletionState === "deleting") {
+    throw new HttpsError("failed-precondition", "Cannot enroll in a course that is currently being deleted.");
+  }
+
   const isAdmin = request.auth.token.admin === true;
   const isAssignedTutor =
     request.auth.token.tutor === true &&
@@ -3447,20 +5095,374 @@ exports.requestCourseEnrollment = onCall(async (request) => {
 });
 
 /**
- * 18. Firestore Triggers: Stage 8 Course Analytics Recomputation
- * - Triggered when documents in enrollments, testSubmissions, or assignmentSubmissions are created, updated, or deleted.
- * - Recomputes courses/{courseId}/analytics/summary idempotently.
+ * Helper & Admin Callable: Migrate test answer keys out of courses/{courseId}/tests/{testId}
+ * into courses/{courseId}/testKeys/{testId} and strip correctIndex/explanation from tests.
  */
-exports.onEnrollmentOrSubmissionWrite = onDocumentWritten("{collectionId}/{docId}", async (event) => {
-  const { collectionId } = event.params || {};
-  if (!["enrollments", "testSubmissions", "assignmentSubmissions"].includes(collectionId)) {
-    return null;
+async function runMigrateTestKeys({ courseId = null, adminUid = "system" } = {}) {
+  let courseDocs = [];
+  if (courseId && typeof courseId === "string" && courseId.trim()) {
+    const cSnap = await db.collection("courses").doc(courseId.trim()).get();
+    if (cSnap.exists) {
+      courseDocs = [cSnap];
+    }
+  } else {
+    const allCoursesSnap = await db.collection("courses").get();
+    courseDocs = allCoursesSnap.docs;
   }
 
-  const beforeData = event.data?.before?.exists ? event.data.before.data() : null;
-  const afterData = event.data?.after?.exists ? event.data.after.data() : null;
-  const courseIds = new Set();
+  let migratedTestsCount = 0;
+  const migratedCourseIds = [];
 
+  for (const cDoc of courseDocs) {
+    const cId = cDoc.id;
+    const cRef = db.collection("courses").doc(cId);
+    const testsSnap = await cRef.collection("tests").get();
+    let courseMigrated = false;
+
+    for (const testDoc of testsSnap.docs) {
+      const testId = testDoc.id;
+      const testData = testDoc.data() || {};
+      const questions = Array.isArray(testData.questions) ? testData.questions : [];
+      if (questions.length === 0) continue;
+
+      const hasAnswerData = questions.some(
+        (q) => q && (typeof q.correctIndex !== "undefined" || typeof q.explanation !== "undefined")
+      );
+      const keyRef = cRef.collection("testKeys").doc(testId);
+      const keySnap = await keyRef.get();
+
+      if (hasAnswerData || !keySnap.exists) {
+        if (questions.some((q) => q && typeof q.correctIndex !== "undefined") || !keySnap.exists) {
+          const answers = questions.map((q) =>
+            typeof q?.correctIndex === "number" ? q.correctIndex : Number(q?.correctIndex) || 0
+          );
+          const passingScore = typeof testData.passingScore === "number" ? testData.passingScore : 60;
+          await keyRef.set(
+            {
+              answers,
+              passingScore,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
+
+        if (hasAnswerData) {
+          const sanitizedQuestions = questions.map((q) => {
+            const copy = { ...(q || {}) };
+            delete copy.correctIndex;
+            delete copy.explanation;
+            return copy;
+          });
+          await cRef.collection("tests").doc(testId).update({
+            questions: sanitizedQuestions,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        }
+
+        migratedTestsCount += 1;
+        courseMigrated = true;
+      }
+    }
+
+    if (courseMigrated) {
+      migratedCourseIds.push(cId);
+    }
+  }
+
+  await db.collection("auditLogs").add({
+    action: "Test Answer Keys Migrated",
+    detail: `Migrated ${migratedTestsCount} test key(s) across ${migratedCourseIds.length} course(s) by ${adminUid}`,
+    migratedTestsCount,
+    migratedCourseIds,
+    adminUid,
+    badge: "pill-success",
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return { migratedTestsCount, migratedCourseIds };
+}
+
+exports.migrateTestKeys = onCall(async (request) => {
+  if (!request.auth || !request.auth.uid || request.auth.token?.admin !== true) {
+    throw new HttpsError("permission-denied", "Access denied: Verified administrator privileges required.");
+  }
+  const { courseId } = request.data || {};
+  const result = await runMigrateTestKeys({
+    courseId: typeof courseId === "string" ? courseId.trim() : null,
+    adminUid: request.auth.uid,
+  });
+  return { success: true, ...result };
+});
+
+/**
+ * 18a. Tutor Course Publish Request Callable
+ * - Verifies caller is an assigned course tutor (or admin) and course is not deleting.
+ * - Sets status: "pending_review" on courses/{courseId} and writes an audit log.
+ */
+exports.requestCoursePublish = onCall(async (request) => {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError("unauthenticated", "Authentication is required to request course publication.");
+  }
+
+  const uid = request.auth.uid;
+  const { courseId } = request.data || {};
+  if (!courseId || typeof courseId !== "string" || !courseId.trim() || courseId === "general" || courseId === "platform") {
+    throw new HttpsError("invalid-argument", "A valid courseId is required.");
+  }
+
+  const normalizedCourseId = courseId.trim();
+  const courseRef = db.collection("courses").doc(normalizedCourseId);
+  const courseSnap = await courseRef.get();
+  if (!courseSnap.exists) {
+    throw new HttpsError("not-found", `Course '${normalizedCourseId}' does not exist.`);
+  }
+
+  const courseData = courseSnap.data() || {};
+  if (courseData.status === "deleting" || courseData.deletionState === "deleting") {
+    throw new HttpsError("failed-precondition", "Cannot request publication for a course that is being deleted.");
+  }
+
+  const isAdmin = request.auth.token?.admin === true;
+  const isAssignedCourseTutor =
+    request.auth.token?.tutor === true &&
+    (courseData.tutorId === uid ||
+      courseData.tutorUid === uid ||
+      courseData.instructorId === uid ||
+      (Array.isArray(courseData.assignedTutors) && courseData.assignedTutors.includes(uid)));
+
+  if (!isAdmin && !isAssignedCourseTutor) {
+    throw new HttpsError("permission-denied", "Access denied: You are not an assigned tutor for this course.");
+  }
+
+  await courseRef.update({
+    status: "pending_review",
+    publishRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
+    publishRequestedBy: uid,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await db.collection("auditLogs").add({
+    action: "Course Publish Requested",
+    detail: `Tutor ${uid} submitted course '${courseData.title || normalizedCourseId}' for publish review`,
+    courseId: normalizedCourseId,
+    courseTitle: courseData.title || normalizedCourseId,
+    tutorUid: uid,
+    status: "pending_review",
+    badge: "pill-warning",
+    timestamp: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  return {
+    success: true,
+    courseId: normalizedCourseId,
+    status: "pending_review",
+  };
+});
+
+/**
+ * 18. Authoritative Server-Side Test Scoring Callable
+ * - Verifies authentication and active/approved course enrollment.
+ * - Loads courses/{courseId}/testKeys/{testId} and scores submission server-side.
+ * - Writes testSubmissions/{uid}_{testId} and returns { score, passed, attempt } without exposing answer key.
+ */
+exports.submitTest = onCall(async (request) => {
+  if (!request.auth || !request.auth.uid) {
+    throw new HttpsError("unauthenticated", "You must be signed in to submit a test.");
+  }
+
+  const uid = request.auth.uid;
+  const { courseId, testId, answers } = request.data || {};
+
+  if (!courseId || typeof courseId !== "string" || !courseId.trim() || courseId === "general" || courseId === "platform") {
+    throw new HttpsError("invalid-argument", "A valid courseId is required.");
+  }
+  if (!testId || typeof testId !== "string" || !testId.trim()) {
+    throw new HttpsError("invalid-argument", "A valid testId is required.");
+  }
+  if (!answers || typeof answers !== "object") {
+    throw new HttpsError("invalid-argument", "A valid answers object or array is required.");
+  }
+
+  const normalizedCourseId = courseId.trim();
+  const normalizedTestId = testId.trim();
+
+  // Verify user account eligibility and fetch profile fields
+  const userSnap = await db.collection("users").doc(uid).get();
+  const userData = userSnap.exists ? userSnap.data() || {} : {};
+  if (userData.status === "suspended" || userData.disabled === true) {
+    throw new HttpsError("permission-denied", "Suspended accounts cannot submit tests.");
+  }
+
+  // Verify course exists and is not deleting
+  const courseRef = db.collection("courses").doc(normalizedCourseId);
+  const courseSnap = await courseRef.get();
+  if (!courseSnap.exists) {
+    throw new HttpsError("not-found", `Course '${normalizedCourseId}' does not exist.`);
+  }
+  const courseData = courseSnap.data() || {};
+  if (courseData.status === "deleting" || courseData.deletionState === "deleting") {
+    throw new HttpsError("failed-precondition", "Cannot submit a test for a course that is being deleted.");
+  }
+
+  // Verify active or approved enrollment in enrollments/{uid}_{courseId}
+  const enrollmentId = `${uid}_${normalizedCourseId}`;
+  const enrollmentSnap = await db.collection("enrollments").doc(enrollmentId).get();
+  if (!enrollmentSnap.exists) {
+    throw new HttpsError("permission-denied", "Active course enrollment is required to submit a test.");
+  }
+  const enrollmentData = enrollmentSnap.data() || {};
+  if (!["active", "approved"].includes(enrollmentData.status)) {
+    throw new HttpsError("permission-denied", "Your enrollment must be active or approved to submit a test.");
+  }
+
+  // Load answer key from courses/{courseId}/testKeys/{testId}
+  const keySnap = await courseRef.collection("testKeys").doc(normalizedTestId).get();
+  let keyAnswers = null;
+  let passingScore = 60;
+
+  if (keySnap.exists) {
+    const keyData = keySnap.data() || {};
+    if (Array.isArray(keyData.answers)) {
+      keyAnswers = keyData.answers;
+    }
+    if (typeof keyData.passingScore === "number") {
+      passingScore = keyData.passingScore;
+    }
+  } else {
+    // Fallback for un-migrated test doc that still has embedded correctIndex
+    const testSnap = await courseRef.collection("tests").doc(normalizedTestId).get();
+    if (!testSnap.exists) {
+      throw new HttpsError("not-found", `Test '${normalizedTestId}' does not exist in course '${normalizedCourseId}'.`);
+    }
+    const testData = testSnap.data() || {};
+    const questions = Array.isArray(testData.questions) ? testData.questions : [];
+    if (questions.length > 0 && questions.some((q) => q && typeof q.correctIndex === "number")) {
+      keyAnswers = questions.map((q) => (typeof q?.correctIndex === "number" ? q.correctIndex : 0));
+      if (typeof testData.passingScore === "number") {
+        passingScore = testData.passingScore;
+      }
+    }
+  }
+
+  if (!Array.isArray(keyAnswers) || keyAnswers.length === 0) {
+    throw new HttpsError("failed-precondition", `Answer key for test '${normalizedTestId}' is not configured.`);
+  }
+
+  let correctCount = 0;
+  keyAnswers.forEach((expectedIndex, idx) => {
+    const submittedChoice = Array.isArray(answers)
+      ? answers[idx]
+      : answers[idx] !== undefined
+        ? answers[idx]
+        : answers[String(idx)];
+    if (
+      submittedChoice !== undefined &&
+      submittedChoice !== null &&
+      Number(submittedChoice) === Number(expectedIndex)
+    ) {
+      correctCount += 1;
+    }
+  });
+
+  const score = Math.round(((correctCount / keyAnswers.length) * 100) * 10) / 10;
+  const passed = score >= passingScore;
+
+  const submissionDocId = `${uid}_${normalizedTestId}`;
+  const submissionRef = db.collection("testSubmissions").doc(submissionDocId);
+  const existingSubSnap = await submissionRef.get();
+  const previousAttempt = existingSubSnap.exists ? Number(existingSubSnap.data()?.attempt) || 0 : 0;
+  const attempt = previousAttempt + 1;
+
+  const studentName =
+    userData.fullName ||
+    [userData.surname, userData.firstName].filter(Boolean).join(" ").trim() ||
+    request.auth.token?.name ||
+    request.auth.token?.email ||
+    "Learner";
+  const regNumber = userData.regNumber || null;
+
+  await submissionRef.set(
+    {
+      uid,
+      courseId: normalizedCourseId,
+      testId: normalizedTestId,
+      answers,
+      score,
+      passed,
+      attempt,
+      studentName,
+      regNumber,
+      status: "graded",
+      submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  return {
+    score,
+    passed,
+    attempt,
+  };
+});
+
+/**
+ * 19. Firestore Triggers: Stage 8 Course Analytics & Server-Side Progress Recomputation
+ * - Triggered when documents in enrollments, testSubmissions, or assignmentSubmissions are created, updated, or deleted.
+ * - On enrollment writes where completedItemIds changes, recomputes progressPercent server-side using countCourseCurriculumItems(courseId).
+ * - Recomputes courses/{courseId}/analytics/summary idempotently.
+ * - Skips recomputation on enrollment updates when only `updatedAt`, `lastAccessedLesson`, or `progressPercent` changed.
+ */
+async function handleCourseAnalyticsTrigger(event, { isEnrollment = false } = {}) {
+  const beforeData = event?.data?.before?.exists ? event.data.before.data() : null;
+  const afterData = event?.data?.after?.exists ? event.data.after.data() : null;
+
+  if (isEnrollment && beforeData && afterData) {
+    const allKeys = new Set([...Object.keys(beforeData), ...Object.keys(afterData)]);
+    const changedKeys = Array.from(allKeys).filter(
+      (key) => JSON.stringify(beforeData[key]) !== JSON.stringify(afterData[key])
+    );
+    if (
+      changedKeys.length === 0 ||
+      changedKeys.every(
+        (key) => key === "updatedAt" || key === "lastAccessedLesson" || key === "progressPercent"
+      )
+    ) {
+      return null;
+    }
+  }
+
+  if (isEnrollment && afterData && afterData.courseId) {
+    const beforeCompleted = Array.isArray(beforeData?.completedItemIds) ? beforeData.completedItemIds : [];
+    const afterCompleted = Array.isArray(afterData.completedItemIds) ? afterData.completedItemIds : [];
+    const completedChanged =
+      !beforeData || JSON.stringify(beforeCompleted) !== JSON.stringify(afterCompleted);
+
+    if (completedChanged) {
+      const curriculumTotal = await countCourseCurriculumItems(afterData.courseId);
+      const totalLessons =
+        curriculumTotal > 0 ? curriculumTotal : Number(afterData.totalLessons) || 0;
+      const computedProgress =
+        totalLessons > 0
+          ? Math.min(100, Math.round((afterCompleted.length / totalLessons) * 100))
+          : 0;
+
+      if (afterData.progressPercent !== computedProgress) {
+        const enrollmentDocId =
+          event?.params?.docId ||
+          afterData.id ||
+          (afterData.uid && afterData.courseId ? `${afterData.uid}_${afterData.courseId}` : null);
+        if (enrollmentDocId) {
+          await db
+            .collection("enrollments")
+            .doc(enrollmentDocId)
+            .set({ progressPercent: computedProgress }, { merge: true });
+        }
+      }
+    }
+  }
+
+  const courseIds = new Set();
   if (beforeData?.courseId) courseIds.add(beforeData.courseId);
   if (afterData?.courseId) courseIds.add(afterData.courseId);
 
@@ -3468,7 +5470,21 @@ exports.onEnrollmentOrSubmissionWrite = onDocumentWritten("{collectionId}/{docId
     await recomputeCourseAnalytics(cid);
   }
   return null;
-});
+}
+
+exports.onEnrollmentWrite = onDocumentWritten("enrollments/{docId}", (event) =>
+  handleCourseAnalyticsTrigger(event, { isEnrollment: true })
+);
+
+exports.onTestSubmissionWrite = onDocumentWritten("testSubmissions/{docId}", (event) =>
+  handleCourseAnalyticsTrigger(event, { isEnrollment: false })
+);
+
+exports.onAssignmentSubmissionWrite = onDocumentWritten("assignmentSubmissions/{docId}", (event) =>
+  handleCourseAnalyticsTrigger(event, { isEnrollment: false })
+);
 
 exports.recomputeCourseAnalytics = recomputeCourseAnalytics;
+
+
 

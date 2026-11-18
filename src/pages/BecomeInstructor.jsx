@@ -1,31 +1,56 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
-import { collection, addDoc, serverTimestamp } from "firebase/firestore";
+import { collection, addDoc, getDocs, query, where, serverTimestamp } from "firebase/firestore";
 import { db } from "../firebase";
-import { getResources, uploadResource } from "../contexts/resourcesService";
+import { getResources, uploadResource, deleteResource } from "../contexts/resourcesService";
 
 export default function BecomeInstructor() {
   const { currentUser, userProfile, isTutor: hasTutorClaim, isAdmin } = useAuth();
   const navigate = useNavigate();
 
-  // If user is already instructor/tutor or admin:
-  const isTutor = hasTutorClaim || isAdmin;
+  // Verified tutor or administrator status
+  const isTutor = Boolean(hasTutorClaim || isAdmin);
   const [activeTab, setActiveTab] = useState(isTutor ? "dashboard" : "apply");
+
+  useEffect(() => {
+    if (!isTutor && activeTab === "dashboard") {
+      setActiveTab("apply");
+    }
+  }, [isTutor, activeTab]);
 
   // Application form state
   const [formData, setFormData] = useState({
-    fullName: currentUser?.displayName || userProfile?.fullName || "Samuel Asuquo",
-    courseTitle: "Applied Generative AI & Automation",
+    fullName: currentUser?.displayName || userProfile?.fullName || "",
+    courseTitle: "",
     category: "Tech & Digital Skills",
-    courseDescription: "Practical guide to automating corporate workflows using LLMs, APIs, and modern toolchains.",
-    learningOutcomes: "Students will build 4 end-to-end automated pipelines and earn an accredited industry certificate.",
-    syllabus: "Module 1: Foundations\nModule 2: Tooling & APIs\nModule 3: Production Deployment",
+    courseDescription: "",
+    learningOutcomes: "",
+    syllabus: "",
   });
+
+  useEffect(() => {
+    const defaultName = currentUser?.displayName || userProfile?.fullName || "";
+    if (defaultName && !formData.fullName) {
+      setFormData((prev) => ({ ...prev, fullName: defaultName }));
+    }
+  }, [currentUser?.displayName, userProfile?.fullName, formData.fullName]);
 
   const [applied, setApplied] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+
+  // Live Tutor Courses & Analytics State
+  const [tutorCourses, setTutorCourses] = useState([]);
+  const [loadingCourses, setLoadingCourses] = useState(false);
+  const [tutorStats, setTutorStats] = useState({
+    totalCourses: 0,
+    publishedCourses: 0,
+    draftCourses: 0,
+    totalEnrolled: 0,
+    activeLearners: 0,
+    avgCompletion: 0,
+  });
 
   // Tutor Resources State
   const [tutorResources, setTutorResources] = useState([]);
@@ -34,25 +59,137 @@ export default function BecomeInstructor() {
     title: "",
     description: "",
     category: "Tech & Digital Skills",
-    courseId: "ai-essentials",
+    courseId: "",
     externalUrl: "",
     file: null,
   });
   const [uploadingResource, setUploadingResource] = useState(false);
+  const [deletingResourceId, setDeletingResourceId] = useState(null);
   const [resourceToast, setResourceToast] = useState("");
 
   useEffect(() => {
+    if (!isTutor || !currentUser?.uid) return;
+    let isMounted = true;
+
+    async function loadLiveTutorData() {
+      setLoadingCourses(true);
+      try {
+        let coursesList = [];
+        if (isAdmin) {
+          const snap = await getDocs(collection(db, "courses"));
+          coursesList = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        } else {
+          const [primarySnap, tutorUidSnap, instructorSnap, assignedSnap] = await Promise.all([
+            getDocs(query(collection(db, "courses"), where("tutorId", "==", currentUser.uid))).catch(() => ({ docs: [] })),
+            getDocs(query(collection(db, "courses"), where("tutorUid", "==", currentUser.uid))).catch(() => ({ docs: [] })),
+            getDocs(query(collection(db, "courses"), where("instructorId", "==", currentUser.uid))).catch(() => ({ docs: [] })),
+            getDocs(query(collection(db, "courses"), where("assignedTutors", "array-contains", currentUser.uid))).catch(() => ({ docs: [] })),
+          ]);
+          const merged = new Map();
+          [primarySnap, tutorUidSnap, instructorSnap, assignedSnap].forEach((snap) => {
+            (snap.docs || []).forEach((d) => merged.set(d.id, { id: d.id, ...d.data() }));
+          });
+          coursesList = Array.from(merged.values());
+        }
+
+        coursesList = coursesList.filter(
+          (c) => c.status !== "deleting" && c.deletionState !== "deleting"
+        );
+
+        let allEnrollments = [];
+        await Promise.all(
+          coursesList.map(async (course) => {
+            try {
+              const enrSnap = await getDocs(
+                query(collection(db, "enrollments"), where("courseId", "==", course.id))
+              );
+              const courseEnrs = enrSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+              allEnrollments.push(...courseEnrs);
+            } catch {
+              // Ignore per-course enrollment read errors
+            }
+          })
+        );
+
+        const enrichedCourses = coursesList.map((c) => {
+          const cEnrs = allEnrollments.filter(
+            (e) => e.courseId === c.id && ["active", "approved"].includes(e.status)
+          );
+          const avgProg =
+            cEnrs.length > 0
+              ? Math.round(
+                  cEnrs.reduce((acc, item) => acc + (Number(item.progressPercent) || 0), 0) /
+                    cEnrs.length
+                )
+              : 0;
+          return {
+            ...c,
+            studentsCount: cEnrs.length,
+            avgProgress: avgProg,
+          };
+        });
+
+        const activeEnrs = allEnrollments.filter((e) =>
+          ["active", "approved"].includes(e.status)
+        );
+        const overallCompletion =
+          activeEnrs.length > 0
+            ? Math.round(
+                activeEnrs.reduce((acc, item) => acc + (Number(item.progressPercent) || 0), 0) /
+                  activeEnrs.length
+              )
+            : 0;
+        const publishedCount = enrichedCourses.filter((c) => c.status === "published").length;
+        const draftCount = enrichedCourses.length - publishedCount;
+
+        if (isMounted) {
+          setTutorCourses(enrichedCourses);
+          setTutorStats({
+            totalCourses: enrichedCourses.length,
+            publishedCourses: publishedCount,
+            draftCourses: draftCount,
+            totalEnrolled: allEnrollments.length,
+            activeLearners: activeEnrs.length,
+            avgCompletion: overallCompletion,
+          });
+          if (enrichedCourses.length > 0) {
+            setResourceData((prev) => ({
+              ...prev,
+              courseId: prev.courseId || enrichedCourses[0].id,
+            }));
+          }
+        }
+      } catch (err) {
+        console.warn("Could not load live tutor overview data:", err);
+      } finally {
+        if (isMounted) setLoadingCourses(false);
+      }
+    }
+
+    loadLiveTutorData();
+    return () => {
+      isMounted = false;
+    };
+  }, [isTutor, isAdmin, currentUser?.uid]);
+
+  useEffect(() => {
+    if (!isTutor) return;
     getResources("all")
       .then((res) => {
         if (res) setTutorResources(res);
       })
       .catch((err) => console.warn(err));
-  }, []);
+  }, [isTutor]);
 
   async function handleTutorUploadResource(e) {
     e.preventDefault();
     if (!resourceData.title.trim() || (!resourceData.file && !resourceData.externalUrl.trim())) {
       setResourceToast("Please provide a title and either a file or link.");
+      setTimeout(() => setResourceToast(""), 4000);
+      return;
+    }
+    if (!resourceData.courseId) {
+      setResourceToast("Please select a target course first.");
       setTimeout(() => setResourceToast(""), 4000);
       return;
     }
@@ -69,7 +206,7 @@ export default function BecomeInstructor() {
           ? {
               uid: currentUser.uid,
               displayName: currentUser.displayName || userProfile?.fullName || "Tutor",
-              role: isAdmin ? "admin" : (hasTutorClaim ? "tutor" : "student"),
+              role: isAdmin ? "admin" : hasTutorClaim ? "tutor" : "student",
             }
           : null,
       });
@@ -79,7 +216,7 @@ export default function BecomeInstructor() {
         title: "",
         description: "",
         category: "Tech & Digital Skills",
-        courseId: "ai-essentials",
+        courseId: tutorCourses[0]?.id || "",
         externalUrl: "",
         file: null,
       });
@@ -87,10 +224,27 @@ export default function BecomeInstructor() {
       setTimeout(() => setResourceToast(""), 4000);
     } catch (err) {
       console.error(err);
-      setResourceToast("Could not upload resource. Please try again.");
+      setResourceToast(err.message || "Could not upload resource. Please try again.");
       setTimeout(() => setResourceToast(""), 4000);
     } finally {
       setUploadingResource(false);
+    }
+  }
+
+  async function handleDeleteTutorResource(resItem) {
+    if (!resItem?.id) return;
+    setDeletingResourceId(resItem.id);
+    try {
+      await deleteResource(resItem.id, resItem.fileUrl, resItem.storagePath);
+      setTutorResources((prev) => prev.filter((r) => r.id !== resItem.id));
+      setResourceToast(`✓ Deleted "${resItem.title}".`);
+      setTimeout(() => setResourceToast(""), 4000);
+    } catch (err) {
+      console.error("Failed to delete resource:", err);
+      setResourceToast("Failed to delete resource: " + (err.message || "Permission denied"));
+      setTimeout(() => setResourceToast(""), 4000);
+    } finally {
+      setDeletingResourceId(null);
     }
   }
 
@@ -108,13 +262,13 @@ export default function BecomeInstructor() {
     try {
       const appData = {
         applicantUid: currentUser.uid,
-        fullName: formData.fullName,
+        fullName: formData.fullName.trim(),
         email: currentUser.email,
-        courseTitle: formData.courseTitle,
+        courseTitle: formData.courseTitle.trim(),
         category: formData.category,
-        courseDescription: formData.courseDescription,
-        learningOutcomes: formData.learningOutcomes,
-        syllabus: formData.syllabus,
+        courseDescription: formData.courseDescription.trim(),
+        learningOutcomes: formData.learningOutcomes.trim(),
+        syllabus: formData.syllabus.trim(),
         status: "pending",
         appliedAt: serverTimestamp(),
       };
@@ -139,30 +293,34 @@ export default function BecomeInstructor() {
               TUTOR PORTAL
             </div>
             <h1 style={{ fontSize: "clamp(1.5rem, 4.5vw, 2rem)", fontWeight: 800, color: "#3C181A" }}>
-              {activeTab === "dashboard" ? "Welcome back, Tutor 👋" : "Teach on Peleekings"}
+              {activeTab === "dashboard" && isTutor ? "Welcome back, Tutor 👋" : "Teach on Peleekings"}
             </h1>
             <p style={{ color: "var(--text-secondary)", fontSize: "0.92rem" }}>
-              {activeTab === "dashboard"
-                ? "Manage your courses, track your learners, and inspect course analytics."
+              {activeTab === "dashboard" && isTutor
+                ? "Manage your assigned courses, track your learners, and inspect live course analytics."
                 : "Share your industry expertise and empower learners worldwide."}
             </p>
           </div>
 
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              className={`btn ${activeTab === "dashboard" ? "btn-solid-dark" : "btn-outline"}`}
-              onClick={() => setActiveTab("dashboard")}
-            >
-              Tutor Overview
-            </button>
-            <button
-              type="button"
-              className="btn btn-outline"
-              onClick={() => navigate("/teach-portal")}
-            >
-              Curriculum Studio &rarr;
-            </button>
+            {isTutor && (
+              <>
+                <button
+                  type="button"
+                  className={`btn ${activeTab === "dashboard" ? "btn-solid-dark" : "btn-outline"}`}
+                  onClick={() => setActiveTab("dashboard")}
+                >
+                  Tutor Overview
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-outline"
+                  onClick={() => navigate("/teach-portal")}
+                >
+                  Curriculum Studio &rarr;
+                </button>
+              </>
+            )}
             <button
               type="button"
               className={`btn ${activeTab === "apply" ? "btn-solid-dark" : "btn-outline"}`}
@@ -173,17 +331,33 @@ export default function BecomeInstructor() {
           </div>
         </div>
 
-        {/* ── Tutor Dashboard View (Screens 7 & 8) ───────────────────── */}
-        {activeTab === "dashboard" && (
+        {/* ── Tutor Dashboard View (Verified Tutors & Admins Only) ───── */}
+        {activeTab === "dashboard" && isTutor && (
           <div>
             {/* Stat Metric Cards */}
             <div className="stats-cards-deck">
               {[
-                { label: "Your Courses", val: "3", sub: "2 published, 1 draft" },
-                { label: "Total Learners", val: "124", sub: "+18 this month" },
-                { label: "Avg. Completion", val: "78%", sub: "+5% vs platform avg" },
-                { label: "Avg. Test Score", val: "82%", sub: "Top 10% tier" },
-              ].map(stat => (
+                {
+                  label: "Your Courses",
+                  val: String(tutorStats.totalCourses),
+                  sub: `${tutorStats.publishedCourses} published, ${tutorStats.draftCourses} draft`,
+                },
+                {
+                  label: "Active Learners",
+                  val: String(tutorStats.activeLearners),
+                  sub: `${tutorStats.totalEnrolled} total enrollment record(s)`,
+                },
+                {
+                  label: "Avg. Completion",
+                  val: `${tutorStats.avgCompletion}%`,
+                  sub: "Across active enrollments",
+                },
+                {
+                  label: "Course Resources",
+                  val: String(tutorResources.length),
+                  sub: "Published learning materials",
+                },
+              ].map((stat) => (
                 <div key={stat.label} className="stat-metric-card">
                   <div style={{ fontSize: "0.8rem", fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", letterSpacing: "0.05em" }}>
                     {stat.label}
@@ -209,88 +383,116 @@ export default function BecomeInstructor() {
                     onClick={() => navigate("/teach-portal")}
                     className="btn btn-solid-dark btn-sm"
                   >
-                    + Add New Course
+                    Open Curriculum Studio &rarr;
                   </button>
                 </div>
 
-                <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                  {[
-                    { id: "ai-essentials", title: "AI Essentials & Automation", students: 124, progress: 78, status: "Published" },
-                    { id: "graphic-design", title: "Graphic Design Fundamentals", students: 86, progress: 64, status: "Published" },
-                    { id: "computer-basics", title: "Corporate Workflow Design", students: 0, progress: 0, status: "Draft" },
-                  ].map(c => (
-                    <div
-                      key={c.title}
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        flexWrap: "wrap",
-                        gap: 12,
-                        padding: "16px",
-                        borderRadius: "var(--radius-sm)",
-                        border: "1px solid var(--border-light)",
-                        background: "#F8FAFC",
-                      }}
-                    >
-                      <div style={{ flex: "1 1 200px", minWidth: 0 }}>
-                        <div style={{ fontWeight: 700, fontSize: "0.95rem", color: "var(--text-primary)" }}>
-                          {c.title}
+                {loadingCourses ? (
+                  <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)" }}>
+                    Loading your assigned courses...
+                  </div>
+                ) : tutorCourses.length === 0 ? (
+                  <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)", background: "#F8FAFC", borderRadius: 8 }}>
+                    No courses are currently assigned to your instructor account. Open the Curriculum Studio to create or manage courses.
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                    {tutorCourses.map((c) => (
+                      <div
+                        key={c.id}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                          gap: 12,
+                          padding: "16px",
+                          borderRadius: "var(--radius-sm)",
+                          border: "1px solid var(--border-light)",
+                          background: "#F8FAFC",
+                        }}
+                      >
+                        <div style={{ flex: "1 1 200px", minWidth: 0 }}>
+                          <div style={{ fontWeight: 700, fontSize: "0.95rem", color: "var(--text-primary)" }}>
+                            {c.title}
+                          </div>
+                          <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 2 }}>
+                            {c.studentsCount || 0} active learners &bull; {c.avgProgress || 0}% completion
+                          </div>
                         </div>
-                        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: 2 }}>
-                          {c.students} active learners &bull; {c.progress}% completion
-                        </div>
-                      </div>
 
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-                        <span className={`pill-badge ${c.status === "Published" ? "pill-success" : "pill-tech"}`}>
-                          {c.status}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => navigate("/teach-portal")}
-                          className="btn btn-outline btn-sm"
-                        >
-                          Manage Course &rarr;
-                        </button>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                          <span className={`pill-badge ${c.status === "published" ? "pill-success" : "pill-tech"}`}>
+                            {c.status === "published" ? "Published" : "Draft"}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => navigate("/teach-portal")}
+                            className="btn btn-outline btn-sm"
+                          >
+                            Manage Course &rarr;
+                          </button>
+                        </div>
                       </div>
-                    </div>
-                  ))}
-                </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
-              {/* Course Analytics Card (Screen 8) */}
+              {/* Course Analytics Card */}
               <div style={{ background: "#FFFFFF", border: "1px solid var(--border-light)", borderRadius: "var(--radius-md)", padding: "20px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
                   <h2 style={{ fontSize: "1.2rem", fontWeight: 800 }}>Course Analytics</h2>
-                  <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Last 30 Days</span>
+                  <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>Live Summary</span>
                 </div>
 
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 24 }}>
                   <div style={{ padding: 12, background: "#F8FAFC", borderRadius: 8 }}>
-                    <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Enrolled</div>
-                    <div style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--text-primary)" }}>124</div>
+                    <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Total Enrollments</div>
+                    <div style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--text-primary)" }}>
+                      {tutorStats.totalEnrolled}
+                    </div>
                   </div>
                   <div style={{ padding: 12, background: "#F8FAFC", borderRadius: 8 }}>
-                    <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Active</div>
-                    <div style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--text-primary)" }}>97</div>
+                    <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Active Learners</div>
+                    <div style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--text-primary)" }}>
+                      {tutorStats.activeLearners}
+                    </div>
                   </div>
                   <div style={{ padding: 12, background: "#F8FAFC", borderRadius: 8 }}>
                     <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Completion Rate</div>
-                    <div style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--primary-learner)" }}>78%</div>
+                    <div style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--primary-learner)" }}>
+                      {tutorStats.avgCompletion}%
+                    </div>
                   </div>
                   <div style={{ padding: 12, background: "#F8FAFC", borderRadius: 8 }}>
-                    <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Avg. Test Score</div>
-                    <div style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--success-text)" }}>82%</div>
+                    <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Published Courses</div>
+                    <div style={{ fontSize: "1.3rem", fontWeight: 800, color: "var(--success-text)" }}>
+                      {tutorStats.publishedCourses}
+                    </div>
                   </div>
                 </div>
 
                 {/* Donut progress visual */}
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "16px 0" }}>
-                  <div style={{ width: 130, height: 130, borderRadius: "50%", background: "conic-gradient(#EC586E 0% 78%, #E2E8F0 78% 100%)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <div
+                    style={{
+                      width: 130,
+                      height: 130,
+                      borderRadius: "50%",
+                      background: `conic-gradient(#EC586E 0% ${tutorStats.avgCompletion}%, #E2E8F0 ${tutorStats.avgCompletion}% 100%)`,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
                     <div style={{ width: 96, height: 96, borderRadius: "50%", background: "#FFFFFF", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-                      <span style={{ fontSize: "1.4rem", fontWeight: 900, color: "var(--text-primary)" }}>78%</span>
-                      <span style={{ fontSize: "0.68rem", color: "var(--text-muted)", textTransform: "uppercase" }}>Completed</span>
+                      <span style={{ fontSize: "1.4rem", fontWeight: 900, color: "var(--text-primary)" }}>
+                        {tutorStats.avgCompletion}%
+                      </span>
+                      <span style={{ fontSize: "0.68rem", color: "var(--text-muted)", textTransform: "uppercase" }}>
+                        Completed
+                      </span>
                     </div>
                   </div>
                 </div>
@@ -373,11 +575,15 @@ export default function BecomeInstructor() {
                           value={resourceData.courseId}
                           onChange={(e) => setResourceData({ ...resourceData, courseId: e.target.value })}
                           className="form-field-input"
+                          required
                         >
-                          <option value="ai-essentials">AI Essentials &amp; Automation</option>
-                          <option value="computer-basics">Introduction to Computer</option>
-                          <option value="photography">Photography Fundamentals</option>
-                          <option value="platform">Platform-Wide Resource</option>
+                          <option value="">-- Select Target Course --</option>
+                          {tutorCourses.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.title}
+                            </option>
+                          ))}
+                          {isAdmin && <option value="platform">Platform-Wide Resource</option>}
                         </select>
                       </div>
 
@@ -421,7 +627,7 @@ export default function BecomeInstructor() {
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 {tutorResources.length === 0 ? (
                   <div style={{ textAlign: "center", color: "var(--text-muted)", padding: 20 }}>
-                    No course resources uploaded yet. Click "+ Upload New Material" to add your first resource.
+                    No course resources uploaded yet. Click &ldquo;+ Upload New Material&rdquo; to add your first resource.
                   </div>
                 ) : (
                   tutorResources.map((res) => (
@@ -457,15 +663,28 @@ export default function BecomeInstructor() {
                         </div>
                       </div>
 
-                      <a
-                        href={res.fileUrl || "#"}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="btn btn-outline btn-sm"
-                        style={{ textDecoration: "none" }}
-                      >
-                        Download &darr;
-                      </a>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <a
+                          href={res.fileUrl || "#"}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="btn btn-outline btn-sm"
+                          style={{ textDecoration: "none" }}
+                        >
+                          Download &darr;
+                        </a>
+                        {(isAdmin || tutorCourses.some((c) => c.id === res.courseId)) && (
+                          <button
+                            type="button"
+                            disabled={deletingResourceId === res.id}
+                            onClick={() => handleDeleteTutorResource(res)}
+                            className="btn btn-outline btn-sm"
+                            style={{ color: "#B91C1C", borderColor: "#FECACA" }}
+                          >
+                            {deletingResourceId === res.id ? "Deleting..." : "Delete"}
+                          </button>
+                        )}
+                      </div>
                     </div>
                   ))
                 )}
@@ -498,9 +717,11 @@ export default function BecomeInstructor() {
                   >
                     Return to Dashboard &rarr;
                   </button>
-                  <button type="button" className="btn btn-outline btn-lg" onClick={() => setActiveTab("dashboard")}>
-                    View Tutor Overview
-                  </button>
+                  {isTutor && (
+                    <button type="button" className="btn btn-outline btn-lg" onClick={() => setActiveTab("dashboard")}>
+                      View Tutor Overview
+                    </button>
+                  )}
                 </div>
               </div>
             ) : (
@@ -524,6 +745,7 @@ export default function BecomeInstructor() {
                     <input
                       type="text"
                       required
+                      placeholder="Enter your full name"
                       className="form-field-input"
                       value={formData.fullName}
                       onChange={(e) => setFormData({ ...formData, fullName: e.target.value })}
@@ -536,6 +758,7 @@ export default function BecomeInstructor() {
                       <input
                         type="text"
                         required
+                        placeholder="e.g. Applied Generative AI & Automation"
                         className="form-field-input"
                         value={formData.courseTitle}
                         onChange={(e) => setFormData({ ...formData, courseTitle: e.target.value })}
@@ -560,6 +783,7 @@ export default function BecomeInstructor() {
                     <textarea
                       rows={3}
                       required
+                      placeholder="Describe what learners will achieve in this course..."
                       className="form-field-input"
                       value={formData.courseDescription}
                       onChange={(e) => setFormData({ ...formData, courseDescription: e.target.value })}
@@ -571,6 +795,7 @@ export default function BecomeInstructor() {
                     <textarea
                       rows={2}
                       required
+                      placeholder="Key skills and projects learners will complete..."
                       className="form-field-input"
                       value={formData.learningOutcomes}
                       onChange={(e) => setFormData({ ...formData, learningOutcomes: e.target.value })}
@@ -582,6 +807,7 @@ export default function BecomeInstructor() {
                     <textarea
                       rows={4}
                       required
+                      placeholder={"Module 1: Foundations\nModule 2: Practical Workflows\nModule 3: Capstone Project"}
                       className="form-field-input"
                       value={formData.syllabus}
                       onChange={(e) => setFormData({ ...formData, syllabus: e.target.value })}

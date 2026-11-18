@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { Link, useNavigate, useLocation } from "react-router-dom";
 import {
   LayoutDashboard,
@@ -19,9 +19,11 @@ import {
   CheckCircle2,
   Circle,
 } from "lucide-react";
-import { useAuth } from "../contexts/AuthContext";
+import { useAuth, allocateRegistrationCode } from "../contexts/AuthContext";
 import { useBodyScrollLock } from "../utils/scrollLock";
 import { checkPasswordRequirements, validatePasswordOrThrow } from "../utils/passwordPolicy";
+import brandSubmark from "../assets/brand-submark.png";
+import brandWordmark from "../assets/brand-wordmark.png";
 import {
   getUserActivity,
   submitAssignment,
@@ -34,6 +36,10 @@ import {
 } from "../contexts/userActivity";
 import { COURSES_CATALOG } from "../data/courses";
 import { getCurriculumForCourse } from "../data/courseCurricula";
+import {
+  filterAndSortLearnerAnnouncements,
+  fetchLearnerAnnouncementsFromFirestore,
+} from "../utils/courseCatalogue";
 import { doc, getDocs, collection, query, where, orderBy, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase";
 
@@ -164,19 +170,68 @@ export default function Dashboard() {
   const nyscCode = isNonCorper ? "Not Applicable (Non-Corper)" : (userProfile?.nyscStateCode || "Not provided");
 
   const [realRegNumber, setRealRegNumber] = useState(userProfile?.regNumber || null);
+  const [retryingRegCode, setRetryingRegCode] = useState(false);
+  const effectiveRegNumber = realRegNumber || userProfile?.regNumber || null;
+
+  function triggerToast(msg) {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(""), 3500);
+  }
+
+  const handleRetryRegCode = useCallback(async () => {
+    if (!currentUser?.uid || retryingRegCode) return;
+    setRetryingRegCode(true);
+    try {
+      const code = await allocateRegistrationCode(currentUser.uid, {
+        email: currentUser.email || userProfile?.email || "",
+        fullName: userProfile?.fullName || currentUser.displayName || "",
+        displayName: userProfile?.displayName || currentUser.displayName || "",
+        surname: userProfile?.surname || "",
+        firstName: userProfile?.firstName || "",
+        studentType: userProfile?.studentType || "non_corper",
+        nyscStateCode: userProfile?.nyscStateCode || null,
+        phoneNumber: userProfile?.phoneNumber || "",
+      });
+      if (code) {
+        setRealRegNumber(code);
+        triggerToast(`Registration code assigned: ${code}`);
+      }
+    } catch (err) {
+      console.error("Manual registration code retry failed:", err);
+      triggerToast(err?.message || "Could not generate registration code yet. Please try again.");
+    } finally {
+      setRetryingRegCode(false);
+    }
+  }, [currentUser, userProfile, retryingRegCode]);
 
   useEffect(() => {
-    if (userProfile?.regNumber) {
-      setRealRegNumber(userProfile.regNumber);
-      return;
-    }
-    if (!currentUser?.uid) return;
+    if (effectiveRegNumber || !currentUser?.uid) return;
+    let allocatedInEffect = false;
 
     const unsub = onSnapshot(
       doc(db, "users", currentUser.uid),
       (docSnap) => {
         if (docSnap.exists() && docSnap.data().regNumber) {
           setRealRegNumber(docSnap.data().regNumber);
+        } else if (docSnap.exists() && !allocatedInEffect) {
+          allocatedInEffect = true;
+          const data = docSnap.data() || {};
+          allocateRegistrationCode(currentUser.uid, {
+            email: data.email || currentUser.email || "",
+            fullName: data.fullName || currentUser.displayName || "",
+            displayName: data.displayName || currentUser.displayName || "",
+            surname: data.surname || "",
+            firstName: data.firstName || "",
+            studentType: data.studentType || "non_corper",
+            nyscStateCode: data.nyscStateCode || null,
+            phoneNumber: data.phoneNumber || "",
+          })
+            .then((code) => {
+              if (code) setRealRegNumber(code);
+            })
+            .catch((err) => {
+              console.warn("Dashboard mount registration code retry failed:", err);
+            });
         }
       },
       (err) => {
@@ -184,14 +239,9 @@ export default function Dashboard() {
       }
     );
     return () => unsub();
-  }, [currentUser?.uid, userProfile?.regNumber]);
+  }, [currentUser?.uid, currentUser?.email, currentUser?.displayName, effectiveRegNumber]);
 
-  const regCode = realRegNumber || "Generating your code...";
-
-  function triggerToast(msg) {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(""), 3500);
-  }
+  const regCode = effectiveRegNumber || "Generating your code...";
 
   const [userActivity, setUserActivity] = useState(() => getUserActivity(currentUser?.uid));
   const [liveEnrollments, setLiveEnrollments] = useState([]);
@@ -243,12 +293,33 @@ export default function Dashboard() {
   useEffect(() => {
     async function loadDynamicCourses() {
       try {
-        const snap = await getDocs(collection(db, "courses"));
+        let snap;
+        try {
+          snap = await getDocs(query(collection(db, "courses"), where("status", "==", "published")));
+        } catch {
+          snap = await getDocs(collection(db, "courses"));
+        }
         if (!snap.empty) {
           const fromDb = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          const deletingIds = new Set(
+            fromDb
+              .filter(
+                (c) =>
+                  c.status === "deleting" ||
+                  c.status === "deleted" ||
+                  c.deletionState === "deleting" ||
+                  c.deleted === true
+              )
+              .map((c) => c.id)
+          );
+          const activeFromDb = fromDb.filter(
+            (c) => !deletingIds.has(c.id) && (!c.status || c.status === "published")
+          );
           const combined = [
-            ...fromDb,
-            ...COURSES_CATALOG.filter((c) => !fromDb.some((fc) => fc.id === c.id)),
+            ...activeFromDb,
+            ...COURSES_CATALOG.filter(
+              (c) => !fromDb.some((fc) => fc.id === c.id) && !deletingIds.has(c.id)
+            ),
           ];
           setAllCoursesList(combined);
         }
@@ -291,54 +362,100 @@ export default function Dashboard() {
       .catch((err) => console.warn("Could not fetch live enrollments:", err));
   }, [currentUser, allCoursesList]);
 
-  // Active courses enrolled: strictly require Firestore-verified active/approved enrollment (do not trust localStorage for enrollment access)
-  const enrolledCourses = liveEnrollments.filter((c) => isEnrollmentAuthorized(c));
-  const pendingEnrollments = liveEnrollments.filter((c) => c.status === "pending");
-  const inactiveEnrollments = liveEnrollments.filter((c) =>
-    ["rejected", "revoked", "suspended"].includes(c.status)
+  // Active courses enrolled: strictly require Firestore-verified active/approved enrollment (memoized to prevent infinite re-render loops)
+  const enrolledCourses = useMemo(
+    () => liveEnrollments.filter((c) => isEnrollmentAuthorized(c)),
+    [liveEnrollments]
   );
-  const completedCourses = enrolledCourses.filter((c) => (c.progress || 0) >= 100);
+  const pendingEnrollments = useMemo(
+    () => liveEnrollments.filter((c) => c.status === "pending"),
+    [liveEnrollments]
+  );
+  const inactiveEnrollments = useMemo(
+    () =>
+      liveEnrollments.filter((c) =>
+        ["rejected", "revoked", "suspended"].includes(c.status)
+      ),
+    [liveEnrollments]
+  );
+  const completedCourses = useMemo(
+    () => enrolledCourses.filter((c) => (c.progress || 0) >= 100),
+    [enrolledCourses]
+  );
+  const enrolledCourseIdsKey = useMemo(() => {
+    const publishedCourseLookup = new Map(allCoursesList.map((c) => [c.id, c]));
+    return enrolledCourses
+      .map((c) => (typeof c.id === "string" ? c.id.trim() : ""))
+      .filter((cid) => {
+        if (!cid || cid === "general" || cid === "platform") return false;
+        const courseRec = publishedCourseLookup.get(cid);
+        if (
+          courseRec &&
+          (courseRec.status === "deleting" ||
+            courseRec.status === "deleted" ||
+            courseRec.deletionState === "deleting" ||
+            courseRec.deleted === true ||
+            (courseRec.status && courseRec.status !== "published"))
+        ) {
+          return false;
+        }
+        return true;
+      })
+      .sort()
+      .join(",");
+  }, [enrolledCourses, allCoursesList]);
 
   // Live Announcements from Firestore
   const [liveAnnouncements, setLiveAnnouncements] = useState([]);
   const [loadingAnnouncements, setLoadingAnnouncements] = useState(false);
+  const [announcementsError, setAnnouncementsError] = useState(null);
+
+  const loadAnnouncements = useCallback(async () => {
+    setLoadingAnnouncements(true);
+    setAnnouncementsError(null);
+    const withQueryTimeout = (promise, ms = 5000) => {
+      let timerId;
+      const timeout = new Promise((_, reject) => {
+        timerId = setTimeout(() => reject(new Error("Request timed out loading announcements.")), ms);
+      });
+      return Promise.race([promise, timeout]).finally(() => clearTimeout(timerId));
+    };
+    try {
+      const validCourseIds = enrolledCourseIdsKey
+        ? Array.from(
+            new Set(
+              enrolledCourseIdsKey
+                .split(",")
+                .map((id) => id.trim())
+                .filter((id) => id && id !== "general" && id !== "platform")
+            )
+          )
+        : [];
+
+      const result = await fetchLearnerAnnouncementsFromFirestore({
+        db,
+        enrolledCourseIds: validCourseIds,
+        getDocsFn: getDocs,
+        withQueryTimeout,
+        nowMs: Date.now(),
+      });
+
+      setLiveAnnouncements(result.announcements);
+      if (result.hasError) {
+        setAnnouncementsError(result.error);
+      }
+    } catch (err) {
+      console.warn("Notice loading announcements for student dashboard:", err);
+      setAnnouncementsError(err?.message || "Unable to load announcements right now.");
+      setLiveAnnouncements([]);
+    } finally {
+      setLoadingAnnouncements(false);
+    }
+  }, [enrolledCourseIdsKey]);
 
   useEffect(() => {
-    async function loadAnnouncements() {
-      setLoadingAnnouncements(true);
-      try {
-        const q = query(
-          collection(db, "announcements"),
-          where("status", "==", "published"),
-          orderBy("createdAt", "desc")
-        );
-        const snap = await getDocs(q);
-        const enrolledCourseIds = new Set(enrolledCourses.map((c) => c.id));
-        const list = snap.docs
-          .map((d) => {
-            const data = d.data();
-            let dateStr = "Recent";
-            if (data.createdAt?.toDate) {
-              dateStr = data.createdAt.toDate().toLocaleDateString();
-            } else if (data.createdAt) {
-              dateStr = new Date(data.createdAt).toLocaleDateString();
-            }
-            return { id: d.id, ...data, date: dateStr };
-          })
-          .filter((a) => {
-            if (a.audience === "all" || a.audience === "learners") return true;
-            if (a.audience === "course" && a.courseId && enrolledCourseIds.has(a.courseId)) return true;
-            return false;
-          });
-        setLiveAnnouncements(list);
-      } catch (err) {
-        console.warn("Notice loading announcements for student dashboard:", err);
-      } finally {
-        setLoadingAnnouncements(false);
-      }
-    }
     loadAnnouncements();
-  }, [enrolledCourses]);
+  }, [loadAnnouncements]);
 
   // Real Assignments loaded from Firestore + curriculum for actively enrolled courses
   const [courseAssignments, setCourseAssignments] = useState([]);
@@ -351,8 +468,6 @@ export default function Dashboard() {
 
   // Lock background page scroll at all widths when any modal dialog is open
   useBodyScrollLock(showPathModal || Boolean(activeUploadAssignment));
-
-  const userSubmissions = userActivity?.assignmentSubmissions || {};
 
   useEffect(() => {
     let isMounted = true;
@@ -434,8 +549,8 @@ export default function Dashboard() {
             try {
               sub = await getAssignmentSubmission(currentUser.uid, item.id);
             } catch {}
-            if (!sub && userSubmissions[item.id]) {
-              sub = userSubmissions[item.id];
+            if (!sub && userActivity?.assignmentSubmissions?.[item.id]) {
+              sub = userActivity.assignmentSubmissions[item.id];
             }
             if (sub) {
               return {
@@ -473,7 +588,7 @@ export default function Dashboard() {
     return () => {
       isMounted = false;
     };
-  }, [currentUser?.uid, enrolledCourses.length]);
+  }, [currentUser?.uid, enrolledCourses, userActivity?.assignmentSubmissions]);
 
   const assignments = courseAssignments;
   const submittedAssignmentsCount = assignments.filter((a) => Boolean(a.submission)).length;
@@ -605,9 +720,9 @@ export default function Dashboard() {
         <div className="sidebar-mobile-header">
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div className="brand-logo-icon" style={{ width: 28, height: 28, fontSize: "0.9rem" }}>
-              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+              <img src={brandSubmark} alt="" className="brand-submark-img" />
             </div>
-            <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
+            <img src={brandWordmark} alt="Peleekings" className="brand-wordmark-img" style={{ height: 20 }} />
           </div>
           <button
             type="button"
@@ -632,13 +747,32 @@ export default function Dashboard() {
             <div style={{ fontWeight: 700, fontSize: "0.95rem", color: "var(--text-primary)", whiteSpace: "nowrap", textOverflow: "ellipsis", overflow: "hidden" }}>
               {userName}
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
               <span className={`pill-badge ${userProfile?.studentType === "non_corper" ? "pill-creative" : "pill-tech"}`} style={{ padding: "2px 8px", fontSize: "0.68rem" }}>
                 {userProfile?.studentType === "non_corper" ? "Non-Corper" : "Corper"}
               </span>
               {regCode && regCode !== "Pending assignment" ? (
-                <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontWeight: 600 }}>
+                <span style={{ fontSize: "0.75rem", color: "var(--text-muted)", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 6 }}>
                   {regCode}
+                  {!effectiveRegNumber && (
+                    <button
+                      type="button"
+                      onClick={handleRetryRegCode}
+                      disabled={retryingRegCode}
+                      style={{
+                        fontSize: "0.68rem",
+                        fontWeight: 700,
+                        padding: "1px 6px",
+                        borderRadius: 6,
+                        border: "1px solid var(--border-light)",
+                        background: "#FFFFFF",
+                        color: "var(--primary-learner)",
+                        cursor: retryingRegCode ? "wait" : "pointer",
+                      }}
+                    >
+                      {retryingRegCode ? "Retrying..." : "Retry"}
+                    </button>
+                  )}
                 </span>
               ) : null}
             </div>
@@ -1399,7 +1533,7 @@ export default function Dashboard() {
                         </div>
                       </div>
                       <div className="brand-logo-icon" style={{ width: 48, height: 48, borderRadius: "50%" }}>
-                        <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="Peleekings" className="brand-submark-img" />
+                        <img src={brandSubmark} alt="Peleekings" className="brand-submark-img" />
                       </div>
                     </div>
                     <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", marginBottom: 20 }}>
@@ -1483,7 +1617,20 @@ export default function Dashboard() {
                 </div>
                 <div className="profile-fields-row" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                   <div>
-                    <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>User ID</label>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                      <label style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-secondary)" }}>User ID</label>
+                      {!effectiveRegNumber && (
+                        <button
+                          type="button"
+                          onClick={handleRetryRegCode}
+                          disabled={retryingRegCode}
+                          className="btn btn-outline btn-sm"
+                          style={{ padding: "2px 8px", fontSize: "0.72rem", minHeight: 24 }}
+                        >
+                          {retryingRegCode ? "Retrying..." : "Retry"}
+                        </button>
+                      )}
+                    </div>
                     <input
                       type="text"
                       readOnly
@@ -1718,12 +1865,49 @@ export default function Dashboard() {
         {/* ── TAB: ANNOUNCEMENTS ─────────────────────────────────────── */}
         {activeNav === "announcements" && (
           <div className="dashboard-tab-panel">
-            <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Announcements &amp; Broadcasts</h2>
-            <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", marginBottom: 24 }}>Stay updated with course broadcasts and instructor notices.</p>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 24 }}>
+              <div>
+                <h2 style={{ fontSize: "1.5rem", fontWeight: 800, marginBottom: 6 }}>Announcements &amp; Broadcasts</h2>
+                <p style={{ color: "var(--text-muted)", fontSize: "0.9rem", margin: 0 }}>Stay updated with course broadcasts and instructor notices.</p>
+              </div>
+              <button
+                type="button"
+                className="btn btn-outline btn-sm"
+                disabled={loadingAnnouncements}
+                onClick={() => loadAnnouncements()}
+              >
+                {loadingAnnouncements ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
+
+            {announcementsError && (
+              <div
+                role="alert"
+                style={{
+                  marginBottom: 16,
+                  padding: "12px 16px",
+                  borderRadius: 10,
+                  background: "#FEF2F2",
+                  border: "1px solid #FECACA",
+                  color: "#991B1B",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 12,
+                  flexWrap: "wrap",
+                  fontSize: "0.875rem",
+                }}
+              >
+                <span>{announcementsError}</span>
+                <button type="button" className="btn btn-outline btn-sm" onClick={() => loadAnnouncements()}>
+                  Retry
+                </button>
+              </div>
+            )}
 
             {loadingAnnouncements ? (
               <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading announcements...</div>
-            ) : liveAnnouncements.length === 0 ? (
+            ) : liveAnnouncements.length === 0 && !announcementsError ? (
               <EmptyState
                 icon={Megaphone}
                 title="No announcements yet"
@@ -1731,7 +1915,7 @@ export default function Dashboard() {
                 buttonText={enrolledCourses.length === 0 ? "Browse courses" : undefined}
                 onButtonClick={enrolledCourses.length === 0 ? () => setActiveNav("browse-courses") : undefined}
               />
-            ) : (
+            ) : liveAnnouncements.length > 0 ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                 {liveAnnouncements.map((ann) => (
                   <div
@@ -1756,7 +1940,7 @@ export default function Dashboard() {
                   </div>
                 ))}
               </div>
-            )}
+            ) : null}
           </div>
         )}
 

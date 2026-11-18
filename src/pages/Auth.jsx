@@ -5,6 +5,8 @@ import { doc, onSnapshot } from "firebase/firestore";
 import { db } from "../firebase";
 import { useAuth } from "../contexts/AuthContext";
 import { checkPasswordRequirements, validatePasswordOrThrow } from "../utils/passwordPolicy";
+import brandSubmark from "../assets/brand-submark.png";
+import brandWordmark from "../assets/brand-wordmark.png";
 
 export default function Auth() {
   const navigate = useNavigate();
@@ -310,9 +312,9 @@ export default function Auth() {
         <div className="auth-title-block">
           <Link to="/" className="brand-wrapper" style={{ justifyContent: "center", marginBottom: 16 }}>
             <div className="brand-logo-icon">
-              <img src="/assets/aistudio/20260925_194828_31921ef2.png" alt="" className="brand-submark-img" />
+              <img src={brandSubmark} alt="" className="brand-submark-img" />
             </div>
-            <img src="/assets/aistudio/20260925_194706_376e00d5.png" alt="Peleekings" className="brand-wordmark-img" />
+            <img src={brandWordmark} alt="Peleekings" className="brand-wordmark-img" />
           </Link>
           <h1 style={{ fontSize: "1.65rem", fontWeight: 800, color: "var(--text-primary)", marginBottom: 6 }}>
             {registeredProfile
